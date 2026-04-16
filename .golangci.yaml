@@ -1,0 +1,11 @@
+# golangci-lint configuration file
+# see: https://golangci-lint.run/usage/configuration/
+
+version: "2"
+linters:
+  enable:
+    - goheader
+
+  settings:
+    goheader:
+      template-path: ${config-path}/hack/boilerplate.txt

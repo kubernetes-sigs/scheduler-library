@@ -1,0 +1,8 @@
+bin/
+
+# Go workspace files
+go.work*
+# Go test binaries
+*.test
+# Go coverage profiles
+*.out
