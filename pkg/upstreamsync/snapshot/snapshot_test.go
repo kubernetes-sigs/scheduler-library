@@ -825,6 +825,36 @@ func TestSchedulePods(t *testing.T) {
 	}
 }
 
+// TestScheduleTransactionDoesNotRequestAuthoritativeRefresh checks that a
+// committed scheduling transaction stays on the incremental fast path.
+// SchedulePods registers undo operations, but its assumed-pod state is
+// reconciled by the next incremental refresh, so a committed scheduling
+// transaction must not be treated as a direct snapshot mutation the way
+// PreemptPods is.
+func TestScheduleTransactionDoesNotRequestAuthoritativeRefresh(t *testing.T) {
+	ctx := context.Background()
+	node1 := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{v1.ResourcePods: "2"}).Obj()
+	cs, _, _ := setupSnapshotTest(t, ctx, []*v1.Node{node1}, nil)
+	pod1 := st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Obj()
+
+	placement, err := cs.MakePlacement([]string{"node1"})
+	if err != nil {
+		t.Fatalf("MakePlacement() error = %v", err)
+	}
+
+	err = cs.Transaction(ctx, func() (TransactionResult, error) {
+		_, err := cs.SchedulePods(ctx, []*v1.Pod{pod1}, placement, SchedulePodsOptions{})
+		return Commit, err
+	})
+	if err != nil {
+		t.Fatalf("Transaction() error = %v", err)
+	}
+
+	if cs.NeedsAuthoritativeRefresh() {
+		t.Fatalf("a committed scheduling transaction must not request an authoritative refresh")
+	}
+}
+
 func TestSchedulePodsByTemplate(t *testing.T) {
 	node1 := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{v1.ResourcePods: "3"}).Obj()
 

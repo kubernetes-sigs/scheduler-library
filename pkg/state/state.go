@@ -28,6 +28,10 @@ type ClusterState struct {
 	Cache      cache.Cache
 	profiles   *upstreamsync.ProfileMap
 	sharedSnap *cache.Snapshot
+	// prev is the ClusterSnapshot returned by the previous Snapshot call. It is
+	// consulted to detect a committed direct mutation that the incremental
+	// refresh cannot undo, so the shared snapshot can be rebuilt instead.
+	prev *snapshot.ClusterSnapshot
 }
 
 // New creates a new ClusterState with an internal Kubernetes scheduler cache, frameworks,
@@ -44,9 +48,22 @@ func New(c cache.Cache, profiles *upstreamsync.ProfileMap, snap *cache.Snapshot)
 // in-place. Calling Snapshot again invalidates any previously returned ClusterSnapshot — the caller
 // must not use a previous snapshot after requesting a new one.
 func (s *ClusterState) Snapshot(logger klog.Logger) (*snapshot.ClusterSnapshot, error) {
-	snap := s.sharedSnap
-	if err := s.Cache.UpdateSnapshot(logger, snap); err != nil {
+	// If the previous snapshot committed a direct mutation of the shared
+	// snapshot (such as a PreemptPods removal), the incremental UpdateSnapshot
+	// would not restore it: that mutation does not advance the cache-side node
+	// generation, so the refresh treats the node as already in sync and skips
+	// it. Rebuild the shared snapshot from the cache in that case, keeping the
+	// same *cache.Snapshot pointer the frameworks were built with.
+	if s.prev != nil && s.prev.NeedsAuthoritativeRefresh() {
+		fresh := cache.NewEmptySnapshot()
+		if err := s.Cache.UpdateSnapshot(logger, fresh); err != nil {
+			return nil, fmt.Errorf("failed to rebuild snapshot: %w", err)
+		}
+		*s.sharedSnap = *fresh
+	} else if err := s.Cache.UpdateSnapshot(logger, s.sharedSnap); err != nil {
 		return nil, fmt.Errorf("failed to update snapshot: %w", err)
 	}
-	return snapshot.New(snap, s.profiles), nil
+	cs := snapshot.New(s.sharedSnap, s.profiles)
+	s.prev = cs
+	return cs, nil
 }

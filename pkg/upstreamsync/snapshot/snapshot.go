@@ -54,6 +54,10 @@ type ClusterSnapshot struct {
 	// handles unusable, i.e. whenever the state they would be restoring into is no longer the one
 	// they were taken from. Unpreempt compares it with the value recorded in the handle.
 	stateVersionForPreemption uint64
+	// needsAuthoritativeRefresh records that a PreemptPods removal may have mutated
+	// the shared snapshot. The undo is not exact, so the next Snapshot must rebuild
+	// from the cache rather than refresh incrementally.
+	needsAuthoritativeRefresh bool
 }
 
 // undoLog is a stack of the operations reverting the mutations applied to the snapshot, most
@@ -115,6 +119,14 @@ func New(s *cache.Snapshot, profiles *upstreamsync.ProfileMap) *ClusterSnapshot 
 	}
 }
 
+// NeedsAuthoritativeRefresh reports whether this snapshot may have had a direct
+// mutation applied (such as a PreemptPods removal) that a later incremental
+// Cache.UpdateSnapshot cannot reconcile on its own, because that mutation does
+// not advance the cache-side node generation the refresh compares against.
+func (s *ClusterSnapshot) NeedsAuthoritativeRefresh() bool {
+	return s.needsAuthoritativeRefresh
+}
+
 // Transaction executes the provided function within a transaction.
 // It rolls back operations if the function returns Revert or an error.
 // Only a single active transaction is supported at any given time;
@@ -137,6 +149,9 @@ func (s *ClusterSnapshot) Transaction(ctx context.Context, transactionFn func() 
 		s.undoLog.restoreState(initialStateVersion)
 		s.stateVersionForPreemption = initialStateVersionForPreemption
 	} else {
+		// A direct mutation marks the snapshot itself (see PreemptPods); the
+		// transaction does not infer it from undo-log activity, so a committed
+		// scheduling transaction stays on the incremental fast path.
 		s.undoLog.commit()
 		// invalidate preemptions done within the transaction
 		s.stateVersionForPreemption++
@@ -314,6 +329,16 @@ func (s *ClusterSnapshot) PreemptPods(ctx context.Context, pods []*v1.Pod) (_ *U
 		if pod.Spec.NodeName == "" {
 			return nil, fmt.Errorf("pod %s has no node name", klog.KObj(pod))
 		}
+	}
+
+	// A non-empty preemption is about to mutate the shared snapshot directly.
+	// Mark it now, before the first removal, so the flag holds across a later
+	// commit, revert, or error: the undo path is not an exact restoration, so any
+	// of those outcomes still needs the next ClusterState refresh to rebuild from
+	// the authoritative cache. An empty preemption mutates nothing and stays on
+	// the incremental fast path.
+	if len(pods) > 0 {
+		s.needsAuthoritativeRefresh = true
 	}
 
 	initialStateVersion := s.undoLog.stateVersion
