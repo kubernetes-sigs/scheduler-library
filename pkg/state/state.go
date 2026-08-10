@@ -28,6 +28,8 @@ type ClusterState struct {
 	Cache      cache.Cache
 	profiles   *upstreamsync.ProfileMap
 	sharedSnap *cache.Snapshot
+	// generation is bumped on every Snapshot so a stale ClusterSnapshot can detect it.
+	generation uint64
 }
 
 // New creates a new ClusterState with an internal Kubernetes scheduler cache, frameworks,
@@ -44,9 +46,10 @@ func New(c cache.Cache, profiles *upstreamsync.ProfileMap, snap *cache.Snapshot)
 // in-place. Calling Snapshot again invalidates any previously returned ClusterSnapshot — the caller
 // must not use a previous snapshot after requesting a new one.
 func (s *ClusterState) Snapshot(logger klog.Logger) (*snapshot.ClusterSnapshot, error) {
+	s.generation++
 	snap := s.sharedSnap
 	if err := s.Cache.UpdateSnapshot(logger, snap); err != nil {
 		return nil, fmt.Errorf("failed to update snapshot: %w", err)
 	}
-	return snapshot.New(snap, s.profiles), nil
+	return snapshot.New(snap, s.profiles, snapshot.WithGeneration(&s.generation)), nil
 }

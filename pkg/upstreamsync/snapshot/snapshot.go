@@ -54,6 +54,10 @@ type ClusterSnapshot struct {
 	// handles unusable, i.e. whenever the state they would be restoring into is no longer the one
 	// they were taken from. Unpreempt compares it with the value recorded in the handle.
 	stateVersionForPreemption uint64
+	// generation is fixed at creation; currentGeneration tracks the ClusterState's
+	// latest. They differ once a newer snapshot supersedes this one.
+	generation        uint64
+	currentGeneration *uint64
 }
 
 // undoLog is a stack of the operations reverting the mutations applied to the snapshot, most
@@ -102,17 +106,44 @@ func (ul *undoLog) commit() {
 	ul.undoOperations = nil
 }
 
+// Option configures a ClusterSnapshot at construction.
+type Option func(*ClusterSnapshot)
+
+// WithGeneration ties the snapshot to a ClusterState generation counter so it
+// rejects mutations once a newer snapshot supersedes it.
+func WithGeneration(current *uint64) Option {
+	return func(cs *ClusterSnapshot) {
+		cs.currentGeneration = current
+		if current != nil {
+			cs.generation = *current
+		}
+	}
+}
+
 // New creates a new ClusterSnapshot stub wrapping the provided scheduler snapshot and frameworks.
 //
 // Consumers should obtain a ClusterSnapshot from simulator.SchedulingSimulator instead, either via
 // NewClusterSnapshot or via NewClusterState followed by state.ClusterState.Snapshot: those build
 // the full plugin chain out of the KubeSchedulerConfiguration and initialize the scheduler metrics,
 // which this constructor expects to have been done already.
-func New(s *cache.Snapshot, profiles *upstreamsync.ProfileMap) *ClusterSnapshot {
-	return &ClusterSnapshot{
+func New(s *cache.Snapshot, profiles *upstreamsync.ProfileMap, opts ...Option) *ClusterSnapshot {
+	cs := &ClusterSnapshot{
 		profiles:          profiles,
 		schedulerSnapshot: s,
 	}
+	for _, opt := range opts {
+		opt(cs)
+	}
+	return cs
+}
+
+// checkNotStale errors if a newer snapshot from the same ClusterState exists.
+// Mutating a superseded one corrupts the cache.Snapshot they all share.
+func (s *ClusterSnapshot) checkNotStale() error {
+	if s.currentGeneration != nil && *s.currentGeneration != s.generation {
+		return fmt.Errorf("stale snapshot: a newer snapshot has been created from the cluster state; a previous snapshot must not be used after requesting a new one")
+	}
+	return nil
 }
 
 // Transaction executes the provided function within a transaction.
@@ -120,6 +151,9 @@ func New(s *cache.Snapshot, profiles *upstreamsync.ProfileMap) *ClusterSnapshot 
 // Only a single active transaction is supported at any given time;
 // attempting to start a nested transaction will return an error.
 func (s *ClusterSnapshot) Transaction(ctx context.Context, transactionFn func() (TransactionResult, error)) error {
+	if err := s.checkNotStale(); err != nil {
+		return err
+	}
 	if s.transactionInProgress {
 		return fmt.Errorf("a transaction is already in progress")
 	}
@@ -232,6 +266,9 @@ func (s *ClusterSnapshot) SchedulePodsByTemplate(ctx context.Context, template *
 }
 
 func (s *ClusterSnapshot) schedulePods(ctx context.Context, pods iter.Seq[*v1.Pod], placement *fwk.Placement, opts SchedulePodsOptions) (_ []SchedulingResult, err error) {
+	if err := s.checkNotStale(); err != nil {
+		return nil, err
+	}
 	if placement == nil || len(placement.Nodes) == 0 {
 		return nil, nil
 	}
@@ -309,6 +346,9 @@ func (s *ClusterSnapshot) MakePlacement(candidateNodeNames []string) (*fwk.Place
 // If any pod fails to be preempted, all previously preempted pods in this call
 // are automatically restored and an error is returned.
 func (s *ClusterSnapshot) PreemptPods(ctx context.Context, pods []*v1.Pod) (_ *Unpreemption, err error) {
+	if err := s.checkNotStale(); err != nil {
+		return nil, err
+	}
 	// Validate all pods before making any changes.
 	for _, pod := range pods {
 		if pod.Spec.NodeName == "" {
@@ -371,6 +411,9 @@ func (s *ClusterSnapshot) PreemptPods(ctx context.Context, pods []*v1.Pod) (_ *U
 // The handle is consumed even if putting some of the pods back fails, in which case the pods that
 // were restored are still registered in the undo log and are rolled back with the transaction.
 func (s *ClusterSnapshot) Unpreempt(u *Unpreemption) ([]*v1.Pod, error) {
+	if err := s.checkNotStale(); err != nil {
+		return nil, err
+	}
 	if u == nil {
 		return nil, fmt.Errorf("preemption handle is nil")
 	}
