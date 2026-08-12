@@ -86,6 +86,10 @@ type SchedulingResult struct {
 // snapshot it was taken from: any permanent mutation of that snapshot invalidates it, since the
 // pods it holds could no longer be restored to the state they were removed from.
 type Unpreemption struct {
+	// owner is the snapshot that took the pods away. The version below says
+	// whether it has moved on since; this says whether it is the one being
+	// asked, because a newer wrapper starts its versions again from zero.
+	owner *ClusterSnapshot
 	// pods are the pods that were preempted, returned to the caller by Unpreempt.
 	pods []*v1.Pod
 	// revertFn puts the pods back into the snapshot, registering the undo of each addition.

@@ -401,6 +401,7 @@ func (s *ClusterSnapshot) PreemptPods(ctx context.Context, pods []*v1.Pod) (_ *U
 	}
 
 	return &Unpreemption{
+		owner:                  s,
 		pods:                   pods,
 		revertFn:               unpreemptFn,
 		validPreemptionVersion: s.stateVersionForPreemption,
@@ -416,6 +417,9 @@ func (s *ClusterSnapshot) Unpreempt(u *Unpreemption) ([]*v1.Pod, error) {
 	}
 	if u == nil {
 		return nil, fmt.Errorf("preemption handle is nil")
+	}
+	if u.owner != s {
+		return nil, fmt.Errorf("preemption handle is invalid: it belongs to a superseded snapshot")
 	}
 	if s.stateVersionForPreemption != u.validPreemptionVersion {
 		return nil, fmt.Errorf("preemption handle is invalid: snapshot has been permanently mutated since preemption")

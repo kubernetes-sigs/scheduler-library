@@ -56,6 +56,14 @@ func TestClusterState_StaleSnapshotRejectsMutation(t *testing.T) {
 		t.Fatalf("Snapshot() error = %v", err)
 	}
 
+	// The handle belongs to stale, so the snapshot that superseded it will not
+	// replay it either. Only checking the receiver would let this through: the
+	// revert closes over the shared state, and current starts its own preemption
+	// versions at zero, which is what the handle recorded.
+	if _, err := current.Unpreempt(handle); err == nil {
+		t.Error("Unpreempt() on the current snapshot with a handle from the stale one = nil, want error")
+	}
+
 	// Every mutation entry point on the stale snapshot is rejected.
 	if _, err := stale.PreemptPods(ctx, []*v1.Pod{victim2}); err == nil || !strings.Contains(err.Error(), "stale") {
 		t.Fatalf("stale PreemptPods should be rejected, got %v", err)
