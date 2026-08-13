@@ -114,7 +114,7 @@ func schedule(podNames []string, candidateNodes []string, opts SchedulePodsOptio
 			}
 			pods = append(pods, p)
 		}
-		placement, err := sc.cs.MakePlacement(candidateNodes)
+		placement, err := sc.cs.MakePlacement(sets.New(candidateNodes...))
 		if err != nil {
 			t.Fatalf("schedule: MakePlacement failed: %v", err)
 		}
@@ -132,7 +132,7 @@ func canSchedule(podName string, candidateNodes []string) stepFn {
 		if !ok {
 			t.Fatalf("canSchedule: pod %q not found in stepContext", podName)
 		}
-		placement, err := sc.cs.MakePlacement(candidateNodes)
+		placement, err := sc.cs.MakePlacement(sets.New(candidateNodes...))
 		if err != nil {
 			t.Fatalf("canSchedule: MakePlacement failed: %v", err)
 		}
@@ -517,7 +517,7 @@ func TestMakePlacement(t *testing.T) {
 
 	cs, _, _ := setupSnapshotTest(t, context.Background(), []*v1.Node{node1, node2}, nil)
 
-	placement, err := cs.MakePlacement([]string{"node1", "node2"})
+	placement, err := cs.MakePlacement(sets.New("node1", "node2"))
 	if err != nil {
 		t.Fatalf("unexpected error from MakePlacement: %v", err)
 	}
@@ -525,16 +525,36 @@ func TestMakePlacement(t *testing.T) {
 		t.Fatalf("expected placement with 2 nodes, got %v", placement)
 	}
 
-	_, err = cs.MakePlacement([]string{"node1", "non-existent-node"})
+	_, err = cs.MakePlacement(sets.New("node1", "non-existent-node"))
 	if err == nil {
 		t.Fatalf("expected error when node not found in snapshot, got nil")
 	}
+}
 
-	// Two entries for one node make the placement as long as this two-node
-	// snapshot, which AssumePlacement reads as no restriction at all.
-	_, err = cs.MakePlacement([]string{"node1", "node1"})
+// Placement.Nodes is an exported slice on an upstream type, so a placement that
+// left MakePlacement well formed does not have to arrive that way.
+func TestCanSchedulePodRejectsPlacementNamingANodeTwice(t *testing.T) {
+	ctx := t.Context()
+	node := func(name string) *v1.Node {
+		return st.MakeNode().Name(name).Capacity(map[v1.ResourceName]string{
+			v1.ResourceCPU:    "0",
+			v1.ResourceMemory: "0",
+			v1.ResourcePods:   "110",
+		}).Obj()
+	}
+	cs, _, _ := setupSnapshotTest(t, ctx, []*v1.Node{node("node1"), node("node2")}, nil)
+	pod := st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").
+		SchedulerName(v1.DefaultSchedulerName).Obj()
+
+	placement, err := cs.MakePlacement(sets.New("node1", "node2"))
+	if err != nil {
+		t.Fatalf("MakePlacement() error = %v", err)
+	}
+	placement.Nodes[1] = placement.Nodes[0]
+
+	nodes, _, err := cs.CanSchedulePod(ctx, pod, placement)
 	if err == nil {
-		t.Fatalf("expected error when a node is named twice, got nil")
+		t.Fatalf("expected an error for a placement naming node1 twice, got nodes %v", nodes)
 	}
 }
 
@@ -601,7 +621,7 @@ func TestCanSchedulePod(t *testing.T) {
 			}
 			pod := podBuilder.Obj()
 
-			placement, err := cs.MakePlacement(tc.candidateNodes)
+			placement, err := cs.MakePlacement(sets.New(tc.candidateNodes...))
 			if err != nil && !tc.expectErr {
 				t.Fatalf("MakePlacement() error = %v", err)
 			}
@@ -860,7 +880,7 @@ func TestSchedulePods(t *testing.T) {
 
 			cs, snap, _ := setupSnapshotTest(t, ctx, tc.nodes, nil)
 
-			placement, err := cs.MakePlacement(tc.candidateNodes)
+			placement, err := cs.MakePlacement(sets.New(tc.candidateNodes...))
 			if err != nil && !tc.expectErr {
 				t.Fatalf("MakePlacement() error = %v, expectErr %v", err, tc.expectErr)
 			}
@@ -1042,7 +1062,7 @@ func TestSchedulePodsByTemplate(t *testing.T) {
 
 			cs, snap, _ := setupSnapshotTest(t, ctx, tc.nodes, nil)
 
-			placement, err := cs.MakePlacement(tc.candidateNodes)
+			placement, err := cs.MakePlacement(sets.New(tc.candidateNodes...))
 			if err != nil && !tc.expectErr {
 				t.Fatalf("MakePlacement() error = %v, expectErr %v", err, tc.expectErr)
 			}
@@ -1107,7 +1127,7 @@ func TestResetMutations_NodeGenerationRestored(t *testing.T) {
 		t.Fatalf("PreemptPods failed: %v", err)
 	}
 
-	placement, err := cs.MakePlacement([]string{"node2"})
+	placement, err := cs.MakePlacement(sets.New("node2"))
 	if err != nil {
 		t.Fatalf("MakePlacement failed: %v", err)
 	}

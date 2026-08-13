@@ -23,6 +23,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
@@ -348,7 +349,7 @@ func TestScheduleOnePod(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cs, snap, _ := setupSnapshotTest(t, ctx, tc.nodes, nil)
 
-			placement, err := cs.MakePlacement([]string{tc.candidate})
+			placement, err := cs.MakePlacement(sets.New(tc.candidate))
 			if err != nil {
 				t.Fatalf("MakePlacement failed: %v", err)
 			}

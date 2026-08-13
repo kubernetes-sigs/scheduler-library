@@ -22,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/klog/v2"
@@ -356,7 +357,7 @@ func TestNewClusterSnapshot_Scheduling(t *testing.T) {
 		},
 	}
 
-	placement, err := snap.MakePlacement([]string{"node1"})
+	placement, err := snap.MakePlacement(sets.New("node1"))
 	if err != nil {
 		t.Fatalf("MakePlacement failed: %v", err)
 	}
@@ -427,7 +428,7 @@ func TestClusterState_Scheduling(t *testing.T) {
 		},
 	}
 
-	placement, err := snap.MakePlacement([]string{"node1"})
+	placement, err := snap.MakePlacement(sets.New("node1"))
 	if err != nil {
 		t.Fatalf("MakePlacement failed: %v", err)
 	}

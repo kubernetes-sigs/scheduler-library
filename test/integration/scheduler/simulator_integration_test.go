@@ -19,6 +19,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/informers"
 	"k8s.io/klog/v2"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
@@ -115,7 +116,7 @@ func TestSimulatorIntegrationFlow(t *testing.T) {
 		v1.ResourceCPU: "4",
 	}).Obj()
 
-	placement, err := snap.MakePlacement([]string{"node1"})
+	placement, err := snap.MakePlacement(sets.New("node1"))
 	if err != nil {
 		t.Fatalf("MakePlacement failed: %v", err)
 	}
