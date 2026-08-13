@@ -529,6 +529,13 @@ func TestMakePlacement(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error when node not found in snapshot, got nil")
 	}
+
+	// Two entries for one node make the placement as long as this two-node
+	// snapshot, which AssumePlacement reads as no restriction at all.
+	_, err = cs.MakePlacement([]string{"node1", "node1"})
+	if err == nil {
+		t.Fatalf("expected error when a node is named twice, got nil")
+	}
 }
 
 func TestCanSchedulePod(t *testing.T) {

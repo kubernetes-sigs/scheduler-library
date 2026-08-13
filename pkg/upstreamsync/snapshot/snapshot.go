@@ -298,7 +298,15 @@ func (s *ClusterSnapshot) schedulePods(ctx context.Context, pods iter.Seq[*v1.Po
 // MakePlacement creates a framework.Placement containing NodeInfo structures for each candidate node name.
 func (s *ClusterSnapshot) MakePlacement(candidateNodeNames []string) (*fwk.Placement, error) {
 	nodes := make([]fwk.NodeInfo, 0, len(candidateNodeNames))
+	// A name given twice makes the placement as long as a wider set of nodes,
+	// and AssumePlacement reads a placement the length of the snapshot as every
+	// node before it looks at any of them.
+	named := make(map[string]struct{}, len(candidateNodeNames))
 	for _, name := range candidateNodeNames {
+		if _, repeated := named[name]; repeated {
+			return nil, fmt.Errorf("node %s is named more than once in the placement", name)
+		}
+		named[name] = struct{}{}
 		ni, err := s.schedulerSnapshot.NodeInfos().Get(name)
 		if err != nil {
 			return nil, fmt.Errorf("error getting %s from snapshot: %w", name, err)
