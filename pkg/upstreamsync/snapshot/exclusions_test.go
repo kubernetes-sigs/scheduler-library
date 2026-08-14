@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -266,14 +267,21 @@ func TestCanSchedulePodWithExclusions(t *testing.T) {
 				t.Fatalf("CanSchedulePodWithExclusions() error = %v", err)
 			}
 
+			// CanSchedulePod filters nodes in parallel, so the feasible list
+			// has no guaranteed order — compare order-insensitively, like
+			// TestCanSchedulePod does.
+			feasibleCmpOpts := []cmp.Option{
+				cmpopts.EquateEmpty(),
+				cmpopts.SortSlices(func(x, y string) bool { return x < y }),
+			}
 			plainFeasible, _, err := cs.CanSchedulePod(ctx, pod, placement)
 			if err != nil {
 				t.Fatalf("CanSchedulePod() error = %v", err)
 			}
-			if diff := cmp.Diff(plainFeasible, feasible); diff != "" {
+			if diff := cmp.Diff(plainFeasible, feasible, feasibleCmpOpts...); diff != "" {
 				t.Errorf("feasible nodes differ from CanSchedulePod (-plain +withExclusions):\n%s", diff)
 			}
-			if diff := cmp.Diff(tc.expectNodes, feasible); diff != "" {
+			if diff := cmp.Diff(tc.expectNodes, feasible, feasibleCmpOpts...); diff != "" {
 				t.Errorf("unexpected feasible nodes (-want +got):\n%s", diff)
 			}
 			if diff := cmp.Diff(tc.expectExcluded, exclusions); diff != "" {
