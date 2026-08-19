@@ -17,6 +17,7 @@ package upstreamsync
 import (
 	"context"
 	"fmt"
+	"maps"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -24,6 +25,7 @@ import (
 	"k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
+	restclient "k8s.io/client-go/rest"
 	resourceslicetracker "k8s.io/dynamic-resource-allocation/resourceslice/tracker"
 	"k8s.io/klog/v2"
 	configv1 "k8s.io/kube-scheduler/config/v1"
@@ -67,6 +69,7 @@ type FrameworkCapturer = scheduler.FrameworkCapturer
 type frameworkOptions struct {
 	profiles                   []schedulerapi.KubeSchedulerProfile
 	frameworkOutOfTreeRegistry frameworkruntime.Registry
+	kubeConfig                 *restclient.Config
 	applyDefaultProfile        bool
 	extenders                  []schedulerapi.Extender
 	frameworkCapturer          FrameworkCapturer
@@ -125,6 +128,22 @@ func WithProfiles(p ...schedulerapi.KubeSchedulerProfile) Option {
 	}
 }
 
+// WithFrameworkOutOfTreeRegistry sets the registry for out-of-tree plugins. Those plugins
+// will be appended to the default registry.
+func WithFrameworkOutOfTreeRegistry(registry frameworkruntime.Registry) Option {
+	cloned := maps.Clone(registry)
+	return func(o *frameworkOptions) {
+		o.frameworkOutOfTreeRegistry = cloned
+	}
+}
+
+// WithKubeConfig sets the kube config exposed to plugins via fwk.Handle.
+func WithKubeConfig(cfg *restclient.Config) Option {
+	return func(o *frameworkOptions) {
+		o.kubeConfig = cfg
+	}
+}
+
 // NewProfileMap builds the scheduling profiles out of the given configuration and dependencies.
 //
 // UPSTREAM-DIFF: extracted from scheduler.New, keeping only the framework construction. Everything
@@ -165,7 +184,7 @@ func NewProfileMap(ctx context.Context,
 
 	registry := frameworkplugins.NewInTreeRegistry()
 	if err := registry.Merge(options.frameworkOutOfTreeRegistry); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("merging out-of-tree plugin registry: %w", err)
 	}
 
 	extenders, err := buildExtenders(logger, options.extenders, options.profiles)
@@ -214,6 +233,7 @@ func NewProfileMap(ctx context.Context,
 
 	profileMap, err := profile.NewMap(ctx, options.profiles, registry, recorderFactory,
 		frameworkruntime.WithClientSet(client),
+		frameworkruntime.WithKubeConfig(options.kubeConfig),
 		frameworkruntime.WithInformerFactory(informerFactory),
 		frameworkruntime.WithPodNominator(podNominator),
 		frameworkruntime.WithPodActivator(podActivator),
