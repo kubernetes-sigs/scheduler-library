@@ -32,6 +32,7 @@ import (
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	schedFwk "k8s.io/kubernetes/pkg/scheduler/framework"
+	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 )
 
 // Simulator is the set of "what-if" operations that run against a single in-memory view of the
@@ -75,6 +76,20 @@ type Simulator interface {
 	Unpreempt(u *snapshot.Unpreemption) ([]*v1.Pod, error)
 }
 
+type simulatorOptions struct {
+	outOfTreeRegistry frameworkruntime.Registry
+}
+
+// Option configures a SchedulingSimulator.
+type Option func(*simulatorOptions)
+
+// WithOutOfTreeRegistry configures the simulator to use the provided out-of-tree plugin registry.
+func WithOutOfTreeRegistry(registry frameworkruntime.Registry) Option {
+	return func(o *simulatorOptions) {
+		o.outOfTreeRegistry = registry
+	}
+}
+
 // SchedulingSimulator is the entry point of the library: it owns the scheduler configuration and
 // the informers, and creates the objects the simulation is run against (see NewClusterState and
 // NewClusterSnapshot). It is meant to be created once and reused; every state and snapshot it
@@ -83,17 +98,22 @@ type SchedulingSimulator struct {
 	cfg             *schedulerapi.KubeSchedulerConfiguration
 	informerFactory informers.SharedInformerFactory
 	client          kubernetes.Interface
+	opts            []upstreamsync.Option
 }
 
 // NewSchedulingSimulator creates a new SchedulingSimulator.
 // The cfg may be nil, in which case the default kube-scheduler profile is used, and so may the
 // informerFactory, in which case one is created from the client. The informers are started and
 // synced before returning, so the call blocks until the cluster state has been read.
+//
+// Out-of-tree plugins can be registered by passing WithOutOfTreeRegistry in opts. The read-only
+// rest config from client is automatically exposed to plugins via fwk.Handle.KubeConfig().
 func NewSchedulingSimulator(
 	ctx context.Context,
 	cfg *schedulerapi.KubeSchedulerConfiguration,
 	client ReadonlyClient,
 	informerFactory informers.SharedInformerFactory,
+	opts ...Option,
 ) (*SchedulingSimulator, error) {
 	if client.client == nil {
 		return nil, fmt.Errorf("client needs to be provided, got nil")
@@ -112,10 +132,24 @@ func NewSchedulingSimulator(
 		return nil, res.Err
 	}
 
+	var simOpts simulatorOptions
+	for _, opt := range opts {
+		opt(&simOpts)
+	}
+
+	var frameworkOpts []upstreamsync.Option
+	if len(simOpts.outOfTreeRegistry) > 0 {
+		frameworkOpts = append(frameworkOpts, upstreamsync.WithFrameworkOutOfTreeRegistry(simOpts.outOfTreeRegistry))
+	}
+	if client.config != nil {
+		frameworkOpts = append(frameworkOpts, upstreamsync.WithKubeConfig(client.config))
+	}
+
 	return &SchedulingSimulator{
 		cfg:             cfg,
 		informerFactory: informerFactory,
 		client:          client.client,
+		opts:            frameworkOpts,
 	}, nil
 }
 
@@ -145,7 +179,7 @@ func (s *SchedulingSimulator) NewClusterSnapshot(ctx context.Context, pods []*v1
 }
 
 func (s *SchedulingSimulator) buildProfileMap(ctx context.Context, snap *cache.Snapshot) (*upstreamsync.ProfileMap, error) {
-	profiles, err := framework.NewProfileMap(ctx, s.client, s.informerFactory, snap, s.cfg)
+	profiles, err := framework.NewProfileMap(ctx, s.client, s.informerFactory, snap, s.cfg, s.opts...)
 	if err != nil {
 		return nil, fmt.Errorf("schedlib: building scheduler: %w", err)
 	}
