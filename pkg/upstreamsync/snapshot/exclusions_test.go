@@ -218,6 +218,7 @@ func TestCanSchedulePodWithExclusions(t *testing.T) {
 		name           string
 		candidateNodes []string
 		podRequestCPU  string
+		nodeAffinity   *v1.NodeAffinity
 		expectNodes    []string
 		expectExcluded []NodeExclusion
 	}{
@@ -234,6 +235,46 @@ func TestCanSchedulePodWithExclusions(t *testing.T) {
 			expectNodes:    []string{},
 			expectExcluded: []NodeExclusion{
 				{NodeName: "node1", Plugin: "NodeResourcesFit", Stage: RejectionStageFilter},
+			},
+		},
+		{
+			// A metadata.name affinity makes NodeAffinity.PreFilter return a
+			// PreFilterResult, so node2 is narrowed out before Filter runs.
+			name:           "prefilter narrowing is attributed to the narrowing plugin",
+			candidateNodes: []string{"node1", "node2"},
+			nodeAffinity: &v1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+					NodeSelectorTerms: []v1.NodeSelectorTerm{{
+						MatchFields: []v1.NodeSelectorRequirement{
+							{Key: metav1.ObjectNameField, Operator: v1.NodeSelectorOpIn, Values: []string{"node1"}},
+						},
+					}},
+				},
+			},
+			expectNodes: []string{"node1"},
+			expectExcluded: []NodeExclusion{
+				{NodeName: "node2", Plugin: "NodeAffinity", Stage: RejectionStagePreFilterNarrowing},
+			},
+		},
+		{
+			// Two non-intersecting metadata.name requirements in one term make
+			// NodeAffinity.PreFilter reject the pod outright for every node.
+			name:           "prefilter rejection is attributed to the rejecting plugin",
+			candidateNodes: []string{"node1", "node2"},
+			nodeAffinity: &v1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+					NodeSelectorTerms: []v1.NodeSelectorTerm{{
+						MatchFields: []v1.NodeSelectorRequirement{
+							{Key: metav1.ObjectNameField, Operator: v1.NodeSelectorOpIn, Values: []string{"node1"}},
+							{Key: metav1.ObjectNameField, Operator: v1.NodeSelectorOpIn, Values: []string{"node2"}},
+						},
+					}},
+				},
+			},
+			expectNodes: []string{},
+			expectExcluded: []NodeExclusion{
+				{NodeName: "node1", Plugin: "NodeAffinity", Stage: RejectionStagePreFilter},
+				{NodeName: "node2", Plugin: "NodeAffinity", Stage: RejectionStagePreFilter},
 			},
 		},
 	}
@@ -255,6 +296,9 @@ func TestCanSchedulePodWithExclusions(t *testing.T) {
 			if tc.podRequestCPU != "" {
 				podBuilder = podBuilder.Req(map[v1.ResourceName]string{v1.ResourceCPU: tc.podRequestCPU})
 			}
+			if tc.nodeAffinity != nil {
+				podBuilder = podBuilder.NodeAffinity(tc.nodeAffinity)
+			}
 			pod := podBuilder.Obj()
 
 			placement, err := cs.MakePlacement(tc.candidateNodes)
@@ -267,9 +311,11 @@ func TestCanSchedulePodWithExclusions(t *testing.T) {
 				t.Fatalf("CanSchedulePodWithExclusions() error = %v", err)
 			}
 
-			// CanSchedulePod filters nodes in parallel, so the feasible list
-			// has no guaranteed order — compare order-insensitively, like
-			// TestCanSchedulePod does.
+			// Only the feasible-node list is compared order-insensitively (the
+			// SortSlices option below applies to []string only): CanSchedulePod
+			// filters nodes in parallel, so that list has no guaranteed order,
+			// whereas the NodeExclusion records are placement-ordered by
+			// contract and are compared strictly.
 			feasibleCmpOpts := []cmp.Option{
 				cmpopts.EquateEmpty(),
 				cmpopts.SortSlices(func(x, y string) bool { return x < y }),

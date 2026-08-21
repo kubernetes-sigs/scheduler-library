@@ -51,11 +51,13 @@ func SetupSnapshotTest(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (*
 					PreFilter: schedulerapi.PluginSet{
 						Enabled: []schedulerapi.Plugin{
 							{Name: "NodeResourcesFit"},
+							{Name: "NodeAffinity"},
 						},
 					},
 					Filter: schedulerapi.PluginSet{
 						Enabled: []schedulerapi.Plugin{
 							{Name: "NodeResourcesFit"},
+							{Name: "NodeAffinity"},
 						},
 					},
 					Bind: schedulerapi.PluginSet{
@@ -72,6 +74,10 @@ func SetupSnapshotTest(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (*
 								Type: schedulerapi.LeastAllocated,
 							},
 						},
+					},
+					{
+						Name: "NodeAffinity",
+						Args: &schedulerapi.NodeAffinityArgs{},
 					},
 				},
 			},
