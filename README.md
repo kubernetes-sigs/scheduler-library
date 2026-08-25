@@ -18,8 +18,8 @@ Everything a consumer needs is reachable from the [`pkg/simulator`](pkg/simulato
 
 1. `simulator.NewReadonlyClient(restConfig)` — the only client type the library accepts; its transport rejects mutating requests.
 2. `simulator.NewSchedulingSimulator(ctx, cfg, client, informerFactory)` — created once and reused.
-3. `SchedulingSimulator.NewClusterState(ctx)` (live cluster state) or `SchedulingSimulator.NewClusterSnapshot(ctx, pods, nodes)` (explicit state).
-4. `ClusterSnapshot.MakePlacement`, `CanSchedulePod`, `SchedulePods`, `SchedulePodsByTemplate`, `PreemptPods`, `Unpreempt` and `Transaction` — the simulation methods.
+3. `SchedulingSimulator.NewClusterState(ctx)` (live cluster state) or `SchedulingSimulator.NewClusterSnapshot(ctx, pods, nodes, podGroups, compositePodGroups)` (explicit state).
+4. `ClusterSnapshot.MakePlacement`, `CanSchedulePod`, `SchedulePods`, `SchedulePodsByTemplate`, `ScheduleWorkload`, `PreemptPods`, `Unpreempt` and `Transaction` — the simulation methods.
 
 The remaining packages are implementation detail: `pkg/upstreamsync` holds logic duplicated from (or destined for) the upstream kube-scheduler, and `pkg/framework` wires the upstream scheduler framework for in-memory use.
 

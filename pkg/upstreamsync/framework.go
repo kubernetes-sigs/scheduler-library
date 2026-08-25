@@ -103,6 +103,21 @@ func (p *ProfileMap) FrameworkForPod(pod *v1.Pod) (framework.Framework, error) {
 	return fwk, nil
 }
 
+// FrameworkForPodGroup returns the framework of the profile requested by the pod group,
+// defaulting to the default scheduler name when its member pods do not name one.
+//
+// UPSTREAM-DIFF: adapted from Scheduler.frameworkForPodGroup in schedule_one_podgroup.go.
+// It checks its podgroup members and delegates to FrameworkForPod which looks up the podgroup member profile.
+// Pods admitted by the API server always have that field defaulted, while
+// simulated pods may not, so an empty name is mapped to the default profile here.
+func (p *ProfileMap) FrameworkForPodGroup(podGroupInfo *framework.PodGroupInfo) (framework.Framework, error) {
+	pods := podGroupInfo.GetUnscheduledPods()
+	if len(pods) == 0 {
+		return nil, fmt.Errorf("no pods in pod group")
+	}
+	return p.FrameworkForPod(pods[0])
+}
+
 func WithProfiles(p ...schedulerapi.KubeSchedulerProfile) Option {
 	return func(o *frameworkOptions) {
 		o.profiles = p

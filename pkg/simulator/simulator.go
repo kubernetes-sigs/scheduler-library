@@ -24,6 +24,8 @@ import (
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
 
 	v1 "k8s.io/api/core/v1"
+	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
+	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -58,6 +60,11 @@ type Simulator interface {
 	// each SchedulingResult carries the generated pod, which is the only way to learn what was
 	// scheduled.
 	SchedulePodsByTemplate(ctx context.Context, template *v1.PodTemplateSpec, placement *fwk.Placement, maxPods int, opts snapshot.SchedulePodsByTemplateOptions) ([]snapshot.SchedulingResult, error)
+
+	// ScheduleWorkload schedules the given pods belonging to the same hierarchy using the
+	// workload-aware scheduling algorithm. If the pods do not belong to the same hierarchy,
+	// it returns an error.
+	ScheduleWorkload(ctx context.Context, pods []*v1.Pod, opts snapshot.ScheduleWorkloadOptions) ([]snapshot.SchedulingResult, error)
 
 	// PreemptPods removes the given running pods from the snapshot and returns the handle that puts
 	// them back. The handle is single-use and is invalidated by any later permanent mutation of the
@@ -133,9 +140,15 @@ func (s *SchedulingSimulator) NewClusterState(ctx context.Context) (*state.Clust
 	return state.New(internalCache, profiles, snap), nil
 }
 
-// NewClusterSnapshot initializes a new snapshot with the provided pods and nodes.
-func (s *SchedulingSimulator) NewClusterSnapshot(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (Simulator, error) {
-	snap := cache.NewSnapshot(pods, nodes)
+// NewClusterSnapshot initializes a new snapshot with the provided pods, nodes, pod groups, and composite pod groups.
+func (s *SchedulingSimulator) NewClusterSnapshot(
+	ctx context.Context,
+	pods []*v1.Pod,
+	nodes []*v1.Node,
+	podGroups []*schedulingv1beta1.PodGroup,
+	compositePodGroups []*schedulingv1alpha3.CompositePodGroup,
+) (Simulator, error) {
+	snap := cache.NewTestSnapshotWithCompositePodGroups(pods, nodes, podGroups, compositePodGroups)
 
 	profiles, err := s.buildProfileMap(ctx, snap)
 	if err != nil {

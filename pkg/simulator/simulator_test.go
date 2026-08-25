@@ -19,13 +19,18 @@ import (
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
+	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/features"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
+	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
 )
 
@@ -297,7 +302,7 @@ func TestNewClusterSnapshot(t *testing.T) {
 				t.Fatalf("NewSchedulingSimulator failed: %v", err)
 			}
 
-			snapshot, err := sim.NewClusterSnapshot(ctx, nil, nil)
+			snapshot, err := sim.NewClusterSnapshot(ctx, nil, nil, nil, nil)
 			if (err != nil) != tc.expectErr {
 				t.Errorf("NewClusterSnapshot err = %v, expectErr %v", err, tc.expectErr)
 			}
@@ -343,7 +348,7 @@ func TestNewClusterSnapshot_Scheduling(t *testing.T) {
 		},
 	}
 
-	snap, err := sim.NewClusterSnapshot(ctx, nil, nodes)
+	snap, err := sim.NewClusterSnapshot(ctx, nil, nodes, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to create snapshot: %v", err)
 	}
@@ -443,5 +448,75 @@ func TestClusterState_Scheduling(t *testing.T) {
 	}
 	if results[0].SelectedNodeName != "node1" {
 		t.Errorf("Expected pod to be scheduled on node1, got %q", results[0].SelectedNodeName)
+	}
+}
+
+func TestNewClusterSnapshot_PodGroupScheduling(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.GenericWorkload, true)
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.TopologyAwareWorkloadScheduling, true)
+
+	ctx := context.Background()
+	cfg := &schedulerapi.KubeSchedulerConfiguration{
+		Profiles: []schedulerapi.KubeSchedulerProfile{
+			{
+				SchedulerName: "default-scheduler",
+				Plugins: &schedulerapi.Plugins{
+					QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+					PreFilter: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "NodeResourcesFit"}}},
+					Filter:    schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "NodeResourcesFit"}}},
+					Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+				},
+				PluginConfig: []schedulerapi.PluginConfig{
+					{
+						Name: "NodeResourcesFit",
+						Args: &schedulerapi.NodeResourcesFitArgs{
+							ScoringStrategy: &schedulerapi.ScoringStrategy{
+								Type: schedulerapi.LeastAllocated,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	client := fake.NewClientset()
+	informerFactory := informers.NewSharedInformerFactory(client, 0)
+	sim, err := NewSchedulingSimulator(ctx, cfg, ReadonlyClient{client: client}, informerFactory)
+	if err != nil {
+		t.Fatalf("failed to create simulator: %v", err)
+	}
+
+	nodes := []*v1.Node{
+		st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{
+			v1.ResourceCPU:    "4",
+			v1.ResourceMemory: "4Gi",
+			v1.ResourcePods:   "10",
+		}).Obj(),
+	}
+
+	pg := st.MakePodGroup().Name("test-gang").Namespace("default").MinCount(2).Obj()
+
+	snap, err := sim.NewClusterSnapshot(ctx, nil, nodes, []*schedulingv1beta1.PodGroup{pg}, nil)
+	if err != nil {
+		t.Fatalf("failed to create snapshot with pod groups: %v", err)
+	}
+
+	pod1 := st.MakePod().Name("pod1").Namespace("default").PodGroupName("test-gang").Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).Obj()
+	pod2 := st.MakePod().Name("pod2").Namespace("default").PodGroupName("test-gang").Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).Obj()
+
+	results, err := snap.ScheduleWorkload(ctx, []*v1.Pod{pod1, pod2}, snapshot.NewScheduleWorkloadOptions(false))
+	if err != nil {
+		t.Fatalf("ScheduleWorkload failed: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("Expected 2 results, got %d", len(results))
+	}
+	for _, r := range results {
+		if !r.Status.IsSuccess() {
+			t.Errorf("Expected pod %s to schedule successfully, got: %v", r.Pod.Name, r.Status)
+		}
+		if r.SelectedNodeName != "node1" {
+			t.Errorf("Expected pod %s on node1, got %q", r.Pod.Name, r.SelectedNodeName)
+		}
 	}
 }
