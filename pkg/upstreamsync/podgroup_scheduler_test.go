@@ -180,7 +180,7 @@ func TestRunRootSchedulingAlgorithm(t *testing.T) {
 			if err != nil {
 				t.Fatalf("SetupSnapshotTestWithPodGroups failed: %v", err)
 			}
-			sched := upstreamsync.NewScheduler(snap, 0, 0, 1)
+			sched := upstreamsync.NewScheduler(snap, 0, 0, 1, nil)
 			fwkInst, err := profileMap.FrameworkForPod(&v1.Pod{})
 			if err != nil {
 				t.Fatalf("FrameworkForPod failed: %v", err)
