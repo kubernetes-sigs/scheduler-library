@@ -208,10 +208,24 @@ func schedulingResult(algRes *upstreamsync.AlgorithmResult) SchedulingResult {
 // StopOnFailure controls whether the first unschedulable pod stops the loop. Note that
 // All unexpected execution errors always propagate immediately regardless of StopOnFailure, as they
 // indicate a programming error rather than a scheduling failure.
-// Every pod that is scheduled gets its Spec.NodeName set to the selected node, which is also
-// reported by the corresponding SchedulingResult.
+// The pods passed in are left untouched. Each result carries the library's own copy of the pod the
+// attempt was made for, with Spec.NodeName set to the selected node when it was scheduled; that
+// copy is what PreemptPods takes to remove the pod again.
 func (s *ClusterSnapshot) SchedulePods(ctx context.Context, pods []*v1.Pod, placement *fwk.Placement, opts SchedulePodsOptions) ([]SchedulingResult, error) {
-	return s.schedulePods(ctx, slices.Values(pods), placement, opts)
+	return s.schedulePods(ctx, ownedCopies(pods), placement, opts)
+}
+
+// ownedCopies yields a copy of every pod, so that the simulation records the placement it made on a
+// pod of its own rather than on one the caller passed in and still owns. The pods generated from a
+// template need no such copy, as nothing outside the library holds them.
+func ownedCopies(pods []*v1.Pod) iter.Seq[*v1.Pod] {
+	return func(yield func(*v1.Pod) bool) {
+		for _, pod := range pods {
+			if !yield(pod.DeepCopy()) {
+				return
+			}
+		}
+	}
 }
 
 // SchedulePodsByTemplate attempts to schedule as many pods matching the template as possible.
@@ -273,8 +287,8 @@ func (s *ClusterSnapshot) schedulePods(ctx context.Context, pods iter.Seq[*v1.Po
 		}
 
 		if res.Status.IsSuccess() {
-			// Reflect the simulated placement on the caller's pod, so that a pod scheduled in this
-			// loop is seen as assigned by whoever inspects it, including the SchedulingResult below.
+			// The pods here are the library's own, so the placement is recorded on the pod itself
+			// and travels to the caller through the SchedulingResult below.
 			pod.Spec.NodeName = res.ScheduleResult.SuggestedHost
 		}
 

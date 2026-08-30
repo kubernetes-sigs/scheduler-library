@@ -342,6 +342,18 @@ func TestSnapshot_ActionSequences(t *testing.T) {
 			},
 		},
 		{
+			name:         "Dry-run rescheduling between preempt and unpreempt restores the original node",
+			assignedPods: map[string][]string{"node1": {"pod1"}, "singlePodNode": {}},
+			steps: []stepFn{
+				preempt("u1", "pod1"),
+				schedule([]string{"pod1"}, []string{"singlePodNode"}, NewSchedulePodsOptions(true, false)),
+				unpreempt("u1"),
+				verifySnapshot(map[string]sets.Set[string]{
+					"node1":         sets.New("pod1"),
+					"singlePodNode": sets.New[string]()}),
+			},
+		},
+		{
 			name:         "Preemption handle created in transaction fails to unpreempt in another transaction",
 			assignedPods: map[string][]string{"node1": {"pod1"}},
 			steps: []stepFn{
@@ -668,6 +680,13 @@ func TestSchedulePods(t *testing.T) {
 	pod3 := st.MakePod().Name("pod3").Namespace("default").UID("uid-pod3").Obj()
 	pod4 := st.MakePod().Name("pod4").Namespace("default").UID("uid-pod4").Obj()
 
+	// onNode is how a scheduled pod comes back: a copy carrying the node the attempt selected.
+	onNode := func(p *v1.Pod, nodeName string) *v1.Pod {
+		p = p.DeepCopy()
+		p.Spec.NodeName = nodeName
+		return p
+	}
+
 	tests := []struct {
 		name                string
 		nodes               []*v1.Node
@@ -686,7 +705,7 @@ func TestSchedulePods(t *testing.T) {
 			opts:           SchedulePodsOptions{},
 			expectResults: []SchedulingResult{
 				{
-					Pod:              pod1,
+					Pod:              onNode(pod1, "node1"),
 					SelectedNodeName: "node1",
 					Status:           fwk.NewStatus(fwk.Success),
 				},
@@ -701,7 +720,8 @@ func TestSchedulePods(t *testing.T) {
 			opts:           NewSchedulePodsOptions(true, false),
 			expectResults: []SchedulingResult{
 				{
-					Pod:              pod1,
+					// The dry run is reported like any other attempt; only the snapshot is restored.
+					Pod:              onNode(pod1, "node1"),
 					SelectedNodeName: "node1",
 					Status:           fwk.NewStatus(fwk.Success),
 				},
@@ -741,12 +761,12 @@ func TestSchedulePods(t *testing.T) {
 			opts:           NewSchedulePodsOptions(false, false),
 			expectResults: []SchedulingResult{
 				{
-					Pod:              pod1,
+					Pod:              onNode(pod1, "node1"),
 					Status:           fwk.NewStatus(fwk.Success),
 					SelectedNodeName: "node1",
 				},
 				{
-					Pod:              pod2,
+					Pod:              onNode(pod2, "node1"),
 					Status:           fwk.NewStatus(fwk.Success),
 					SelectedNodeName: "node1",
 				},
@@ -771,12 +791,12 @@ func TestSchedulePods(t *testing.T) {
 			opts:           NewSchedulePodsOptions(false, true),
 			expectResults: []SchedulingResult{
 				{
-					Pod:              pod1,
+					Pod:              onNode(pod1, "node1"),
 					Status:           fwk.NewStatus(fwk.Success),
 					SelectedNodeName: "node1",
 				},
 				{
-					Pod:              pod2,
+					Pod:              onNode(pod2, "node1"),
 					Status:           fwk.NewStatus(fwk.Success),
 					SelectedNodeName: "node1",
 				},
@@ -797,7 +817,7 @@ func TestSchedulePods(t *testing.T) {
 			opts:           NewSchedulePodsOptions(false, true),
 			expectResults: []SchedulingResult{
 				{
-					Pod:              pod1,
+					Pod:              onNode(pod1, "node1"),
 					SelectedNodeName: "node1",
 					Status:           fwk.NewStatus(fwk.Success),
 				},
@@ -817,7 +837,7 @@ func TestSchedulePods(t *testing.T) {
 			opts:           NewSchedulePodsOptions(false, true),
 			expectResults: []SchedulingResult{
 				{
-					Pod:              pod1,
+					Pod:              onNode(pod1, "node1"),
 					SelectedNodeName: "node1",
 					Status:           fwk.NewStatus(fwk.Success),
 				},
@@ -837,7 +857,7 @@ func TestSchedulePods(t *testing.T) {
 			opts:           SchedulePodsOptions{},
 			expectResults: []SchedulingResult{
 				{
-					Pod:              pod1,
+					Pod:              onNode(pod1, "node1"),
 					SelectedNodeName: "node1",
 					Status:           fwk.NewStatus(fwk.Success),
 				},
@@ -858,7 +878,13 @@ func TestSchedulePods(t *testing.T) {
 				t.Fatalf("MakePlacement() error = %v, expectErr %v", err, tc.expectErr)
 			}
 
-			results, err := cs.SchedulePods(ctx, tc.pods, placement, tc.opts)
+			// The fixtures are shared by the cases, so each one works on its own copies.
+			pods := make([]*v1.Pod, 0, len(tc.pods))
+			for _, p := range tc.pods {
+				pods = append(pods, p.DeepCopy())
+			}
+
+			results, err := cs.SchedulePods(ctx, pods, placement, tc.opts)
 			if (err != nil) != tc.expectErr {
 				t.Fatalf("SchedulePods() error = %v, expectErr %v", err, tc.expectErr)
 			}
@@ -867,7 +893,12 @@ func TestSchedulePods(t *testing.T) {
 				t.Errorf("Unexpected scheduling results (-want +got):\n%s", diff)
 			}
 
-			// SchedulePods reflects the selected node on the pods it was given.
+			// The pods belong to the caller, so the simulation must not write to them.
+			if diff := cmp.Diff(tc.pods, pods); diff != "" {
+				t.Errorf("SchedulePods mutated the pods it was given (-before +after):\n%s", diff)
+			}
+
+			// Successful results report the selected node on the Pod they return.
 			for _, res := range results {
 				if !res.Status.IsSuccess() {
 					continue
@@ -880,6 +911,31 @@ func TestSchedulePods(t *testing.T) {
 			ft.VerifySnapshot(t, snap, tc.expectSnapshotState)
 		})
 	}
+}
+
+// The pod handed to SchedulePods is not the one the snapshot ends up holding: the result carries
+// the copy that was placed, and that copy is what PreemptPods takes to remove it again.
+func TestSchedulePodsResultFeedsPreemptPods(t *testing.T) {
+	ctx := context.Background()
+	node := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{v1.ResourcePods: "1"}).Obj()
+	pod := st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Obj()
+
+	cs, snap, _ := setupSnapshotTest(t, ctx, []*v1.Node{node}, nil)
+	placement, err := cs.MakePlacement([]string{"node1"})
+	if err != nil {
+		t.Fatalf("MakePlacement() error = %v", err)
+	}
+
+	results, err := cs.SchedulePods(ctx, []*v1.Pod{pod}, placement, SchedulePodsOptions{})
+	if err != nil {
+		t.Fatalf("SchedulePods() error = %v", err)
+	}
+	ft.VerifySnapshot(t, snap, map[string]sets.Set[string]{"node1": sets.New("pod1")})
+
+	if _, err := cs.PreemptPods(ctx, []*v1.Pod{results[0].Pod}); err != nil {
+		t.Fatalf("PreemptPods(results[0].Pod) error = %v", err)
+	}
+	ft.VerifySnapshot(t, snap, map[string]sets.Set[string]{"node1": sets.New[string]()})
 }
 
 func TestSchedulePodsByTemplate(t *testing.T) {
