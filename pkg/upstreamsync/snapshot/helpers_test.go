@@ -357,7 +357,7 @@ func TestScheduleOnePod(t *testing.T) {
 			}
 			defer snap.ForgetPlacement()
 
-			algRes, revertFn, err := scheduleOnePod(ctx, cs.profiles, upstreamsync.NewScheduler(snap, 0, 0, math.MaxInt32), tc.pod)
+			algRes, revertFn, err := scheduleOnePod(ctx, cs.profiles, upstreamsync.NewScheduler(snap, 0, 0, math.MaxInt32, nil), tc.pod)
 			if (err != nil) != tc.expectErr {
 				t.Fatalf("unexpected error state: %v, expectErr: %v", err, tc.expectErr)
 			}

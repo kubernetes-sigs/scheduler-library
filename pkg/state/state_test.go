@@ -15,27 +15,31 @@
 package state
 
 import (
+	"context"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/klog/v2"
+	fwk "k8s.io/kube-scheduler/framework"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
 	plugins "k8s.io/kubernetes/pkg/scheduler/framework/plugins"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	"k8s.io/kubernetes/pkg/scheduler/profile"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
-	"sigs.k8s.io/scheduler-library/pkg/framework"
+	slframework "sigs.k8s.io/scheduler-library/pkg/framework"
 	ft "sigs.k8s.io/scheduler-library/pkg/framework/testing"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
 )
 
 func init() {
-	framework.InitMetricsOnce()
+	slframework.InitMetricsOnce()
 }
 
 func TestClusterState_AddPod(t *testing.T) {
@@ -533,4 +537,561 @@ func TestClusterState_SyncSnapshot_RevertsMutations(t *testing.T) {
 		t.Errorf("Expected SyncSnapshot to return the same snapshot instance")
 	}
 	ft.VerifySnapshot(t, sharedSnap, map[string]sets.Set[string]{"node1": sets.New("pod1")})
+}
+
+const testReservePluginName = "TestReservePlugin"
+
+type mockReservePlugin struct {
+	reserveCalled   bool
+	unreserveCalled bool
+	failReserve     bool
+}
+
+func (p *mockReservePlugin) Name() string {
+	return testReservePluginName
+}
+
+var _ fwk.ReservePlugin = &mockReservePlugin{}
+
+func (p *mockReservePlugin) Reserve(_ context.Context, _ fwk.CycleState, _ *v1.Pod, _ string) *fwk.Status {
+	p.reserveCalled = true
+	if p.failReserve {
+		return fwk.NewStatus(fwk.Error, "reserve plugin failed")
+	}
+	return fwk.NewStatus(fwk.Success)
+}
+
+func (p *mockReservePlugin) Unreserve(_ context.Context, _ fwk.CycleState, _ *v1.Pod, _ string) {
+	p.unreserveCalled = true
+}
+
+func newTestProfile(schedulerName string, reservePluginName string) *schedulerapi.KubeSchedulerProfile {
+	prof := &schedulerapi.KubeSchedulerProfile{
+		SchedulerName: schedulerName,
+	}
+	if reservePluginName != "" {
+		prof.Plugins = &schedulerapi.Plugins{
+			QueueSort: schedulerapi.PluginSet{
+				Enabled: []schedulerapi.Plugin{
+					{Name: "PrioritySort"},
+				},
+			},
+			Bind: schedulerapi.PluginSet{
+				Enabled: []schedulerapi.Plugin{
+					{Name: "DefaultBinder"},
+				},
+			},
+			Reserve: schedulerapi.PluginSet{
+				Enabled: []schedulerapi.Plugin{
+					{Name: reservePluginName},
+				},
+			},
+		}
+	}
+	return prof
+}
+
+func newTestProfileMap(ctx context.Context, sharedSnap *cache.Snapshot, registry frameworkruntime.Registry, prof *schedulerapi.KubeSchedulerProfile) (*upstreamsync.ProfileMap, error) {
+	informerFactory := informers.NewSharedInformerFactory(fake.NewClientset(), 0)
+	if registry == nil {
+		registry = plugins.NewInTreeRegistry()
+	}
+	if prof == nil {
+		prof = newTestProfile(v1.DefaultSchedulerName, "")
+	}
+	fwk, err := frameworkruntime.NewFramework(ctx, registry, prof,
+		frameworkruntime.WithSnapshotSharedLister(sharedSnap),
+		frameworkruntime.WithInformerFactory(informerFactory),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &upstreamsync.ProfileMap{
+		Map: profile.Map{
+			prof.SchedulerName: fwk,
+		},
+	}, nil
+}
+
+func TestClusterState_AssumeAndReserve(t *testing.T) {
+	tests := []struct {
+		name                 string
+		nodeNames            []string
+		pod                  *v1.Pod
+		plugin               *mockReservePlugin
+		withCustomProfileMap bool
+		profileSchedulerName string
+		nilCache             bool
+		nilProfiles          bool
+		nilCycleState        bool
+		duplicateAssume      bool
+		wantErr              bool
+		wantReserveCalled    bool
+		wantUnreserveCalled  bool
+		wantAssumedInCache   bool
+		expectedSnapshot     map[string]sets.Set[string]
+	}{
+		{
+			name:                 "successful assume and reserve",
+			nodeNames:            []string{"node1"},
+			pod:                  st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
+			plugin:               &mockReservePlugin{},
+			withCustomProfileMap: true,
+			wantErr:              false,
+			wantReserveCalled:    true,
+			wantUnreserveCalled:  false,
+			wantAssumedInCache:   true,
+			expectedSnapshot:     map[string]sets.Set[string]{"node1": sets.New("pod1")},
+		},
+		{
+			name:      "reserve plugin fails and rolls back",
+			nodeNames: []string{"node1"},
+			pod:       st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
+			plugin: &mockReservePlugin{
+				failReserve: true,
+			},
+			withCustomProfileMap: true,
+			wantErr:              true,
+			wantReserveCalled:    true,
+			wantUnreserveCalled:  true,
+			wantAssumedInCache:   false,
+			expectedSnapshot:     map[string]sets.Set[string]{"node1": sets.New[string]()},
+		},
+		{
+			name:      "pod without node name fails",
+			nodeNames: []string{"node1"},
+			pod:       st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Obj(),
+			wantErr:   true,
+		},
+		{
+			name:      "nil pod fails",
+			nodeNames: []string{"node1"},
+			pod:       nil,
+			wantErr:   true,
+		},
+		{
+			name:                 "profile not found for pod scheduler name",
+			nodeNames:            []string{"node1"},
+			pod:                  st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").SchedulerName("custom-scheduler").Obj(),
+			withCustomProfileMap: true,
+			profileSchedulerName: v1.DefaultSchedulerName,
+			wantErr:              true,
+		},
+		{
+			name:                 "duplicate assume returns error",
+			nodeNames:            []string{"node1"},
+			pod:                  st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
+			plugin:               &mockReservePlugin{},
+			withCustomProfileMap: true,
+			duplicateAssume:      true,
+			wantErr:              true,
+			wantReserveCalled:    true,
+			wantAssumedInCache:   true,
+			expectedSnapshot:     map[string]sets.Set[string]{"node1": sets.New("pod1")},
+		},
+		{
+			name:     "nil cache returns error",
+			pod:      st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
+			nilCache: true,
+			wantErr:  true,
+		},
+		{
+			name:        "nil profiles returns error",
+			pod:         st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
+			nilProfiles: true,
+			wantErr:     true,
+		},
+		{
+			name:          "nil cycleState returns error",
+			pod:           st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
+			nilCycleState: true,
+			wantErr:       true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			logger := klog.FromContext(ctx)
+			sharedSnap := cache.NewEmptySnapshot()
+
+			var profiles *upstreamsync.ProfileMap
+			var err error
+			if tc.nilProfiles {
+				profiles = nil
+			} else if tc.withCustomProfileMap {
+				registry := plugins.NewInTreeRegistry()
+				schedulerName := v1.DefaultSchedulerName
+				if tc.profileSchedulerName != "" {
+					schedulerName = tc.profileSchedulerName
+				}
+				var reservePluginName string
+				if tc.plugin != nil {
+					if err := registry.Register(testReservePluginName, func(ctx context.Context, obj runtime.Object, handle fwk.Handle) (fwk.Plugin, error) {
+						return tc.plugin, nil
+					}); err != nil {
+						t.Fatalf("Failed to register test reserve plugin: %v", err)
+					}
+					reservePluginName = testReservePluginName
+				}
+				prof := newTestProfile(schedulerName, reservePluginName)
+				profiles, err = newTestProfileMap(ctx, sharedSnap, registry, prof)
+				if err != nil {
+					t.Fatalf("newTestProfileMap failed: %v", err)
+				}
+			} else {
+				profiles = newDummyProfileMap()
+			}
+
+			var internalCache cache.Cache
+			if !tc.nilCache {
+				internalCache = cache.New(ctx, nil, false)
+				for _, n := range tc.nodeNames {
+					internalCache.AddNode(logger, st.MakeNode().Name(n).Capacity(map[v1.ResourceName]string{
+						v1.ResourceCPU:    "1",
+						v1.ResourceMemory: "1Gi",
+						v1.ResourcePods:   "110",
+					}).Obj())
+				}
+			}
+			var nodeName string
+			if tc.pod != nil {
+				nodeName = tc.pod.Spec.NodeName
+			}
+			state := New(internalCache, profiles, sharedSnap)
+			var cycleState fwk.CycleState
+			if !tc.nilCycleState {
+				cycleState = framework.NewCycleState()
+			}
+			if tc.duplicateAssume {
+				if err := state.AssumeAndReserve(ctx, tc.pod, cycleState, nodeName); err != nil {
+					t.Fatalf("First AssumeAndReserve() unexpected error = %v", err)
+				}
+			}
+
+			err = state.AssumeAndReserve(ctx, tc.pod, cycleState, nodeName)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("AssumeAndReserve() error = %v, wantErr = %v", err, tc.wantErr)
+			}
+
+			if tc.plugin != nil {
+				if tc.plugin.reserveCalled != tc.wantReserveCalled {
+					t.Errorf("plugin.reserveCalled = %v, want %v", tc.plugin.reserveCalled, tc.wantReserveCalled)
+				}
+				if tc.plugin.unreserveCalled != tc.wantUnreserveCalled {
+					t.Errorf("plugin.unreserveCalled = %v, want %v", tc.plugin.unreserveCalled, tc.wantUnreserveCalled)
+				}
+			}
+
+			if tc.pod != nil && tc.pod.Spec.NodeName != "" && !tc.nilCache {
+				isAssumed, _ := state.Cache.IsAssumedPod(tc.pod)
+				if isAssumed != tc.wantAssumedInCache {
+					t.Errorf("state.Cache.IsAssumedPod() = %v, want %v", isAssumed, tc.wantAssumedInCache)
+				}
+			}
+
+			if tc.expectedSnapshot != nil {
+				if err := state.SyncSnapshot(logger); err != nil {
+					t.Fatalf("SyncSnapshot() error = %v", err)
+				}
+				ft.VerifySnapshot(t, sharedSnap, tc.expectedSnapshot)
+			}
+		})
+	}
+}
+
+func TestClusterState_UnreserveAndForget(t *testing.T) {
+	tests := []struct {
+		name                 string
+		nodeNames            []string
+		assumePodFirst       bool
+		boundPodFirst        bool
+		pod                  *v1.Pod
+		podToUnreserve       *v1.Pod
+		plugin               *mockReservePlugin
+		withCustomProfileMap bool
+		profileSchedulerName string
+		nilCache             bool
+		nilProfiles          bool
+		wantErr              bool
+		wantUnreserveCalled  bool
+		wantAssumedInCache   bool
+		expectedSnapshot     map[string]sets.Set[string]
+	}{
+		{
+			name:                 "successful unreserve and forget",
+			nodeNames:            []string{"node1"},
+			assumePodFirst:       true,
+			pod:                  st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
+			plugin:               &mockReservePlugin{},
+			withCustomProfileMap: true,
+			wantErr:              false,
+			wantUnreserveCalled:  true,
+			wantAssumedInCache:   false,
+			expectedSnapshot:     map[string]sets.Set[string]{"node1": sets.New[string]()},
+		},
+		{
+			name:                 "unreserve and forget pod with node mismatch returns error",
+			nodeNames:            []string{"node1", "node2"},
+			assumePodFirst:       true,
+			pod:                  st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
+			podToUnreserve:       st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node2").Obj(),
+			plugin:               &mockReservePlugin{},
+			withCustomProfileMap: true,
+			wantErr:              true,
+			wantUnreserveCalled:  true,
+			wantAssumedInCache:   true,
+			expectedSnapshot:     map[string]sets.Set[string]{"node1": sets.New("pod1"), "node2": sets.New[string]()},
+		},
+		{
+			name:                 "unreserve and forget bound pod returns error",
+			nodeNames:            []string{"node1"},
+			boundPodFirst:        true,
+			pod:                  st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
+			plugin:               &mockReservePlugin{},
+			withCustomProfileMap: true,
+			wantErr:              true,
+			wantUnreserveCalled:  false,
+			wantAssumedInCache:   false,
+			expectedSnapshot:     map[string]sets.Set[string]{"node1": sets.New("pod1")},
+		},
+		{
+			name:      "pod without node name fails",
+			nodeNames: []string{"node1"},
+			pod:       st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Obj(),
+			wantErr:   true,
+		},
+		{
+			name:      "nil pod fails",
+			nodeNames: []string{"node1"},
+			pod:       nil,
+			wantErr:   true,
+		},
+		{
+			name:                 "profile not found for pod scheduler name",
+			nodeNames:            []string{"node1"},
+			pod:                  st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").SchedulerName("custom-scheduler").Obj(),
+			withCustomProfileMap: true,
+			profileSchedulerName: v1.DefaultSchedulerName,
+			wantErr:              true,
+		},
+		{
+			name:     "nil cache returns error",
+			pod:      st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
+			nilCache: true,
+			wantErr:  true,
+		},
+		{
+			name:        "nil profiles returns error",
+			pod:         st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj(),
+			nilProfiles: true,
+			wantErr:     true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			logger := klog.FromContext(ctx)
+			sharedSnap := cache.NewEmptySnapshot()
+
+			var profiles *upstreamsync.ProfileMap
+			var err error
+			if tc.nilProfiles {
+				profiles = nil
+			} else if tc.withCustomProfileMap {
+				registry := plugins.NewInTreeRegistry()
+				schedulerName := v1.DefaultSchedulerName
+				if tc.profileSchedulerName != "" {
+					schedulerName = tc.profileSchedulerName
+				}
+				var reservePluginName string
+				if tc.plugin != nil {
+					if err := registry.Register(testReservePluginName, func(ctx context.Context, obj runtime.Object, handle fwk.Handle) (fwk.Plugin, error) {
+						return tc.plugin, nil
+					}); err != nil {
+						t.Fatalf("Failed to register test reserve plugin: %v", err)
+					}
+					reservePluginName = testReservePluginName
+				}
+				prof := newTestProfile(schedulerName, reservePluginName)
+				profiles, err = newTestProfileMap(ctx, sharedSnap, registry, prof)
+				if err != nil {
+					t.Fatalf("newTestProfileMap failed: %v", err)
+				}
+			} else {
+				profiles = newDummyProfileMap()
+			}
+
+			var internalCache cache.Cache
+			if !tc.nilCache {
+				internalCache = cache.New(ctx, nil, false)
+				for _, n := range tc.nodeNames {
+					internalCache.AddNode(logger, st.MakeNode().Name(n).Capacity(map[v1.ResourceName]string{
+						v1.ResourceCPU:    "1",
+						v1.ResourceMemory: "1Gi",
+						v1.ResourcePods:   "110",
+					}).Obj())
+				}
+			}
+			state := New(internalCache, profiles, sharedSnap)
+			cycleState := framework.NewCycleState()
+
+			if tc.boundPodFirst && tc.pod != nil {
+				if err := state.Cache.AddPod(logger, tc.pod); err != nil {
+					t.Fatalf("Cache.AddPod() setup error = %v", err)
+				}
+			}
+
+			if tc.assumePodFirst && tc.pod != nil {
+				if err := state.AssumeAndReserve(ctx, tc.pod, cycleState, tc.pod.Spec.NodeName); err != nil {
+					t.Fatalf("AssumeAndReserve() setup error = %v", err)
+				}
+				// Reset unreserveCalled from plugin since AssumeAndReserve might not have called unreserve,
+				// but let's reset to clearly verify UnreserveAndForget.
+				if tc.plugin != nil {
+					tc.plugin.unreserveCalled = false
+				}
+			}
+
+			podToUnreserve := tc.pod
+			if tc.podToUnreserve != nil {
+				podToUnreserve = tc.podToUnreserve
+			}
+
+			err = state.UnreserveAndForget(ctx, podToUnreserve)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("UnreserveAndForget() error = %v, wantErr = %v", err, tc.wantErr)
+			}
+
+			if tc.plugin != nil {
+				if tc.plugin.unreserveCalled != tc.wantUnreserveCalled {
+					t.Errorf("plugin.unreserveCalled = %v, want %v", tc.plugin.unreserveCalled, tc.wantUnreserveCalled)
+				}
+			}
+
+			if tc.pod != nil && tc.pod.Spec.NodeName != "" && !tc.nilCache {
+				isAssumed, _ := state.Cache.IsAssumedPod(tc.pod)
+				if isAssumed != tc.wantAssumedInCache {
+					t.Errorf("state.Cache.IsAssumedPod() = %v, want %v", isAssumed, tc.wantAssumedInCache)
+				}
+			}
+
+			if tc.expectedSnapshot != nil {
+				err := state.SyncSnapshot(logger)
+				if err != nil {
+					t.Fatalf("Snapshot() error = %v", err)
+				}
+				ft.VerifySnapshot(t, sharedSnap, tc.expectedSnapshot)
+			}
+		})
+	}
+}
+
+func TestClusterState_AssumeAndReserve_Lifecycle(t *testing.T) {
+	ctx := t.Context()
+	logger := klog.FromContext(ctx)
+	sharedSnap := cache.NewEmptySnapshot()
+
+	plugin := &mockReservePlugin{}
+	registry := plugins.NewInTreeRegistry()
+	if err := registry.Register(testReservePluginName, func(ctx context.Context, obj runtime.Object, handle fwk.Handle) (fwk.Plugin, error) {
+		return plugin, nil
+	}); err != nil {
+		t.Fatalf("Failed to register plugin: %v", err)
+	}
+
+	prof := newTestProfile(v1.DefaultSchedulerName, testReservePluginName)
+	profiles, err := newTestProfileMap(ctx, sharedSnap, registry, prof)
+	if err != nil {
+		t.Fatalf("newTestProfileMap failed: %v", err)
+	}
+
+	internalCache := cache.New(ctx, nil, false)
+	node1 := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "2",
+		v1.ResourceMemory: "2Gi",
+		v1.ResourcePods:   "110",
+	}).Obj()
+	node2 := st.MakeNode().Name("node2").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "2",
+		v1.ResourceMemory: "2Gi",
+		v1.ResourcePods:   "110",
+	}).Obj()
+	internalCache.AddNode(logger, node1)
+	internalCache.AddNode(logger, node2)
+
+	state := New(internalCache, profiles, sharedSnap)
+
+	pod1 := st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Node("node1").Obj()
+	pod2 := st.MakePod().Name("pod2").Namespace("default").UID("uid-pod2").Node("node2").Obj()
+
+	// 1. Initial snapshot has no pods
+	err = state.SyncSnapshot(logger)
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	ft.VerifySnapshot(t, sharedSnap, map[string]sets.Set[string]{"node1": sets.New[string](), "node2": sets.New[string]()})
+
+	// 2. Assume and reserve pod1 on node1
+	cycleState := framework.NewCycleState()
+	if err := state.AssumeAndReserve(ctx, pod1, cycleState, pod1.Spec.NodeName); err != nil {
+		t.Fatalf("AssumeAndReserve(pod1) error = %v", err)
+	}
+	isAssumed, _ := state.Cache.IsAssumedPod(pod1)
+	if !isAssumed {
+		t.Errorf("Expected pod1 to be assumed")
+	}
+
+	err = state.SyncSnapshot(logger)
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	ft.VerifySnapshot(t, sharedSnap, map[string]sets.Set[string]{"node1": sets.New("pod1"), "node2": sets.New[string]()})
+
+	// 3. Assume and reserve pod2 on node2
+	cycleState2 := framework.NewCycleState()
+	if err := state.AssumeAndReserve(ctx, pod2, cycleState2, pod2.Spec.NodeName); err != nil {
+		t.Fatalf("AssumeAndReserve(pod2) error = %v", err)
+	}
+	isAssumed, _ = state.Cache.IsAssumedPod(pod2)
+	if !isAssumed {
+		t.Errorf("Expected pod2 to be assumed")
+	}
+
+	err = state.SyncSnapshot(logger)
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	ft.VerifySnapshot(t, sharedSnap, map[string]sets.Set[string]{"node1": sets.New("pod1"), "node2": sets.New("pod2")})
+
+	// 4. Unreserve and forget pod1
+	if err := state.UnreserveAndForget(ctx, pod1); err != nil {
+		t.Fatalf("UnreserveAndForget(pod1) error = %v", err)
+	}
+	isAssumed, _ = state.Cache.IsAssumedPod(pod1)
+	if isAssumed {
+		t.Errorf("Expected pod1 to not be assumed")
+	}
+
+	err = state.SyncSnapshot(logger)
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	ft.VerifySnapshot(t, sharedSnap, map[string]sets.Set[string]{"node1": sets.New[string](), "node2": sets.New("pod2")})
+
+	// 5. Unreserve and forget pod2
+	if err := state.UnreserveAndForget(ctx, pod2); err != nil {
+		t.Fatalf("UnreserveAndForget(pod2) error = %v", err)
+	}
+	isAssumed, _ = state.Cache.IsAssumedPod(pod2)
+	if isAssumed {
+		t.Errorf("Expected pod2 to not be assumed")
+	}
+
+	err = state.SyncSnapshot(logger)
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	ft.VerifySnapshot(t, sharedSnap, map[string]sets.Set[string]{"node1": sets.New[string](), "node2": sets.New[string]()})
 }

@@ -178,7 +178,7 @@ func (s *ClusterSnapshot) CanSchedulePod(ctx context.Context, pod *v1.Pod, place
 
 	feasibleNodes := make([]string, 0)
 	var diagnosis framework.Diagnosis
-	sched := upstreamsync.NewScheduler(s.schedulerSnapshot, 0, 0, math.MaxInt32)
+	sched := upstreamsync.NewScheduler(s.schedulerSnapshot, 0, 0, math.MaxInt32, nil)
 	err = s.schedulerSnapshot.AssumePlacement(placement)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to assume placement: %w", err)
@@ -201,6 +201,7 @@ func schedulingResult(algRes *upstreamsync.AlgorithmResult) SchedulingResult {
 		Pod:              algRes.Pod,
 		Status:           algRes.Status,
 		SelectedNodeName: algRes.ScheduleResult.SuggestedHost,
+		CycleState:       algRes.CycleState,
 	}
 }
 
@@ -264,7 +265,7 @@ func (s *ClusterSnapshot) schedulePods(ctx context.Context, pods iter.Seq[*v1.Po
 	}
 	defer s.schedulerSnapshot.ForgetPlacement()
 	for pod := range pods {
-		sched := upstreamsync.NewScheduler(s.schedulerSnapshot, currentCycle, 0, 1)
+		sched := upstreamsync.NewScheduler(s.schedulerSnapshot, currentCycle, 0, 1, nil)
 
 		res, revertFn, err := scheduleOnePod(ctx, s.profiles, sched, pod)
 
@@ -392,4 +393,13 @@ func (s *ClusterSnapshot) Unpreempt(u *Unpreemption) ([]*v1.Pod, error) {
 	}
 
 	return u.pods, nil
+}
+
+// FrameworkForPod returns the framework for the given pod from associated profiles.
+func (s *ClusterSnapshot) FrameworkForPod(pod *v1.Pod) (framework.Framework, error) {
+	if s.profiles == nil {
+		return nil, fmt.Errorf("profiles map is nil")
+	}
+
+	return s.profiles.FrameworkForPod(pod)
 }

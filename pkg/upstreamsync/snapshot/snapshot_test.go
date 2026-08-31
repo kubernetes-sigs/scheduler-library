@@ -633,6 +633,7 @@ var scheduleResultCmpOpts = []cmp.Option{
 	cmp.Comparer(func(x, y *fwk.Status) bool {
 		return x.Code() == y.Code()
 	}),
+	cmpopts.IgnoreFields(SchedulingResult{}, "CycleState"),
 }
 
 // podNameCmpOpt compares pods generated from a template by namespace and name, ignoring the random
@@ -874,6 +875,9 @@ func TestSchedulePods(t *testing.T) {
 				}
 				if res.Pod.Spec.NodeName != res.SelectedNodeName {
 					t.Errorf("expected pod %s to have NodeName %q, got %q", res.Pod.Name, res.SelectedNodeName, res.Pod.Spec.NodeName)
+				}
+				if res.CycleState == nil {
+					t.Errorf("expected CycleState to be populated for scheduled pod %s", res.Pod.Name)
 				}
 			}
 

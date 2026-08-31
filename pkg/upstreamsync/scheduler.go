@@ -72,6 +72,7 @@ type Scheduler struct {
 	currentCycle       int64
 	nextStartNodeIndex int
 	numNodesToFind     int32
+	cache              cache.Cache
 }
 
 // NewScheduler creates a Scheduler operating on the given snapshot.
@@ -84,12 +85,14 @@ type Scheduler struct {
 func NewScheduler(nodeInfoSnapshot *cache.Snapshot,
 	currentCycle int64,
 	nextStartNodeIndex int,
-	numNodesToFind int32) *Scheduler {
+	numNodesToFind int32,
+	cache cache.Cache) *Scheduler {
 	return &Scheduler{
 		nodeInfoSnapshot:   nodeInfoSnapshot,
 		currentCycle:       currentCycle,
 		nextStartNodeIndex: nextStartNodeIndex,
 		numNodesToFind:     numNodesToFind,
+		cache:              cache,
 	}
 }
 
@@ -148,6 +151,7 @@ func (sched *Scheduler) SchedulePod(ctx context.Context, schedFwk framework.Fram
 			Pod:            pod,
 			ScheduleResult: scheduleResult,
 			Status:         status,
+			CycleState:     state,
 		}, nil
 	}
 	assumedPodInfo, assumeStatus := sched.assumeAndReserve(ctx, state, schedFwk, podInfo.PodInfo, scheduleResult)
@@ -156,6 +160,7 @@ func (sched *Scheduler) SchedulePod(ctx context.Context, schedFwk framework.Fram
 			Pod:            pod,
 			ScheduleResult: ScheduleResult{},
 			Status:         assumeStatus,
+			CycleState:     state,
 		}, nil
 	}
 
@@ -170,7 +175,74 @@ func (sched *Scheduler) SchedulePod(ctx context.Context, schedFwk framework.Fram
 		Pod:            pod,
 		ScheduleResult: scheduleResult,
 		Status:         nil,
+		CycleState:     state,
 	}, revertFn
+}
+
+// AssumeAndReserveInCache assumes and reserves the pod in scheduler's cache.
+//
+// UPSTREAM-DIFF: identical to Scheduler.assumeAndReserve for non-pod-group pods, except that it takes and returns
+// *framework.PodInfo instead of *framework.QueuedPodInfo (see PendingPod) and takes nodeName string instead of ScheduleResult.
+func (sched *Scheduler) AssumeAndReserveInCache(ctx context.Context, state fwk.CycleState,
+	schedFramework framework.Framework, podInfo *framework.PodInfo,
+	nodeName string) (*framework.PodInfo, *fwk.Status) {
+
+	logger := klog.FromContext(ctx)
+	if sched.cache == nil {
+		return nil, fwk.AsStatus(errors.New("Scheduler was built without a cache: " +
+			"pass one to NewScheduler, or assume into the snapshot instead"))
+	}
+
+	assumedPodInfo := podInfo.DeepCopy()
+	if utilfeature.DefaultFeatureGate.Enabled(features.DRANodeAllocatableResources) {
+		assumedPodInfo.Pod.Status.NodeAllocatableResourceClaimStatuses = dynamicresources.ExtractPodNodeAllocatableResourceClaimStatus(logger, state, nodeName)
+	}
+
+	if err := sched.cache.AssumePod(logger, assumedPodInfo.Pod); err != nil {
+		return nil, fwk.AsStatus(err)
+	}
+
+	// Run the Reserve method of reserve plugins.
+	if sts := schedFramework.RunReservePluginsReserve(ctx, state, assumedPodInfo.Pod, nodeName); !sts.IsSuccess() {
+		// trigger un-reserve to clean up state associated with the reserved Pod
+		err := sched.UnreserveAndForgetFromCache(ctx, state, schedFramework, assumedPodInfo, nodeName)
+		if err != nil {
+			utilruntime.HandleErrorWithContext(ctx, err, "ForgetPod failed")
+		}
+
+		if sts.IsRejected() {
+			fitErr := &framework.FitError{
+				NumAllNodes: 1,
+				Pod:         podInfo.Pod,
+				Diagnosis: framework.Diagnosis{
+					NodeToStatus: framework.NewDefaultNodeToStatus(),
+				},
+			}
+			fitErr.Diagnosis.NodeToStatus.Set(nodeName, sts)
+			fitErr.Diagnosis.AddPluginStatus(sts)
+			return assumedPodInfo, fwk.NewStatus(sts.Code()).WithError(fitErr)
+		}
+		return assumedPodInfo, sts
+	}
+
+	return assumedPodInfo, nil
+}
+
+// UnreserveAndForgetFromCache unreserves and forgets the pod from scheduler's cache.
+//
+// UPSTREAM-DIFF: upstream branches on state.IsPodGroupSchedulingCycle() and forgets the pod either
+// from the snapshot or from the scheduler cache. This function always forgets from the cache.
+// Restoring the pod's nomination is dropped as well, since there is no scheduling queue holding nominated pods.
+func (sched *Scheduler) UnreserveAndForgetFromCache(ctx context.Context, state fwk.CycleState,
+	schedFramework framework.Framework, assumedPodInfo *framework.PodInfo, nodeName string) error {
+	logger := klog.FromContext(ctx)
+	schedFramework.RunReservePluginsUnreserve(ctx, state, assumedPodInfo.Pod, nodeName)
+
+	if err := sched.cache.ForgetPod(logger, assumedPodInfo.Pod); err != nil {
+		return fmt.Errorf("failed to forget pod: %w", err)
+	}
+
+	return nil
 }
 
 // assumeAndReserve assumes and reserves the pod in scheduler's memory.
@@ -230,7 +302,7 @@ func (sched *Scheduler) assumeAndReserve(
 // but this shouldn't happen, because such pods with such state cannot reach binding.
 //
 // UPSTREAM-DIFF: upstream branches on state.IsPodGroupSchedulingCycle() and forgets the pod either
-// from the snapshot or from the scheduler cache. The library always forgets from the snapshot,
+// from the snapshot or from the scheduler cache. The function always forgets from the snapshot,
 // because it has no scheduler cache to bind through. Restoring the pod's nomination is dropped
 // as well, since there is no scheduling queue holding nominated pods.
 func (sched *Scheduler) unreserveAndForget(

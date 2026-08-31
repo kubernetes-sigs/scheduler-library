@@ -79,6 +79,8 @@ type SchedulingResult struct {
 	Status *fwk.Status
 	// SelectedNodeName is the node the pod was scheduled on, empty if it was not scheduled.
 	SelectedNodeName string
+	// CycleState is the state of the scheduling cycle.
+	CycleState fwk.CycleState
 }
 
 // Unpreemption is the handle returned by ClusterSnapshot.PreemptPods, allowing the preempted pods
