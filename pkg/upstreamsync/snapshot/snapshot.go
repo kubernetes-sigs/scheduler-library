@@ -37,6 +37,12 @@ import (
 // updates that shared snapshot in-place, which invalidates any previously returned
 // ClusterSnapshot instance — callers must not use a prior snapshot after requesting a new one.
 // A ClusterSnapshot is not safe for concurrent use.
+//
+// When a mutating method reports a failed rollback, the snapshot may be left partly
+// mutated and must not be reused; the failed revert can leave plugin state that cannot
+// be selectively undone. To recover, rebuild the snapshot and its plugins: for a
+// ClusterState-backed snapshot, recreate the ClusterState, which rebuilds them from the
+// unaffected cache.
 type ClusterSnapshot struct {
 	// profiles holds the scheduling framework per scheduler name. All of them share
 	// schedulerSnapshot as their SnapshotSharedLister, so the plugins always see the mutations
@@ -61,7 +67,7 @@ type ClusterSnapshot struct {
 // running them until the recorded state version is reached again.
 type undoLog struct {
 	// undoOperations are the revert functions, in the order their mutations were applied.
-	undoOperations []func()
+	undoOperations []func() error
 	// stateVersion is incremented by every registered operation and decremented by every undone
 	// one. A caller records it before mutating and passes it to restoreState afterwards to undo
 	// exactly its own mutations.
@@ -71,28 +77,39 @@ type undoLog struct {
 // registerOperation pushes the revert function of a mutation that has just been applied.
 // A nil undoOperation is ignored, so that callers can pass the result of an operation that
 // did not change anything.
-func (ul *undoLog) registerOperation(undoOperation func()) {
+func (ul *undoLog) registerOperation(undoOperation func() error) {
 	if undoOperation != nil {
 		ul.undoOperations = append(ul.undoOperations, undoOperation)
 		ul.stateVersion++
 	}
 }
 
-// restoreState undoes the operations registered after the given state version was observed,
-// in the reverse order of their registration.
-func (ul *undoLog) restoreState(stateVersion uint64) {
-	for ul.stateVersion != stateVersion {
-		ul.undo()
+// restoreState unwinds back to stateVersion, running every remaining undo even if
+// one fails and joining their errors. A target the log cannot reach is rejected
+// rather than unwound past the retained history into a slice panic.
+func (ul *undoLog) restoreState(stateVersion uint64) error {
+	if stateVersion > ul.stateVersion {
+		return fmt.Errorf("cannot restore to future state version %d from %d", stateVersion, ul.stateVersion)
 	}
+	if ul.stateVersion-stateVersion > uint64(len(ul.undoOperations)) {
+		return fmt.Errorf("cannot restore to state version %d: only %d undo operations retained", stateVersion, len(ul.undoOperations))
+	}
+	var errs []error
+	for ul.stateVersion != stateVersion {
+		if err := ul.undo(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // undo pops the most recently registered operation and runs it.
-func (ul *undoLog) undo() {
+func (ul *undoLog) undo() error {
 	ops := ul.undoOperations
 	ops, undoOp := ops[:len(ops)-1], ops[len(ops)-1]
 	ul.undoOperations = ops
-	undoOp()
 	ul.stateVersion--
+	return undoOp()
 }
 
 // New creates a new ClusterSnapshot stub wrapping the provided scheduler snapshot and frameworks.
@@ -115,7 +132,11 @@ func (s *ClusterSnapshot) ResetMutations() error {
 		return fmt.Errorf("transaction is in progress, cannot reset mutations")
 	}
 	if s.undoLog.stateVersion > 0 {
-		s.undoLog.restoreState(0)
+		if err := s.undoLog.restoreState(0); err != nil {
+			// The reset left the snapshot partly mutated; invalidate outstanding handles.
+			s.stateVersionForPreemption++
+			return fmt.Errorf("reset mutations failed, snapshot may be inconsistent: %w", err)
+		}
 		s.stateVersionForPreemption++
 	}
 	return nil
@@ -142,7 +163,13 @@ func (s *ClusterSnapshot) Transaction(ctx context.Context, transactionFn func() 
 	result, err := transactionFn()
 
 	if err != nil || result == Revert {
-		s.undoLog.restoreState(initialStateVersion)
+		restoreErr := s.undoLog.restoreState(initialStateVersion)
+		if restoreErr != nil {
+			// The rollback left the snapshot partly mutated; advance the version so
+			// handles from before the transaction cannot revalidate against it.
+			s.stateVersionForPreemption++
+			return fmt.Errorf("transaction rollback failed, snapshot may be inconsistent: %w", errors.Join(err, restoreErr))
+		}
 		s.stateVersionForPreemption = initialStateVersionForPreemption
 	} else {
 		// invalidate preemptions done within the transaction
@@ -247,7 +274,11 @@ func (s *ClusterSnapshot) schedulePods(ctx context.Context, pods iter.Seq[*v1.Po
 
 	defer func() {
 		if err != nil || opts.DryRun {
-			s.undoLog.restoreState(initialStateVersion)
+			if restoreErr := s.undoLog.restoreState(initialStateVersion); restoreErr != nil {
+				// The rollback left the snapshot partly mutated; invalidate outstanding handles.
+				s.stateVersionForPreemption++
+				err = errors.Join(err, fmt.Errorf("rollback failed, snapshot may be inconsistent: %w", restoreErr))
+			}
 		}
 		if initialStateVersion != s.undoLog.stateVersion {
 			s.stateVersionForPreemption++
@@ -279,7 +310,9 @@ func (s *ClusterSnapshot) schedulePods(ctx context.Context, pods iter.Seq[*v1.Po
 		}
 
 		if revertFn != nil {
-			s.undoLog.registerOperation(revertFn)
+			// The extracted upstream revert logs its ForgetPod error and its Unreserve
+			// hook has none, so this wrapper can only ever surface nil.
+			s.undoLog.registerOperation(func() error { revertFn(); return nil })
 		}
 		result = append(result, schedulingResult(res))
 
@@ -324,7 +357,11 @@ func (s *ClusterSnapshot) PreemptPods(ctx context.Context, pods []*v1.Pod) (_ *U
 
 	defer func() {
 		if err != nil {
-			s.undoLog.restoreState(initialStateVersion)
+			if restoreErr := s.undoLog.restoreState(initialStateVersion); restoreErr != nil {
+				// The rollback left the snapshot partly mutated; invalidate outstanding handles.
+				s.stateVersionForPreemption++
+				err = errors.Join(err, fmt.Errorf("rollback failed, snapshot may be inconsistent: %w", restoreErr))
+			}
 		}
 	}()
 
@@ -333,7 +370,9 @@ func (s *ClusterSnapshot) PreemptPods(ctx context.Context, pods []*v1.Pod) (_ *U
 	unpreemptFns := []func() error{}
 
 	for _, pod := range pods {
-		revertFn, err := removePodFromNode(ctx, mutatingSnapshot, pod)
+		// Work from a copy taken now; the caller may mutate pod before a revert runs.
+		podCopy := pod.DeepCopy()
+		revertFn, err := removePodFromNode(ctx, mutatingSnapshot, podCopy)
 		if err != nil {
 			return nil, fmt.Errorf("failed to unreserve and forget pod %s: %w", klog.KObj(pod), err)
 		}
@@ -341,7 +380,7 @@ func (s *ClusterSnapshot) PreemptPods(ctx context.Context, pods []*v1.Pod) (_ *U
 		// Putting the pod back is a snapshot mutation like any other, so it goes through
 		// addPodToNode and registers its own revert function, undoing it re-preempts the pod.
 		unpreemptFns = append(unpreemptFns, func() error {
-			repreemptFn, err := addPodToNode(ctx, mutatingSnapshot, pod, pod.Spec.NodeName)
+			repreemptFn, err := addPodToNode(ctx, mutatingSnapshot, podCopy, podCopy.Spec.NodeName)
 			if err != nil {
 				return fmt.Errorf("failed to unpreempt pod %s: %w", klog.KObj(pod), err)
 			}
@@ -375,6 +414,9 @@ func (s *ClusterSnapshot) Unpreempt(u *Unpreemption) ([]*v1.Pod, error) {
 	if u == nil {
 		return nil, fmt.Errorf("preemption handle is nil")
 	}
+	if u.revertFn == nil {
+		return nil, fmt.Errorf("preemption handle is invalid: uninitialized handle")
+	}
 	if s.stateVersionForPreemption != u.validPreemptionVersion {
 		return nil, fmt.Errorf("preemption handle is invalid: snapshot has been permanently mutated since preemption")
 	}
@@ -386,10 +428,10 @@ func (s *ClusterSnapshot) Unpreempt(u *Unpreemption) ([]*v1.Pod, error) {
 		u.reverted = true
 	}()
 
-	err := u.revertFn()
-	if err != nil {
-		return nil, err
+	if err := u.revertFn(); err != nil {
+		// The revert left the snapshot partly mutated; invalidate any sibling handles.
+		s.stateVersionForPreemption++
+		return nil, fmt.Errorf("unpreempt did not fully restore the snapshot, it may be inconsistent: %w", err)
 	}
-
 	return u.pods, nil
 }
