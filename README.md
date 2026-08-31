@@ -29,6 +29,42 @@ The remaining packages are implementation detail: `pkg/upstreamsync` holds logic
 * **Feasibility Checking**: Perform efficient checks to see if pods can be scheduled on specific nodes (SchedulePods, CanSchedulePod) without affecting the snapshot state.
 * **Minimalism**: Designed to reuse core Kubernetes scheduler logic, minimizing library-specific implementation.
 
+## Out-of-tree plugins
+
+Consumers that run a scheduler with out-of-tree Scheduling Framework plugins must give the
+library the same plugin registry, otherwise the simulation diverges from the real scheduling
+decision. Pass your `frameworkruntime.Registry` to `simulator.NewSchedulingSimulator`:
+
+```go
+sim, err := simulator.NewSchedulingSimulator(ctx, cfg, readonlyClient, informerFactory,
+	upstreamsync.WithFrameworkOutOfTreeRegistry(frameworkruntime.Registry{
+		"MyPlugin": myplugin.New,
+	}),
+)
+```
+
+The registry is merged into the in-tree one exactly as `scheduler.WithFrameworkOutOfTreeRegistry`
+does upstream, so a name that collides with an in-tree plugin is an error. The registry is not
+copied — do not mutate it after passing it in.
+
+### Limitations
+
+* **Only a subset of extension points is executed.** The simulation only runs the extension points
+  necessary for in-memory placement simulation. The exact list of extension points executed is defined
+  in [`pkg/upstreamsync/scheduler.go`](pkg/upstreamsync/scheduler.go) (see `Scheduler.SchedulePod`).
+  Note that `QueueSort` and `Bind` plugins must still be present in the profile — the framework
+  refuses to build without them — but they are not used by the simulation.
+* **`handle.KubeConfig()` is available, but read-only.** It is populated automatically from the
+  `ReadonlyClient` given to the simulator and cannot be overridden with WithKubeConfig at the 
+  simulator level, so plugin factories doing `myclientset.NewForConfigOrDie(handle.KubeConfig())` work. 
+  Clients built from it reject POST/PUT/PATCH/DELETE at the transport level. A plugin that builds 
+  its own config, e.g. via `rest.InClusterConfig()`, bypasses this protection.
+* **The data source decides whether the result is correct.** A plugin that reads cluster state
+  through `handle.SnapshotSharedLister()` sees the simulated state. A plugin that reads it
+  through `handle.SharedInformerFactory()` or its own clients — typical for CRD-based plugins such
+  as the ones in kubernetes-sigs/scheduler-plugins — sees the **real** cluster: hypothetical pods
+  of the simulation do not exist for it, and its verdict will differ from the real scheduler's.
+
 ## Compatibility and versioning
 
 * **Dependencies**: The library directly imports k8s.io/kubernetes.

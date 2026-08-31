@@ -26,7 +26,7 @@ import (
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
 )
 
-func SetupSnapshotTest(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (*upstreamsync.ProfileMap, *cache.Snapshot, error) {
+func SetupSnapshotTest(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node, opts ...upstreamsync.Option) (*upstreamsync.ProfileMap, *cache.Snapshot, error) {
 	client := fake.NewClientset()
 	for _, n := range nodes {
 		if _, err := client.CoreV1().Nodes().Create(ctx, n, metav1.CreateOptions{}); err != nil {
@@ -84,6 +84,7 @@ func SetupSnapshotTest(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (*
 		nil,
 		snap,
 		&prof,
+		opts...,
 	)
 	if err != nil {
 		return nil, nil, err
