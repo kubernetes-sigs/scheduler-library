@@ -510,7 +510,7 @@ func TestClusterState_SyncSnapshot_RevertsMutations(t *testing.T) {
 
 	csnap := state.GetAssociatedSnapshot()
 
-	placement, err := csnap.MakePlacement([]string{"node1"})
+	placement, err := csnap.MakePlacement(sets.New("node1"))
 	if err != nil {
 		t.Fatalf("MakePlacement failed: %v", err)
 	}

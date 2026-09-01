@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -41,7 +42,7 @@ import (
 // simulation visible from this package; consumers are not expected to implement it.
 type Simulator interface {
 	// MakePlacement turns node names into the *fwk.Placement that the other methods restrict the simulation to.
-	MakePlacement(candidateNodeNames []string) (*fwk.Placement, error)
+	MakePlacement(candidateNodeNames sets.Set[string]) (*fwk.Placement, error)
 
 	// CanSchedulePod reports which of the nodes in the placement fit a single pod, leaving the
 	// snapshot untouched. The returned *schedFwk.Diagnosis explains why the remaining nodes were

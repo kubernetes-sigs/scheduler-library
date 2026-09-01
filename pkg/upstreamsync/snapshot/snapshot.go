@@ -23,6 +23,7 @@ import (
 	"slices"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
 
@@ -179,7 +180,7 @@ func (s *ClusterSnapshot) CanSchedulePod(ctx context.Context, pod *v1.Pod, place
 	feasibleNodes := make([]string, 0)
 	var diagnosis framework.Diagnosis
 	sched := upstreamsync.NewScheduler(s.schedulerSnapshot, 0, 0, math.MaxInt32)
-	err = s.schedulerSnapshot.AssumePlacement(placement)
+	err = s.assumePlacement(placement)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to assume placement: %w", err)
 	}
@@ -258,7 +259,7 @@ func (s *ClusterSnapshot) schedulePods(ctx context.Context, pods iter.Seq[*v1.Po
 
 	currentCycle := int64(0)
 
-	err = s.schedulerSnapshot.AssumePlacement(placement)
+	err = s.assumePlacement(placement)
 	if err != nil {
 		return nil, fmt.Errorf("error assuming placement: %w", err)
 	}
@@ -295,10 +296,27 @@ func (s *ClusterSnapshot) schedulePods(ctx context.Context, pods iter.Seq[*v1.Po
 	return result, nil
 }
 
+// assumePlacement is the one way this package hands a placement to the
+// scheduler. A node listed twice makes the placement longer than the set of
+// nodes it names, which AssumePlacement reads as every node in the snapshot
+// before it looks at any of them, and which leaves the same node in the
+// candidate list twice when it does not.
+func (s *ClusterSnapshot) assumePlacement(placement *fwk.Placement) error {
+	named := sets.New[string]()
+	for _, node := range placement.Nodes {
+		name := node.Node().Name
+		if named.Has(name) {
+			return fmt.Errorf("node %s is named more than once in the placement", name)
+		}
+		named.Insert(name)
+	}
+	return s.schedulerSnapshot.AssumePlacement(placement)
+}
+
 // MakePlacement creates a framework.Placement containing NodeInfo structures for each candidate node name.
-func (s *ClusterSnapshot) MakePlacement(candidateNodeNames []string) (*fwk.Placement, error) {
+func (s *ClusterSnapshot) MakePlacement(candidateNodeNames sets.Set[string]) (*fwk.Placement, error) {
 	nodes := make([]fwk.NodeInfo, 0, len(candidateNodeNames))
-	for _, name := range candidateNodeNames {
+	for name := range candidateNodeNames {
 		ni, err := s.schedulerSnapshot.NodeInfos().Get(name)
 		if err != nil {
 			return nil, fmt.Errorf("error getting %s from snapshot: %w", name, err)
