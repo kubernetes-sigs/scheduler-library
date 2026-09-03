@@ -61,16 +61,23 @@ type NodeExclusion struct {
 // Diagnosis via NodeExclusionsFromDiagnosis. The feasible-node result is
 // identical to CanSchedulePod's; on error no exclusions are derived.
 func (s *ClusterSnapshot) CanSchedulePodWithExclusions(ctx context.Context, pod *v1.Pod, placement *fwk.Placement) ([]string, []NodeExclusion, *framework.Diagnosis, error) {
-	feasibleNodes, diagnosis, err := s.CanSchedulePod(ctx, pod, placement)
+	feasibleNodes, narrowingPlugins, diagnosis, err := s.canSchedulePod(ctx, pod, placement)
 	if err != nil {
 		return feasibleNodes, nil, diagnosis, err
 	}
-	return feasibleNodes, NodeExclusionsFromDiagnosis(placement, feasibleNodes, diagnosis), diagnosis, nil
+	return feasibleNodes, NodeExclusionsFromDiagnosis(placement, feasibleNodes, diagnosis, narrowingPlugins), diagnosis, nil
 }
 
 // NodeExclusionsFromDiagnosis derives one NodeExclusion per placement node
 // that is not in feasibleNodeNames, in placement order. It reads only typed
-// Diagnosis data and does not mutate the Diagnosis.
+// data and does not mutate the Diagnosis.
+//
+// narrowingPlugins is the set of plugins that narrowed the candidate nodes
+// via PreFilterResult, captured after PreFilter and before Filter ran (see
+// CanSchedulePodWithExclusions). It cannot be recovered from the Diagnosis
+// afterwards: Diagnosis.UnschedulablePlugins also accumulates every
+// Filter-rejecting plugin as evaluation proceeds. A nil set leaves narrowed
+// nodes at RejectionStageUnknown.
 //
 // Attribution follows how the framework populates the Diagnosis:
 //   - Filter plugins store an explicit per-node status tagged with the
@@ -78,12 +85,12 @@ func (s *ClusterSnapshot) CanSchedulePodWithExclusions(ctx context.Context, pod 
 //   - A PreFilter plugin rejection is stored as the absent-nodes status, also
 //     tagged with the plugin name, covering every node without an explicit
 //     status.
-//   - PreFilterResult narrowing stores a plugin-less absent-nodes status and
-//     records the narrowing plugins in UnschedulablePlugins; a plugin is
-//     attributed only when exactly one is recorded.
+//   - PreFilterResult narrowing stores a plugin-less absent-nodes status; the
+//     narrowing plugin is attributed from narrowingPlugins only when exactly
+//     one is recorded, never guessed among several.
 //   - Extenders store explicit plugin-less per-node statuses and add
 //     framework.ExtenderName to UnschedulablePlugins.
-func NodeExclusionsFromDiagnosis(placement *fwk.Placement, feasibleNodeNames []string, diag *framework.Diagnosis) []NodeExclusion {
+func NodeExclusionsFromDiagnosis(placement *fwk.Placement, feasibleNodeNames []string, diag *framework.Diagnosis, narrowingPlugins sets.Set[string]) []NodeExclusion {
 	if placement == nil || len(placement.Nodes) == 0 {
 		return nil
 	}
@@ -100,12 +107,12 @@ func NodeExclusionsFromDiagnosis(placement *fwk.Placement, feasibleNodeNames []s
 		if node == nil || feasible.Has(node.Name) {
 			continue
 		}
-		exclusions = append(exclusions, nodeExclusion(node.Name, diag, explicit.Has(node.Name)))
+		exclusions = append(exclusions, nodeExclusion(node.Name, diag, narrowingPlugins, explicit.Has(node.Name)))
 	}
 	return exclusions
 }
 
-func nodeExclusion(nodeName string, diag *framework.Diagnosis, hasExplicitStatus bool) NodeExclusion {
+func nodeExclusion(nodeName string, diag *framework.Diagnosis, narrowingPlugins sets.Set[string], hasExplicitStatus bool) NodeExclusion {
 	unknown := NodeExclusion{NodeName: nodeName, Stage: RejectionStageUnknown}
 	if diag == nil || diag.NodeToStatus == nil {
 		return unknown
@@ -114,8 +121,6 @@ func nodeExclusion(nodeName string, diag *framework.Diagnosis, hasExplicitStatus
 	if status := diag.NodeToStatus.Get(nodeName); status != nil {
 		plugin = status.Plugin()
 	}
-	// ExtenderName is a pseudo-plugin marker, never a narrowing candidate.
-	narrowingPlugins := diag.UnschedulablePlugins.Difference(sets.New(framework.ExtenderName))
 	switch {
 	case hasExplicitStatus && plugin != "":
 		return NodeExclusion{NodeName: nodeName, Plugin: plugin, Stage: RejectionStageFilter}

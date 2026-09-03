@@ -293,7 +293,7 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 		return result, scheduler.ErrNoNodesAvailable
 	}
 
-	feasibleNodes, diagnosis, nodeHint, err := sched.findNodesThatFitPod(ctx, fwk, podInfo, false)
+	feasibleNodes, diagnosis, _, nodeHint, err := sched.findNodesThatFitPod(ctx, fwk, podInfo, false)
 	if err != nil {
 		return result, err
 	}
@@ -341,12 +341,14 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 }
 
 // FindAllNodesThatFitPod returns every node in the placement that fits the pod, together with the
-// diagnosis explaining why the remaining ones were rejected.
+// diagnosis explaining why the remaining ones were rejected, and the set of plugins that narrowed
+// the candidate nodes via PreFilterResult, captured before Filter rejections are added to
+// Diagnosis.UnschedulablePlugins.
 //
 // UPSTREAM-DIFF: library-only. Upstream never needs the complete set of feasible nodes, as it
 // stops as soon as it has enough candidates to score. Feasibility checks (see
 // ClusterSnapshot.CanSchedulePod) do need it.
-func (sched *Scheduler) FindAllNodesThatFitPod(ctx context.Context, schedFramework framework.Framework, podInfo *PendingPod) ([]fwk.NodeInfo, framework.Diagnosis, string, error) {
+func (sched *Scheduler) FindAllNodesThatFitPod(ctx context.Context, schedFramework framework.Framework, podInfo *PendingPod) ([]fwk.NodeInfo, framework.Diagnosis, sets.Set[string], string, error) {
 	return sched.findNodesThatFitPod(ctx, schedFramework, podInfo, true)
 }
 
@@ -356,8 +358,10 @@ func (sched *Scheduler) FindAllNodesThatFitPod(ctx context.Context, schedFramewo
 // UPSTREAM-DIFF: takes the additional findAll flag (see FindAllNodesThatFitPod). When it is set,
 // the nominated node shortcut is skipped, because returning early with the nominated node alone
 // would hide the other feasible nodes the caller asked for. The CycleState comes from podInfo and
-// the extenders come from the framework instead of sched.Extenders.
-func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework framework.Framework, podInfo *PendingPod, findAll bool) ([]fwk.NodeInfo, framework.Diagnosis, string, error) {
+// the extenders come from the framework instead of sched.Extenders. Also returns the narrowing
+// plugin set captured after PreFilter ran, before Filter rejections are added to
+// Diagnosis.UnschedulablePlugins.
+func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework framework.Framework, podInfo *PendingPod, findAll bool) ([]fwk.NodeInfo, framework.Diagnosis, sets.Set[string], string, error) {
 	state := podInfo.CycleState
 	logger := klog.FromContext(ctx)
 	diagnosis := framework.Diagnosis{
@@ -365,15 +369,19 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework 
 	}
 	allNodes, err := sched.nodeInfoSnapshot.ListNodesInPlacement()
 	if err != nil {
-		return nil, diagnosis, "", err
+		return nil, diagnosis, nil, "", err
 	}
 	// Run "prefilter" plugins.
 	pod := podInfo.Pod
 	preRes, s, unscheduledPlugins := schedFramework.RunPreFilterPlugins(ctx, state, pod)
 	diagnosis.UnschedulablePlugins = unscheduledPlugins
+	// Capture the narrowing plugins while the set is still precise:
+	// findNodesThatPassFilters below adds every Filter-rejecting plugin to
+	// diagnosis.UnschedulablePlugins via AddPluginStatus.
+	narrowingPlugins := unscheduledPlugins.Clone()
 	if !s.IsSuccess() {
 		if !s.IsRejected() {
-			return nil, diagnosis, "", s.AsError()
+			return nil, diagnosis, narrowingPlugins, "", s.AsError()
 		}
 		// All nodes in NodeToStatus will have the same status so that they can be handled in the preemption.
 		diagnosis.NodeToStatus.SetAbsentNodesStatus(s)
@@ -383,7 +391,7 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework 
 		diagnosis.PreFilterMsg = msg
 		logger.V(5).Info("Status after running PreFilter plugins for pod", "pod", klog.KObj(pod), "status", msg)
 		diagnosis.AddPluginStatus(s)
-		return nil, diagnosis, "", nil
+		return nil, diagnosis, narrowingPlugins, "", nil
 	}
 
 	var nodeHint string
@@ -404,7 +412,7 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework 
 		}
 		// Nominated node passes all the filters, scheduler is good to assign this node to the pod.
 		if len(feasibleNodes) != 0 {
-			return feasibleNodes, diagnosis, nodeHint, nil
+			return feasibleNodes, diagnosis, narrowingPlugins, nodeHint, nil
 		}
 	}
 
@@ -426,12 +434,12 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework 
 	processedNodes := len(feasibleNodes) + diagnosis.NodeToStatus.Len()
 	sched.nextStartNodeIndex = (sched.nextStartNodeIndex + processedNodes) % len(allNodes)
 	if err != nil {
-		return nil, diagnosis, nodeHint, err
+		return nil, diagnosis, narrowingPlugins, nodeHint, err
 	}
 
 	feasibleNodesAfterExtender, err := findNodesThatPassExtenders(ctx, schedFramework.Extenders(), pod, feasibleNodes, diagnosis.NodeToStatus)
 	if err != nil {
-		return nil, diagnosis, nodeHint, err
+		return nil, diagnosis, narrowingPlugins, nodeHint, err
 	}
 	if len(feasibleNodesAfterExtender) != len(feasibleNodes) {
 		// Extenders filtered out some nodes.
@@ -448,7 +456,7 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework 
 		diagnosis.UnschedulablePlugins.Insert(framework.ExtenderName)
 	}
 
-	return feasibleNodesAfterExtender, diagnosis, nodeHint, nil
+	return feasibleNodesAfterExtender, diagnosis, narrowingPlugins, nodeHint, nil
 }
 
 // evaluateNominatedNode checks whether the pod fits the node it was nominated to (or hinted at).

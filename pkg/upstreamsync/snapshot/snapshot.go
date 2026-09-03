@@ -23,6 +23,7 @@ import (
 	"slices"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
 
@@ -159,17 +160,25 @@ func (s *ClusterSnapshot) Transaction(ctx context.Context, transactionFn func() 
 // PreFilter and Filter plugins. Returns the names of nodes on which the pod can be scheduled,
 // the framework.Diagnosis for rejected nodes, and any error.
 func (s *ClusterSnapshot) CanSchedulePod(ctx context.Context, pod *v1.Pod, placement *fwk.Placement) ([]string, *framework.Diagnosis, error) {
+	feasibleNodes, _, diagnosis, err := s.canSchedulePod(ctx, pod, placement)
+	return feasibleNodes, diagnosis, err
+}
+
+// canSchedulePod additionally returns the narrowing plugins captured after
+// PreFilter and before Filter, when Diagnosis.UnschedulablePlugins is still
+// precise; Filter rejections are added to that set as evaluation proceeds.
+func (s *ClusterSnapshot) canSchedulePod(ctx context.Context, pod *v1.Pod, placement *fwk.Placement) ([]string, sets.Set[string], *framework.Diagnosis, error) {
 	if placement == nil || len(placement.Nodes) == 0 {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	schedFramework, err := s.profiles.FrameworkForPod(pod)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get framework: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to get framework: %w", err)
 	}
 	state := framework.NewCycleState()
 	podInfo, err := framework.NewPodInfo(pod)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create pod info: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to create pod info: %w", err)
 	}
 	pendingPod := &upstreamsync.PendingPod{
 		PodInfo:    podInfo,
@@ -181,19 +190,19 @@ func (s *ClusterSnapshot) CanSchedulePod(ctx context.Context, pod *v1.Pod, place
 	sched := upstreamsync.NewScheduler(s.schedulerSnapshot, 0, 0, math.MaxInt32)
 	err = s.schedulerSnapshot.AssumePlacement(placement)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to assume placement: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to assume placement: %w", err)
 	}
 	defer s.schedulerSnapshot.ForgetPlacement()
-	nodes, diag, _, err := sched.FindAllNodesThatFitPod(ctx, schedFramework, pendingPod)
+	nodes, diag, narrowingPlugins, _, err := sched.FindAllNodesThatFitPod(ctx, schedFramework, pendingPod)
 	diagnosis = diag
 	for _, node := range nodes {
 		feasibleNodes = append(feasibleNodes, node.Node().Name)
 	}
 	if err != nil {
-		return nil, &diagnosis, fmt.Errorf("failed to find nodes that fit pod: %w", err)
+		return nil, narrowingPlugins, &diagnosis, fmt.Errorf("failed to find nodes that fit pod: %w", err)
 	}
 
-	return feasibleNodes, &diagnosis, nil
+	return feasibleNodes, narrowingPlugins, &diagnosis, nil
 }
 
 func schedulingResult(algRes *upstreamsync.AlgorithmResult) SchedulingResult {

@@ -49,6 +49,7 @@ func TestNodeExclusionsFromDiagnosis(t *testing.T) {
 		placement *fwk.Placement
 		feasible  []string
 		diag      *framework.Diagnosis
+		narrowing sets.Set[string]
 		want      []NodeExclusion
 	}{
 		{
@@ -90,6 +91,7 @@ func TestNodeExclusionsFromDiagnosis(t *testing.T) {
 				NodeToStatus:         framework.NewDefaultNodeToStatus(),
 				UnschedulablePlugins: sets.New("NodeAffinity"),
 			},
+			narrowing: sets.New("NodeAffinity"),
 			want: []NodeExclusion{
 				{NodeName: "n1", Plugin: "NodeAffinity", Stage: RejectionStagePreFilterNarrowing},
 				{NodeName: "n2", Plugin: "NodeAffinity", Stage: RejectionStagePreFilterNarrowing},
@@ -103,8 +105,45 @@ func TestNodeExclusionsFromDiagnosis(t *testing.T) {
 				NodeToStatus:         framework.NewDefaultNodeToStatus(),
 				UnschedulablePlugins: sets.New("NodeAffinity", "OtherPlugin"),
 			},
+			narrowing: sets.New("NodeAffinity", "OtherPlugin"),
 			want: []NodeExclusion{
 				{NodeName: "n1", Stage: RejectionStagePreFilterNarrowing},
+			},
+		},
+		{
+			// UnschedulablePlugins accumulates Filter-rejecting plugins on top
+			// of the narrowing ones, so attribution must come from the
+			// narrowing set captured before Filter ran.
+			name:      "filter pollution of UnschedulablePlugins does not break narrowing attribution",
+			placement: testPlacement("n1", "n2"),
+			feasible:  nil,
+			diag: func() *framework.Diagnosis {
+				nts := framework.NewDefaultNodeToStatus()
+				nts.Set("n1", statusRejectedBy("NodeResourcesFit"))
+				return &framework.Diagnosis{
+					NodeToStatus:         nts,
+					UnschedulablePlugins: sets.New("NodeAffinity", "NodeResourcesFit"),
+				}
+			}(),
+			narrowing: sets.New("NodeAffinity"),
+			want: []NodeExclusion{
+				{NodeName: "n1", Plugin: "NodeResourcesFit", Stage: RejectionStageFilter},
+				{NodeName: "n2", Plugin: "NodeAffinity", Stage: RejectionStagePreFilterNarrowing},
+			},
+		},
+		{
+			// Without the captured set the derivation must not guess from the
+			// polluted UnschedulablePlugins.
+			name:      "nil narrowing set yields unknown-stage records",
+			placement: testPlacement("n1"),
+			feasible:  nil,
+			diag: &framework.Diagnosis{
+				NodeToStatus:         framework.NewDefaultNodeToStatus(),
+				UnschedulablePlugins: sets.New("NodeAffinity"),
+			},
+			narrowing: nil,
+			want: []NodeExclusion{
+				{NodeName: "n1", Stage: RejectionStageUnknown},
 			},
 		},
 		{
@@ -135,6 +174,7 @@ func TestNodeExclusionsFromDiagnosis(t *testing.T) {
 					UnschedulablePlugins: sets.New(framework.ExtenderName, "NodeAffinity"),
 				}
 			}(),
+			narrowing: sets.New("NodeAffinity"),
 			want: []NodeExclusion{
 				{NodeName: "n1", Stage: RejectionStageExtender},
 				{NodeName: "n2", Plugin: "NodeAffinity", Stage: RejectionStagePreFilterNarrowing},
@@ -180,7 +220,7 @@ func TestNodeExclusionsFromDiagnosis(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := NodeExclusionsFromDiagnosis(tc.placement, tc.feasible, tc.diag)
+			got := NodeExclusionsFromDiagnosis(tc.placement, tc.feasible, tc.diag, tc.narrowing)
 			if diff := cmp.Diff(tc.want, got); diff != "" {
 				t.Errorf("unexpected exclusions (-want +got):\n%s", diff)
 			}
@@ -198,13 +238,13 @@ func TestNodeExclusionsFromDiagnosis(t *testing.T) {
 				t.Errorf("got %d records for %d rejected nodes (every rejected node must have exactly one record)", len(got), rejected)
 			}
 
-			if again := NodeExclusionsFromDiagnosis(tc.placement, tc.feasible, tc.diag); !cmp.Equal(got, again) {
+			if again := NodeExclusionsFromDiagnosis(tc.placement, tc.feasible, tc.diag, tc.narrowing); !cmp.Equal(got, again) {
 				t.Errorf("derivation is not deterministic:\nfirst: %v\nsecond: %v", got, again)
 			}
 
 			if tc.diag != nil && tc.diag.NodeToStatus != nil {
 				lenBefore := tc.diag.NodeToStatus.Len()
-				_ = NodeExclusionsFromDiagnosis(tc.placement, tc.feasible, tc.diag)
+				_ = NodeExclusionsFromDiagnosis(tc.placement, tc.feasible, tc.diag, tc.narrowing)
 				if tc.diag.NodeToStatus.Len() != lenBefore {
 					t.Errorf("derivation mutated the diagnosis NodeToStatus (len %d -> %d)", lenBefore, tc.diag.NodeToStatus.Len())
 				}
@@ -218,6 +258,7 @@ func TestCanSchedulePodWithExclusions(t *testing.T) {
 		name           string
 		candidateNodes []string
 		podRequestCPU  string
+		nodeCPU        map[string]string
 		nodeAffinity   *v1.NodeAffinity
 		expectNodes    []string
 		expectExcluded []NodeExclusion
@@ -257,6 +298,30 @@ func TestCanSchedulePodWithExclusions(t *testing.T) {
 			},
 		},
 		{
+			// Narrowing coexisting with a Filter rejection: node1 is in the
+			// narrowed set but lacks CPU, so NodeResourcesFit rejects it and
+			// pollutes Diagnosis.UnschedulablePlugins; node2's narrowing must
+			// still be attributed to NodeAffinity from the captured set.
+			name:           "narrowing mixed with a filter rejection stays attributed",
+			candidateNodes: []string{"node1", "node2"},
+			podRequestCPU:  "1",
+			nodeCPU:        map[string]string{"node2": "1"},
+			nodeAffinity: &v1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+					NodeSelectorTerms: []v1.NodeSelectorTerm{{
+						MatchFields: []v1.NodeSelectorRequirement{
+							{Key: metav1.ObjectNameField, Operator: v1.NodeSelectorOpIn, Values: []string{"node1"}},
+						},
+					}},
+				},
+			},
+			expectNodes: []string{},
+			expectExcluded: []NodeExclusion{
+				{NodeName: "node1", Plugin: "NodeResourcesFit", Stage: RejectionStageFilter},
+				{NodeName: "node2", Plugin: "NodeAffinity", Stage: RejectionStagePreFilterNarrowing},
+			},
+		},
+		{
 			// Two non-intersecting metadata.name requirements in one term make
 			// NodeAffinity.PreFilter reject the pod outright for every node.
 			name:           "prefilter rejection is attributed to the rejecting plugin",
@@ -284,8 +349,12 @@ func TestCanSchedulePodWithExclusions(t *testing.T) {
 
 			snapshotNodes := make([]*v1.Node, len(tc.candidateNodes))
 			for i, name := range tc.candidateNodes {
+				cpu := "0"
+				if v, ok := tc.nodeCPU[name]; ok {
+					cpu = v
+				}
 				snapshotNodes[i] = st.MakeNode().Name(name).Capacity(map[v1.ResourceName]string{
-					v1.ResourceCPU:    "0",
+					v1.ResourceCPU:    cpu,
 					v1.ResourceMemory: "0",
 					v1.ResourcePods:   "110",
 				}).Obj()
@@ -358,7 +427,7 @@ func BenchmarkNodeExclusionsFromDiagnosis(b *testing.B) {
 	diag := &framework.Diagnosis{NodeToStatus: nts}
 
 	for b.Loop() {
-		if got := NodeExclusionsFromDiagnosis(placement, nil, diag); len(got) != numNodes {
+		if got := NodeExclusionsFromDiagnosis(placement, nil, diag, nil); len(got) != numNodes {
 			b.Fatalf("expected %d records, got %d", numNodes, len(got))
 		}
 	}
