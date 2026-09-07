@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	ft "sigs.k8s.io/scheduler-library/pkg/framework/testing"
 	testutils "sigs.k8s.io/scheduler-library/pkg/upstreamsync/testutils"
@@ -585,41 +586,66 @@ func TestMakePlacement(t *testing.T) {
 }
 
 func TestCanSchedulePod(t *testing.T) {
+	basePod := func() *st.PodWrapper {
+		return st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1")
+	}
+	emptyNodeStatus := framework.NewNodeToStatus(map[string]*fwk.Status{}, nil)
+
 	tests := []struct {
 		name           string
 		candidateNodes []string
-		schedulerName  string
-		podRequestCPU  string
-		expectNodes    []string
-		expectErr      bool
-		expectRejected map[string]string
+		pod            *v1.Pod
+		// schedulingGates puts .spec.schedulingGates on the pod, which the SchedulingGates
+		// PreEnqueue plugin rejects.
+		expectNodes       []string
+		expectedDiagnosis *framework.Diagnosis
+		expectErr         bool
 	}{
 		{
 			name:           "Success - all nodes eligible",
 			candidateNodes: []string{"node1", "node2"},
 			expectNodes:    []string{"node1", "node2"},
-			expectErr:      false,
+			pod:            basePod().Obj(),
+			expectedDiagnosis: &framework.Diagnosis{
+				NodeToStatus:         emptyNodeStatus,
+				UnschedulablePlugins: sets.New[string](),
+			},
 		},
 		{
 			name:           "Error - unknown scheduler name",
 			candidateNodes: []string{"node1"},
-			schedulerName:  "unknown-scheduler",
+			pod:            basePod().SchedulerName("unknown-scheduler").Obj(),
 			expectErr:      true,
 		},
 		{
 			name:           "Success - empty candidate list returns empty result",
 			candidateNodes: []string{},
+			pod:            basePod().Obj(),
 			expectNodes:    nil,
-			expectErr:      false,
 		},
 		{
 			name:           "Rejected - insufficient cpu",
 			candidateNodes: []string{"node1"},
-			podRequestCPU:  "1",
+			pod: basePod().Req(map[v1.ResourceName]string{
+				v1.ResourceCPU: "1",
+			}).Obj(),
+			expectNodes: []string{},
+			expectedDiagnosis: &framework.Diagnosis{
+				NodeToStatus: framework.NewNodeToStatus(map[string]*fwk.Status{
+					"node1": fwk.NewStatus(fwk.UnschedulableAndUnresolvable, "Insufficient cpu").WithPlugin("NodeResourcesFit"),
+				}, fwk.NewStatus(fwk.UnschedulableAndUnresolvable)),
+				UnschedulablePlugins: sets.New("NodeResourcesFit"),
+			},
+		},
+		{
+			name:           "Gated - pod carrying scheduling gates never reaches PreFilter",
+			candidateNodes: []string{"node1", "node2"},
+			pod:            basePod().SchedulingGates([]string{"example.com/gate"}).Obj(),
 			expectNodes:    []string{},
-			expectErr:      false,
-			expectRejected: map[string]string{
-				"node1": "Insufficient cpu",
+			expectedDiagnosis: &framework.Diagnosis{
+				NodeToStatus:         emptyNodeStatus,
+				UnschedulablePlugins: sets.New("SchedulingGates"),
+				PreFilterMsg:         "waiting for scheduling gates: [example.com/gate]",
 			},
 		},
 	}
@@ -639,47 +665,47 @@ func TestCanSchedulePod(t *testing.T) {
 
 			cs, _, _ := setupSnapshotTest(t, ctx, snapshotNodes, nil)
 
-			podBuilder := st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").SchedulerName(tc.schedulerName)
-			if tc.podRequestCPU != "" {
-				podBuilder = podBuilder.Req(map[v1.ResourceName]string{
-					v1.ResourceCPU: tc.podRequestCPU,
-				})
-			}
-			pod := podBuilder.Obj()
-
 			placement, err := cs.MakePlacement(tc.candidateNodes)
-			if err != nil && !tc.expectErr {
+			if err != nil {
 				t.Fatalf("MakePlacement() error = %v", err)
 			}
 
-			nodes, diagnosis, err := cs.CanSchedulePod(ctx, pod, placement)
-			if (err != nil) != tc.expectErr {
-				t.Fatalf("CanSchedulePod() error = %v, expectErr %v", err, tc.expectErr)
+			nodes, diagnosis, err := cs.CanSchedulePod(ctx, tc.pod, placement)
+			if err != nil && !tc.expectErr {
+				t.Fatalf("CanSchedulePod() error = %v", err)
 			}
 
-			if !tc.expectErr {
-				if diff := cmp.Diff(tc.expectNodes, nodes, cmpopts.EquateEmpty(), cmpopts.SortSlices(func(x, y string) bool { return x < y })); diff != "" {
-					t.Errorf("Unexpected nodes (-want +got):\n%s", diff)
-				}
+			if diff := cmp.Diff(tc.expectNodes, nodes, cmpopts.EquateEmpty(), cmpopts.SortSlices(func(x, y string) bool { return x < y })); diff != "" {
+				t.Errorf("Unexpected nodes (-want +got):\n%s", diff)
+			}
 
-				if len(tc.expectRejected) > 0 {
-					if diagnosis == nil {
-						t.Errorf("Expected diagnosis, got nil")
-					} else {
-						for nodeName, expectedMsg := range tc.expectRejected {
-							status := diagnosis.NodeToStatus.Get(nodeName)
-							if status == nil {
-								t.Errorf("Expected status for node %s, got nil", nodeName)
-							} else if !strings.Contains(status.Message(), expectedMsg) {
-								t.Errorf("Expected status message %q to contain %q for node %s", status.Message(), expectedMsg, nodeName)
-							}
-						}
-					}
-				}
+			if diff := cmp.Diff(tc.expectedDiagnosis, diagnosis, nodeToStatusCmpOpt); diff != "" {
+				t.Errorf("Unexpected diagnosis (-want +got):\n%s", diff)
 			}
 		})
 	}
 }
+
+var nodeToStatusCmpOpt = cmp.Comparer(func(x, y *framework.NodeToStatus) bool {
+	if x.Len() != y.Len() {
+		return false
+	}
+
+	isEqual := true
+
+	x.ForEachExplicitNode(func(nodeName string, xStatus *fwk.Status) {
+		if !isEqual {
+			return
+		}
+
+		yStatus := y.Get(nodeName)
+		if yStatus == nil || xStatus.Code() != yStatus.Code() || xStatus.Message() != yStatus.Message() {
+			isEqual = false
+		}
+	})
+
+	return isEqual
+})
 
 var scheduleResultCmpOpts = []cmp.Option{
 	cmpopts.EquateEmpty(),
@@ -720,6 +746,10 @@ func TestSchedulePods(t *testing.T) {
 	pod2WithErr := st.MakePod().Name("pod2").Namespace("default").UID("uid-pod2").SchedulerName("non-existent-scheduler").Obj()
 	pod3 := st.MakePod().Name("pod3").Namespace("default").UID("uid-pod3").Obj()
 	pod4 := st.MakePod().Name("pod4").Namespace("default").UID("uid-pod4").Obj()
+	// gatedPod and ungatedPod differ only by .spec.schedulingGates, which is all the SchedulingGates
+	// PreEnqueue plugin looks at.
+	gatedPod := st.MakePod().Name("gatedPod").Namespace("default").UID("uid-gated").SchedulingGates([]string{"example.com/gate"}).Obj()
+	ungatedPod := st.MakePod().Name("ungatedPod").Namespace("default").UID("uid-ungated").Obj()
 
 	// onNode is how a scheduled pod comes back: a copy carrying the node the attempt selected.
 	onNode := func(p *v1.Pod, nodeName string) *v1.Pod {
@@ -891,6 +921,82 @@ func TestSchedulePods(t *testing.T) {
 			expectSnapshotState: map[string]sets.Set[string]{"node1": sets.New("pod1"), "node2": nil},
 		},
 		{
+			name:           "PreEnqueue gate - gated pod is rejected before the scheduling cycle",
+			nodes:          []*v1.Node{node1},
+			pods:           []*v1.Pod{gatedPod},
+			candidateNodes: []string{"node1"},
+			opts:           SchedulePodsOptions{},
+			expectResults: []SchedulingResult{
+				{
+					Pod:              gatedPod,
+					SelectedNodeName: "",
+					Status:           fwk.NewStatus(fwk.UnschedulableAndUnresolvable),
+					GatingPlugin:     "SchedulingGates",
+				},
+			},
+			expectSnapshotState: map[string]sets.Set[string]{"node1": nil},
+		},
+		{
+			name:           "PreEnqueue gate - the same pod without the gate is scheduled",
+			nodes:          []*v1.Node{node1},
+			pods:           []*v1.Pod{ungatedPod},
+			candidateNodes: []string{"node1"},
+			opts:           SchedulePodsOptions{},
+			expectResults: []SchedulingResult{
+				{
+					Pod:              onNode(ungatedPod, "node1"),
+					SelectedNodeName: "node1",
+					Status:           fwk.NewStatus(fwk.Success),
+				},
+			},
+			expectSnapshotState: map[string]sets.Set[string]{"node1": sets.New("ungatedPod")},
+		},
+		{
+			name:           "PreEnqueue gate - StopOnFailure stops the loop at the gated pod",
+			nodes:          []*v1.Node{node1},
+			pods:           []*v1.Pod{pod1, gatedPod, pod2},
+			candidateNodes: []string{"node1"},
+			opts:           NewSchedulePodsOptions(false, true),
+			expectResults: []SchedulingResult{
+				{
+					Pod:              onNode(pod1, "node1"),
+					SelectedNodeName: "node1",
+					Status:           fwk.NewStatus(fwk.Success),
+				},
+				{
+					Pod:          gatedPod,
+					Status:       fwk.NewStatus(fwk.UnschedulableAndUnresolvable),
+					GatingPlugin: "SchedulingGates",
+				},
+			},
+			expectSnapshotState: map[string]sets.Set[string]{"node1": sets.New("pod1")},
+		},
+		{
+			name:           "PreEnqueue gate - without StopOnFailure the loop goes past the gated pod",
+			nodes:          []*v1.Node{node1},
+			pods:           []*v1.Pod{pod1, gatedPod, pod2},
+			candidateNodes: []string{"node1"},
+			opts:           NewSchedulePodsOptions(false, false),
+			expectResults: []SchedulingResult{
+				{
+					Pod:              onNode(pod1, "node1"),
+					SelectedNodeName: "node1",
+					Status:           fwk.NewStatus(fwk.Success),
+				},
+				{
+					Pod:          gatedPod,
+					Status:       fwk.NewStatus(fwk.UnschedulableAndUnresolvable),
+					GatingPlugin: "SchedulingGates",
+				},
+				{
+					Pod:              onNode(pod2, "node1"),
+					SelectedNodeName: "node1",
+					Status:           fwk.NewStatus(fwk.Success),
+				},
+			},
+			expectSnapshotState: map[string]sets.Set[string]{"node1": sets.New("pod1", "pod2")},
+		},
+		{
 			name:           "Error outside transaction - rolls back previous successful pods",
 			nodes:          []*v1.Node{node1},
 			pods:           []*v1.Pod{pod1, pod2WithErr},
@@ -949,6 +1055,19 @@ func TestSchedulePods(t *testing.T) {
 				}
 			}
 
+			// A gated pod never enters a scheduling cycle, so it is left unassigned.
+			for _, res := range results {
+				if res.GatingPlugin == "" {
+					continue
+				}
+				if res.SelectedNodeName != "" {
+					t.Errorf("expected gated pod %s to have no selected node, got %q", res.Pod.Name, res.SelectedNodeName)
+				}
+				if res.Pod.Spec.NodeName != "" {
+					t.Errorf("expected gated pod %s to keep an empty NodeName, got %q", res.Pod.Name, res.Pod.Spec.NodeName)
+				}
+			}
+
 			ft.VerifySnapshot(t, snap, tc.expectSnapshotState)
 		})
 	}
@@ -986,6 +1105,11 @@ func TestSchedulePodsByTemplate(t *testing.T) {
 	customNSTemplate := &v1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "custom-ns"},
 		Spec:       v1.PodSpec{},
+	}
+	gatedTemplate := &v1.PodTemplateSpec{
+		Spec: v1.PodSpec{
+			SchedulingGates: []v1.PodSchedulingGate{{Name: "example.com/gate"}},
+		},
 	}
 
 	// createPodFromTemplate names the pods it generates "<template-name>-<index>-<uuid>", and the
@@ -1102,6 +1226,23 @@ func TestSchedulePodsByTemplate(t *testing.T) {
 					Pod:              generatedPod(1),
 					SelectedNodeName: "node1",
 					Status:           fwk.NewStatus(fwk.Success),
+				},
+			},
+			expectSnapshotState: map[string]int{"node1": 0},
+			expectErr:           false,
+		},
+		{
+			name:           "PreEnqueue gate - gated template yields a single result and no further pod",
+			template:       gatedTemplate,
+			nodes:          []*v1.Node{node1},
+			candidateNodes: []string{"node1"},
+			maxPods:        5,
+			opts:           SchedulePodsByTemplateOptions{},
+			expectResults: []SchedulingResult{
+				{
+					Pod:          generatedPod(0),
+					Status:       fwk.NewStatus(fwk.UnschedulableAndUnresolvable),
+					GatingPlugin: "SchedulingGates",
 				},
 			},
 			expectSnapshotState: map[string]int{"node1": 0},

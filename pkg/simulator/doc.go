@@ -76,6 +76,18 @@
 //     workload-aware scheduling algorithm.
 //   - Transaction groups any of the above and commits or reverts them as a whole.
 //
+// # Gated pods
+//
+// A scheduling cycle is not the first thing that happens to a pod: kube-scheduler first runs the
+// PreEnqueue plugins of the pod's profile, and a pod any of them rejects is "gated" — parked in the
+// unschedulable queue, never looked at by a scheduling cycle. CanSchedulePod, SchedulePods and
+// SchedulePodsByTemplate run those plugins too, so a pod the real scheduler would not consider is
+// not reported as schedulable here either. This is not optional and there is nothing to configure.
+//
+// A gated pod is left completely alone: no node is selected for it, its Spec.NodeName is not set
+// and the snapshot is not touched. snapshot.SchedulingResult.GatingPlugin names the plugin that
+// rejected it, and CanSchedulePod reports it in the Diagnosis.
+//
 // # Package layout
 //
 // The types returned by this package deliberately live elsewhere:

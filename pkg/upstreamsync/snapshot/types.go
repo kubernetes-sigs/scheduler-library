@@ -83,6 +83,10 @@ type SchedulingResult struct {
 	Status *fwk.Status
 	// SelectedNodeName is the node the pod was scheduled on, empty if it was not scheduled.
 	SelectedNodeName string
+	// GatingPlugin is the name of the PreEnqueue plugin that rejected the pod before the scheduling
+	// cycle could start, empty when the pod was not gated. A gated pod never runs PreFilter, so
+	// SelectedNodeName is always empty and Status carries the plugin's rejection.
+	GatingPlugin string
 }
 
 // Unpreemption is the handle returned by ClusterSnapshot.PreemptPods, allowing the preempted pods

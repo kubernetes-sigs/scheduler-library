@@ -130,10 +130,13 @@ func NewSchedulingSimulator(
 }
 
 // NewClusterState initializes a new runtime cluster state.
+// The scheduler cache it hands out as ClusterState.Cache is the very one the scheduling profiles
+// read the pod groups from, so a pod group the consumer adds to it is immediately visible to the
+// plugins.
 func (s *SchedulingSimulator) NewClusterState(ctx context.Context) (*state.ClusterState, error) {
 	snap := cache.NewEmptySnapshot()
 
-	internalCache := cache.New(ctx, nil, utilfeature.DefaultFeatureGate.Enabled(features.GenericWorkload), utilfeature.DefaultFeatureGate.Enabled(features.CompositePodGroup))
+	internalCache := newSchedulerCache(ctx)
 	profiles, err := s.buildProfileMap(ctx, snap)
 	if err != nil {
 		return nil, err
@@ -158,6 +161,15 @@ func (s *SchedulingSimulator) NewClusterSnapshot(
 	}
 
 	return snapshot.New(snap, profiles), nil
+}
+
+// newSchedulerCache creates the upstream scheduler cache the profiles read the pod groups from.
+// Every profile map needs one, as the plugins reach for it unconditionally.
+func newSchedulerCache(ctx context.Context) cache.Cache {
+	framework.InitMetricsOnce()
+	return cache.New(ctx, nil,
+		utilfeature.DefaultFeatureGate.Enabled(features.GenericWorkload),
+		utilfeature.DefaultFeatureGate.Enabled(features.CompositePodGroup))
 }
 
 func (s *SchedulingSimulator) buildProfileMap(ctx context.Context, snap *cache.Snapshot) (*upstreamsync.ProfileMap, error) {
