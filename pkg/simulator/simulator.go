@@ -49,8 +49,10 @@ type Simulator interface {
 	CanSchedulePod(ctx context.Context, pod *v1.Pod, placement *fwk.Placement) ([]string, *schedFwk.Diagnosis, error)
 
 	// SchedulePods schedules the given pods one by one onto the placement and, unless opts.DryRun is
-	// set, keeps the result in the snapshot; every scheduled pod gets its Spec.NodeName set. The
-	// returned slice holds one result per attempted pod.
+	// set, keeps the result in the snapshot. The pods passed in are left untouched; the returned
+	// slice holds one result per attempted pod, each carrying a copy of the pod the attempt was made
+	// for, with the selected node set when it was scheduled. On a pod that was not scheduled
+	// Spec.NodeName is left as it came in, so it is empty unless the caller already set one.
 	SchedulePods(ctx context.Context, pods []*v1.Pod, placement *fwk.Placement, opts snapshot.SchedulePodsOptions) ([]snapshot.SchedulingResult, error)
 
 	// SchedulePodsByTemplate schedules as many pods created from the template as fit, up to maxPods.

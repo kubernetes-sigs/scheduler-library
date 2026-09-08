@@ -72,8 +72,12 @@ const (
 
 // SchedulingResult is the outcome of a single pod scheduling attempt.
 type SchedulingResult struct {
-	// Pod is the pod the attempt was made for. For the pods created from a template it is the
-	// generated pod, which is the only way for the caller to learn what was scheduled.
+	// Pod is the pod the attempt was made for, carrying the selected node when it was scheduled.
+	// For the pods passed to SchedulePods it is the library's own copy; for the pods created from a
+	// template it is the generated pod, which is the only way for the caller to learn what was
+	// scheduled.
+	// On a failed attempt Spec.NodeName is left as it came in, so it is empty unless the caller, or
+	// the template, already set one.
 	Pod *v1.Pod
 	// Status is the outcome of the scheduling cycle: success, or the reason the pod was rejected.
 	Status *fwk.Status
