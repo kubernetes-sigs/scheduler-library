@@ -210,7 +210,8 @@ func schedulingResult(algRes *upstreamsync.AlgorithmResult) SchedulingResult {
 // indicate a programming error rather than a scheduling failure.
 // The pods passed in are left untouched. Each result carries the library's own copy of the pod the
 // attempt was made for, with Spec.NodeName set to the selected node when it was scheduled; that
-// copy is what PreemptPods takes to remove the pod again.
+// copy is what PreemptPods takes to remove the pod again. On a pod that was not scheduled
+// Spec.NodeName is left as it came in, so it is empty unless the caller already set one.
 func (s *ClusterSnapshot) SchedulePods(ctx context.Context, pods []*v1.Pod, placement *fwk.Placement, opts SchedulePodsOptions) ([]SchedulingResult, error) {
 	return s.schedulePods(ctx, ownedCopies(pods), placement, opts)
 }
@@ -218,6 +219,8 @@ func (s *ClusterSnapshot) SchedulePods(ctx context.Context, pods []*v1.Pod, plac
 // ownedCopies yields a copy of every pod, so that the simulation records the placement it made on a
 // pod of its own rather than on one the caller passed in and still owns. The pods generated from a
 // template need no such copy, as nothing outside the library holds them.
+// The pods are copied one at a time rather than the whole slice up front, so a run that stops early
+// never copies the pods it does not attempt.
 func ownedCopies(pods []*v1.Pod) iter.Seq[*v1.Pod] {
 	return func(yield func(*v1.Pod) bool) {
 		for _, pod := range pods {
@@ -287,8 +290,9 @@ func (s *ClusterSnapshot) schedulePods(ctx context.Context, pods iter.Seq[*v1.Po
 		}
 
 		if res.Status.IsSuccess() {
-			// The pods here are the library's own, so the placement is recorded on the pod itself
-			// and travels to the caller through the SchedulingResult below.
+			// The pod object is a copy made within the simulation library. It is not modified by
+			// scheduleOnePod, but it is returned in the result object. To make the result placement
+			// visible to the caller, pod.Spec.NodeName needs to be set.
 			pod.Spec.NodeName = res.ScheduleResult.SuggestedHost
 		}
 
