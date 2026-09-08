@@ -110,10 +110,31 @@ type PendingPod struct {
 // scheduling duration, the pod scheduling context and the permit status are dropped: the library
 // records no scheduling metrics and runs no Permit plugins (see SchedulePod).
 type AlgorithmResult struct {
-	ScheduleResult ScheduleResult
-	Pod            *v1.Pod
-	Status         *fwk.Status
-	CycleState     fwk.CycleState
+	scheduleResult ScheduleResult
+	pod            *v1.Pod
+	podInfo        *framework.PodInfo
+	status         *fwk.Status
+	cycleState     fwk.CycleState
+}
+
+func (ar *AlgorithmResult) GetPod() *v1.Pod {
+	return ar.pod
+}
+
+func (ar *AlgorithmResult) GetPodInfo() fwk.PodInfo {
+	return ar.podInfo
+}
+
+func (ar *AlgorithmResult) GetNodeName() string {
+	return ar.scheduleResult.SuggestedHost
+}
+
+func (ar *AlgorithmResult) GetCycleState() fwk.CycleState {
+	return ar.cycleState
+}
+
+func (ar *AlgorithmResult) GetStatus() *fwk.Status {
+	return ar.status
 }
 
 // SchedulePod runs a scheduling algorithm for individual pod from a pod group.
@@ -145,17 +166,21 @@ func (sched *Scheduler) SchedulePod(ctx context.Context, schedFwk framework.Fram
 		}
 
 		return AlgorithmResult{
-			Pod:            pod,
-			ScheduleResult: scheduleResult,
-			Status:         status,
+			pod:            pod,
+			podInfo:        podInfo.PodInfo,
+			scheduleResult: scheduleResult,
+			status:         status,
+			cycleState:     state,
 		}, nil
 	}
 	assumedPodInfo, assumeStatus := sched.assumeAndReserve(ctx, state, schedFwk, podInfo.PodInfo, scheduleResult)
 	if !assumeStatus.IsSuccess() {
 		return AlgorithmResult{
-			Pod:            pod,
-			ScheduleResult: ScheduleResult{},
-			Status:         assumeStatus,
+			pod:            pod,
+			podInfo:        podInfo.PodInfo,
+			scheduleResult: ScheduleResult{},
+			status:         assumeStatus,
+			cycleState:     state,
 		}, nil
 	}
 
@@ -167,9 +192,11 @@ func (sched *Scheduler) SchedulePod(ctx context.Context, schedFwk framework.Fram
 	}
 
 	return AlgorithmResult{
-		Pod:            pod,
-		ScheduleResult: scheduleResult,
-		Status:         nil,
+		pod:            pod,
+		podInfo:        podInfo.PodInfo,
+		scheduleResult: scheduleResult,
+		status:         nil,
+		cycleState:     state,
 	}, revertFn
 }
 

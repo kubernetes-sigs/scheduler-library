@@ -367,8 +367,8 @@ func TestScheduleOnePod(t *testing.T) {
 			if algRes == nil {
 				t.Fatal("expected algRes to be non-nil")
 			}
-			if algRes.Status.IsSuccess() != tc.expectSuccess {
-				t.Fatalf("expected scheduling success %v, got %v", tc.expectSuccess, algRes.Status.IsSuccess())
+			if algRes.GetStatus().IsSuccess() != tc.expectSuccess {
+				t.Fatalf("expected scheduling success %v, got %v", tc.expectSuccess, algRes.GetStatus().IsSuccess())
 			}
 
 			// scheduleOnePod leaves the pod untouched; reflecting the result on it is up to the caller.
@@ -377,8 +377,8 @@ func TestScheduleOnePod(t *testing.T) {
 			}
 
 			if tc.expectSuccess {
-				if algRes.ScheduleResult.SuggestedHost != tc.candidate {
-					t.Errorf("expected SuggestedHost to be %q, got %q", tc.candidate, algRes.ScheduleResult.SuggestedHost)
+				if algRes.GetNodeName() != tc.candidate {
+					t.Errorf("expected SuggestedHost to be %q, got %q", tc.candidate, algRes.GetNodeName())
 				}
 				if revertFn == nil {
 					t.Fatal("expected revertFn to be non-nil")
