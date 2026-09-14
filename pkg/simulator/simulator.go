@@ -28,7 +28,6 @@ import (
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
-	"k8s.io/client-go/kubernetes"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/scheduler"
@@ -90,9 +89,7 @@ type Simulator interface {
 // NewClusterSnapshot). It is meant to be created once and reused; every state and snapshot it
 // creates gets its own scheduling profiles built from the same configuration.
 type SchedulingSimulator struct {
-	cfg             *schedulerapi.KubeSchedulerConfiguration
-	informerFactory informers.SharedInformerFactory
-	client          kubernetes.Interface
+	comps *upstreamsync.FrameworkComponents
 }
 
 // NewSchedulingSimulator creates a new SchedulingSimulator.
@@ -116,6 +113,17 @@ func NewSchedulingSimulator(
 	}
 	_ = informerFactory.Core().V1().Nodes().Informer()
 	_ = informerFactory.Core().V1().Pods().Informer()
+
+	var opts []upstreamsync.Option
+	if cfg != nil {
+		opts = append(opts, upstreamsync.WithProfiles(cfg.Profiles...))
+	}
+
+	comps, err := upstreamsync.NewFrameworkComponents(ctx, client.client, informerFactory, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("schedlib: initializing framework components: %w", err)
+	}
+
 	informerFactory.StartWithContext(ctx)
 	res := informerFactory.WaitForCacheSyncWithContext(ctx)
 	if res.Err != nil {
@@ -123,21 +131,19 @@ func NewSchedulingSimulator(
 	}
 
 	return &SchedulingSimulator{
-		cfg:             cfg,
-		informerFactory: informerFactory,
-		client:          client.client,
+		comps: comps,
 	}, nil
 }
 
 // NewClusterState initializes a new runtime cluster state.
 func (s *SchedulingSimulator) NewClusterState(ctx context.Context) (*state.ClusterState, error) {
 	snap := cache.NewEmptySnapshot()
-
 	internalCache := cache.New(ctx, nil, utilfeature.DefaultFeatureGate.Enabled(features.GenericWorkload), utilfeature.DefaultFeatureGate.Enabled(features.CompositePodGroup))
-	profiles, err := s.buildProfileMap(ctx, snap)
+	profiles, err := upstreamsync.NewFrameworkMap(ctx, s.comps, framework.DiscardRecorderFactory, snap)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("schedlib: building scheduler: %w", err)
 	}
+	framework.ApplySimulationNeutralizers(profiles)
 
 	return state.New(internalCache, profiles, snap), nil
 }
@@ -151,24 +157,11 @@ func (s *SchedulingSimulator) NewClusterSnapshot(
 	compositePodGroups []*schedulingv1alpha3.CompositePodGroup,
 ) (Simulator, error) {
 	snap := cache.NewTestSnapshotWithCompositePodGroups(pods, nodes, podGroups, compositePodGroups)
-
-	profiles, err := s.buildProfileMap(ctx, snap)
-	if err != nil {
-		return nil, err
-	}
-
-	return snapshot.New(snap, profiles), nil
-}
-
-func (s *SchedulingSimulator) buildProfileMap(ctx context.Context, snap *cache.Snapshot) (*upstreamsync.ProfileMap, error) {
-	profiles, err := framework.NewProfileMap(ctx, s.client, s.informerFactory, snap, s.cfg)
+	profiles, err := upstreamsync.NewFrameworkMap(ctx, s.comps, framework.DiscardRecorderFactory, snap)
 	if err != nil {
 		return nil, fmt.Errorf("schedlib: building scheduler: %w", err)
 	}
-	s.informerFactory.StartWithContext(ctx)
-	res := s.informerFactory.WaitForCacheSyncWithContext(ctx)
-	if res.Err != nil {
-		return nil, res.Err
-	}
-	return profiles, nil
+	framework.ApplySimulationNeutralizers(profiles)
+
+	return snapshot.New(snap, profiles), nil
 }

@@ -77,8 +77,8 @@ func TestNewSchedulingSimulatorWithNilInformerFactory(t *testing.T) {
 	if sim == nil {
 		t.Fatal("Expected simulator to be non-nil")
 	}
-	if sim.informerFactory == nil {
-		t.Error("Expected informerFactory to be automatically initialized, got nil")
+	if sim.comps == nil {
+		t.Error("Expected comps to be automatically initialized, got nil")
 	}
 
 	_, err = sim.NewClusterState(t.Context())
@@ -519,6 +519,51 @@ func TestNewClusterSnapshot_PodGroupScheduling(t *testing.T) {
 		}
 		if r.SelectedNodeName != "node1" {
 			t.Errorf("Expected pod %s on node1, got %q", r.Pod.Name, r.SelectedNodeName)
+		}
+	}
+}
+
+func TestMultipleSnapshotsAndStates_NoInformerIndexerPanic(t *testing.T) {
+	ctx := t.Context()
+	cfg := &schedulerapi.KubeSchedulerConfiguration{
+		Profiles: []schedulerapi.KubeSchedulerProfile{
+			{
+				SchedulerName: "default-scheduler",
+				Plugins: &schedulerapi.Plugins{
+					QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+					Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+				},
+			},
+		},
+	}
+	client := fake.NewClientset()
+	informerFactory := informers.NewSharedInformerFactory(client, 0)
+	sim, err := NewSchedulingSimulator(ctx, cfg, ReadonlyClient{client: fake.NewClientset()}, informerFactory)
+	if err != nil {
+		t.Fatalf("failed to create simulator: %v", err)
+	}
+
+	// Calling NewClusterSnapshot multiple times on the same SchedulingSimulator
+	// must not panic due to informer indexer conflict or already started informers.
+	for i := 0; i < 3; i++ {
+		snap, err := sim.NewClusterSnapshot(ctx, nil, nil, nil, nil)
+		if err != nil {
+			t.Fatalf("iteration %d: NewClusterSnapshot failed: %v", i, err)
+		}
+		if snap == nil {
+			t.Fatalf("iteration %d: Expected snapshot to be non-nil", i)
+		}
+	}
+
+	// Calling NewClusterState multiple times on the same SchedulingSimulator
+	// must also not panic and create isolated states.
+	for i := 0; i < 3; i++ {
+		st, err := sim.NewClusterState(ctx)
+		if err != nil {
+			t.Fatalf("iteration %d: NewClusterState failed: %v", i, err)
+		}
+		if st == nil {
+			t.Fatalf("iteration %d: Expected state to be non-nil", i)
 		}
 	}
 }
