@@ -459,9 +459,7 @@ func TestClusterState_SequentialUpdates(t *testing.T) {
 }
 
 func newDummyProfileMap() *upstreamsync.ProfileMap {
-	return &upstreamsync.ProfileMap{
-		Map: make(profile.Map),
-	}
+	return &upstreamsync.ProfileMap{Map: make(profile.Map)}
 }
 
 func TestClusterState_SyncSnapshot_RevertsMutations(t *testing.T) {
