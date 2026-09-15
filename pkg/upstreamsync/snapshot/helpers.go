@@ -22,7 +22,9 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/klog/v2"
+	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
 )
@@ -99,10 +101,23 @@ func createPodFromTemplate(template *v1.PodTemplateSpec, index int) *v1.Pod {
 // On success it returns the revert function undoing the changes the cycle made to the snapshot;
 // on a scheduling failure the returned function is nil and the reason is carried by the result's
 // Status. The pod is left untouched: it is up to the caller to reflect suggestedHost on it.
-func scheduleOnePod(ctx context.Context, profiles *upstreamsync.ProfileMap, sched *upstreamsync.Scheduler, pod *v1.Pod) (*upstreamsync.AlgorithmResult, func(), error) {
+func scheduleOnePod(ctx context.Context, profiles *upstreamsync.ProfileMap, sched *upstreamsync.Scheduler, pod *v1.Pod) (*SchedulingResult, func(), error) {
 	schedFramework, err := profiles.FrameworkForPod(pod)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to get framework for pod %s: %w", klog.KObj(pod), err)
+	}
+
+	gatingPlugin, status := runPreEnqueuePlugins(ctx, schedFramework, pod)
+	if status.Code() == fwk.Error {
+		return nil, nil, fmt.Errorf("plugin %q failed PreEnqueue: %w", gatingPlugin, status.AsError())
+	}
+
+	if status != nil {
+		return &SchedulingResult{
+			Status:       status,
+			GatingPlugin: gatingPlugin,
+			Pod:          pod,
+		}, nil, nil
 	}
 
 	cycleState := framework.NewCycleState()
@@ -119,8 +134,37 @@ func scheduleOnePod(ctx context.Context, profiles *upstreamsync.ProfileMap, sche
 	algRes, revertFn := sched.SchedulePod(ctx, schedFramework, pendingPod)
 
 	if !algRes.GetStatus().IsSuccess() {
-		return &algRes, nil, nil
+		return schedulingResult(&algRes), nil, nil
 	}
 
-	return &algRes, revertFn, nil
+	return schedulingResult(&algRes), revertFn, nil
+}
+
+// runPreEnqueuePlugins runs the PreEnqueue plugins of the given framework for the pod.
+// It returns the name of the plugin that gated the pod and its status, or ("", nil) if the pod
+// passed every plugin.
+func runPreEnqueuePlugins(ctx context.Context, schedFwk framework.Framework, pod *v1.Pod) (string, *fwk.Status) {
+	for _, pl := range schedFwk.PreEnqueuePlugins() {
+		status := pl.PreEnqueue(ctx, pod)
+
+		if status.IsSuccess() {
+			continue
+		}
+
+		if status.Code() == fwk.Error {
+			utilruntime.HandleErrorWithContext(ctx, status.AsError(), "Unexpected error running PreEnqueue plugin", "pod", klog.KObj(pod), "plugin", pl.Name())
+		} else {
+			klog.FromContext(ctx).V(4).Info("Status after running PreEnqueue plugin", "pod", klog.KObj(pod), "plugin", pl.Name(), "status", status)
+		}
+		return pl.Name(), status
+	}
+	return "", nil
+}
+
+func schedulingResult(algRes *upstreamsync.AlgorithmResult) *SchedulingResult {
+	return &SchedulingResult{
+		Pod:              algRes.GetPod(),
+		Status:           algRes.GetStatus(),
+		SelectedNodeName: algRes.GetNodeName(),
+	}
 }

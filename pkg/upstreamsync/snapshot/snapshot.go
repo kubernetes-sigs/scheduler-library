@@ -23,6 +23,7 @@ import (
 	"slices"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
 
@@ -156,8 +157,12 @@ func (s *ClusterSnapshot) Transaction(ctx context.Context, transactionFn func() 
 }
 
 // CanSchedulePod checks feasibility of a single pod on the specified nodes by running
-// PreFilter and Filter plugins. Returns the names of nodes on which the pod can be scheduled,
-// the framework.Diagnosis for rejected nodes, and any error.
+// PreEnqueue, PreFilter and Filter plugins. Returns the names of nodes on which the pod can be
+// scheduled, the framework.Diagnosis for rejected nodes, and any error.
+//
+// A pod gated by a PreEnqueue plugin has no feasible node: the returned list is empty and the
+// Diagnosis names the plugin in UnschedulablePlugins. framework.Diagnosis has no field for that
+// stage, so the rejection message is reported in PreFilterMsg.
 func (s *ClusterSnapshot) CanSchedulePod(ctx context.Context, pod *v1.Pod, placement *fwk.Placement) ([]string, *framework.Diagnosis, error) {
 	if placement == nil || len(placement.Nodes) == 0 {
 		return nil, nil, nil
@@ -166,6 +171,20 @@ func (s *ClusterSnapshot) CanSchedulePod(ctx context.Context, pod *v1.Pod, place
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to get framework: %w", err)
 	}
+
+	gatingPlugin, status := runPreEnqueuePlugins(ctx, schedFramework, pod)
+	if status.Code() == fwk.Error {
+		return nil, nil, fmt.Errorf("plugin %q failed PreEnqueue: %w", gatingPlugin, status.AsError())
+	}
+	if status != nil {
+		diagnosis := framework.Diagnosis{
+			NodeToStatus:         framework.NewDefaultNodeToStatus(),
+			UnschedulablePlugins: sets.New(gatingPlugin),
+			PreFilterMsg:         status.Message(),
+		}
+		return []string{}, &diagnosis, nil
+	}
+
 	state := framework.NewCycleState()
 	podInfo, err := framework.NewPodInfo(pod)
 	if err != nil {
@@ -196,22 +215,16 @@ func (s *ClusterSnapshot) CanSchedulePod(ctx context.Context, pod *v1.Pod, place
 	return feasibleNodes, &diagnosis, nil
 }
 
-func schedulingResult(algRes *upstreamsync.AlgorithmResult) SchedulingResult {
-	return SchedulingResult{
-		Pod:              algRes.GetPod(),
-		Status:           algRes.GetStatus(),
-		SelectedNodeName: algRes.GetNodeName(),
-	}
-}
-
-// SchedulePods schedules the given pods onto the specified placement using PreFilter and Filter plugins.
+// SchedulePods schedules the given pods onto the specified placement using PreEnqueue, PreFilter
+// and Filter plugins.
 // StopOnFailure controls whether the first unschedulable pod stops the loop. Note that
 // All unexpected execution errors always propagate immediately regardless of StopOnFailure, as they
 // indicate a programming error rather than a scheduling failure.
-// The pods passed in are left untouched. Each result carries the library's own copy of the pod the
-// attempt was made for, with Spec.NodeName set to the selected node when it was scheduled; that
-// copy is what PreemptPods takes to remove the pod again. On a pod that was not scheduled
-// Spec.NodeName is left as it came in, so it is empty unless the caller already set one.
+// The pods passed in are left untouched. Each result carries the library's own copy of the pod with
+// Spec.NodeName set to the selected node when scheduled, or left as it came in if not.
+// A pod rejected by a PreEnqueue plugin is gated and counts as unschedulable: it never reaches the
+// scheduling cycle, leaves the snapshot untouched, and its SchedulingResult names the plugin in
+// GatingPlugin.
 func (s *ClusterSnapshot) SchedulePods(ctx context.Context, pods []*v1.Pod, placement *fwk.Placement, opts SchedulePodsOptions) ([]SchedulingResult, error) {
 	return s.schedulePods(ctx, ownedCopies(pods), placement, opts)
 }
@@ -233,6 +246,7 @@ func ownedCopies(pods []*v1.Pod) iter.Seq[*v1.Pod] {
 
 // SchedulePodsByTemplate attempts to schedule as many pods matching the template as possible.
 // It assumes nodes in the placement are feasible and moves to the next node only if the pod is unschedulable on the current node.
+// If the template-based pod doesn't pass PreEnqueue, it's equivalent with it not fitting on any node, and the function returns.
 func (s *ClusterSnapshot) SchedulePodsByTemplate(ctx context.Context, template *v1.PodTemplateSpec, placement *fwk.Placement, maxPods int, opts SchedulePodsByTemplateOptions) ([]SchedulingResult, error) {
 	if maxPods <= 0 {
 		return nil, nil
@@ -289,19 +303,19 @@ func (s *ClusterSnapshot) schedulePods(ctx context.Context, pods iter.Seq[*v1.Po
 			return result, err
 		}
 
-		if res.GetStatus().IsSuccess() {
+		if res.Status.IsSuccess() {
 			// The pod object is a copy made within the simulation library. It is not modified by
 			// scheduleOnePod, but it is returned in the result object. To make the result placement
 			// visible to the caller, pod.Spec.NodeName needs to be set.
-			pod.Spec.NodeName = res.GetNodeName()
+			pod.Spec.NodeName = res.SelectedNodeName
 		}
 
 		if revertFn != nil {
 			s.undoLog.registerOperation(revertFn)
 		}
-		result = append(result, schedulingResult(res))
+		result = append(result, *res)
 
-		if !res.GetStatus().IsSuccess() {
+		if !res.Status.IsSuccess() {
 			if opts.StopOnFailure {
 				return result, nil
 			}

@@ -16,11 +16,14 @@ package scheduler
 
 import (
 	"testing"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/scheduler"
+	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	testutils "k8s.io/kubernetes/test/integration/util"
 	"sigs.k8s.io/scheduler-library/pkg/simulator"
@@ -143,5 +146,143 @@ func TestSimulatorIntegrationFlow(t *testing.T) {
 	}
 	if len(feasibleNodes) != 1 || feasibleNodes[0] != "node1" {
 		t.Errorf("Expected hugePod to fit on node1 after SyncSnapshot reverted mutations, got feasible nodes %v, diagnosis: %v", feasibleNodes, diag)
+	}
+}
+
+// TestSimulatorPreEnqueueGating checks the simulation against a real kube-scheduler running the
+// same profile: a pod carrying .spec.schedulingGates must be rejected by both, and placed by both
+// once the gate is gone.
+func TestSimulatorPreEnqueueGating(t *testing.T) {
+	cfg := &schedulerapi.KubeSchedulerConfiguration{
+		Profiles: []schedulerapi.KubeSchedulerProfile{
+			{
+				SchedulerName: v1.DefaultSchedulerName,
+				Plugins: &schedulerapi.Plugins{
+					QueueSort:  schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+					PreEnqueue: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "SchedulingGates"}}},
+					PreFilter:  schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "NodeResourcesFit"}}},
+					Filter:     schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "NodeResourcesFit"}}},
+					Bind:       schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+				},
+				PluginConfig: []schedulerapi.PluginConfig{
+					{
+						Name: "NodeResourcesFit",
+						Args: &schedulerapi.NodeResourcesFitArgs{
+							ScoringStrategy: &schedulerapi.ScoringStrategy{
+								Type: schedulerapi.LeastAllocated,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// The real scheduler runs the very same profile, so any difference in the verdict is the
+	// library's own.
+	testCtx := testutils.InitTestSchedulerWithNS(t, "simulator-preenqueue", scheduler.WithProfiles(cfg.Profiles...))
+	ctx := testCtx.Ctx
+	client := testCtx.ClientSet
+
+	node := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "10",
+		v1.ResourceMemory: "10Gi",
+		v1.ResourcePods:   "110",
+	}).Obj()
+	if _, err := client.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to create node in API server: %v", err)
+	}
+
+	readonlyClient, err := simulator.NewReadonlyClient(testCtx.KubeConfig)
+	if err != nil {
+		t.Fatalf("NewReadonlyClient failed: %v", err)
+	}
+	sim, err := simulator.NewSchedulingSimulator(ctx, cfg, readonlyClient, informers.NewSharedInformerFactory(client, 0))
+	if err != nil {
+		t.Fatalf("NewSchedulingSimulator failed: %v", err)
+	}
+
+	// One snapshot for all the cases: they schedule with DryRun, so none of them leaves anything
+	// behind for the next one.
+	snap, err := sim.NewClusterSnapshot(ctx, nil, []*v1.Node{node}, nil, nil)
+	if err != nil {
+		t.Fatalf("NewClusterSnapshot failed: %v", err)
+	}
+	placement, err := snap.MakePlacement([]string{"node1"})
+	if err != nil {
+		t.Fatalf("MakePlacement failed: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		// podName is unique per case, as all the cases share one API server and one node.
+		podName string
+		// schedulingGates is what the SchedulingGates PreEnqueue plugin rejects the pod for; the
+		// two cases below describe the same pod with and without its gate.
+		schedulingGates []string
+		// expectGatingPlugin is what the simulation is expected to report; empty means the pod is
+		// expected to be placed, which is also what the real scheduler is then expected to do.
+		expectGatingPlugin string
+	}{
+		{
+			name:               "gated pod is rejected by both the scheduler and the simulation",
+			podName:            "gated-pod",
+			schedulingGates:    []string{"example.com/gate"},
+			expectGatingPlugin: "SchedulingGates",
+		},
+		{
+			name:               "ungated pod is placed by both",
+			podName:            "ungated-pod",
+			schedulingGates:    nil,
+			expectGatingPlugin: "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := st.MakePod().Name(tc.podName).Namespace(testCtx.NS.Name).UID("uid-" + tc.podName).
+				SchedulingGates(tc.schedulingGates).
+				Req(map[v1.ResourceName]string{v1.ResourceCPU: "2"}).Obj()
+			if _, err := client.CoreV1().Pods(testCtx.NS.Name).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+				t.Fatalf("failed to create pod in API server: %v", err)
+			}
+
+			// What the real scheduler does with the pod.
+			if tc.expectGatingPlugin != "" {
+				if err := testutils.WaitForPodSchedulingGated(ctx, client, pod, 30*time.Second); err != nil {
+					t.Fatalf("expected the real scheduler to keep the pod gated: %v", err)
+				}
+			} else if err := testutils.WaitForPodToSchedule(ctx, client, pod); err != nil {
+				t.Fatalf("expected the real scheduler to place the pod: %v", err)
+			}
+
+			// What the simulation does with it, on a node that has room either way.
+			simPod := pod.DeepCopy()
+			results, err := snap.SchedulePods(ctx, []*v1.Pod{simPod}, placement, snapshot.NewSchedulePodsOptions(true, false))
+			if err != nil {
+				t.Fatalf("SchedulePods failed: %v", err)
+			}
+			if len(results) != 1 {
+				t.Fatalf("Expected 1 result, got %d", len(results))
+			}
+			if results[0].GatingPlugin != tc.expectGatingPlugin {
+				t.Errorf("Expected GatingPlugin %q, got %q (status %v)", tc.expectGatingPlugin, results[0].GatingPlugin, results[0].Status)
+			}
+
+			wantNode := "node1"
+			if tc.expectGatingPlugin != "" {
+				wantNode = ""
+			}
+			if results[0].SelectedNodeName != wantNode || results[0].Pod.Spec.NodeName != wantNode {
+				t.Errorf("Expected node %q, got SelectedNodeName %q and NodeName %q",
+					wantNode, results[0].SelectedNodeName, results[0].Pod.Spec.NodeName)
+			}
+			if simPod.Spec.NodeName != "" {
+				t.Errorf("SchedulePods mutated caller-owned pod: NodeName is %q, want empty", simPod.Spec.NodeName)
+			}
+			if gated := tc.expectGatingPlugin != ""; gated == results[0].Status.IsSuccess() {
+				t.Errorf("Expected gated = %v, got status %v", gated, results[0].Status)
+			}
+		})
 	}
 }

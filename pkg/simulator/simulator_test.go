@@ -16,6 +16,7 @@ package simulator
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
@@ -520,5 +521,183 @@ func TestNewClusterSnapshot_PodGroupScheduling(t *testing.T) {
 		if r.SelectedNodeName != "node1" {
 			t.Errorf("Expected pod %s on node1, got %q", r.Pod.Name, r.SelectedNodeName)
 		}
+	}
+}
+
+func TestNewClusterSnapshot_PreEnqueueGating(t *testing.T) {
+	cfg := &schedulerapi.KubeSchedulerConfiguration{
+		Profiles: []schedulerapi.KubeSchedulerProfile{
+			{
+				SchedulerName: "default-scheduler",
+				Plugins: &schedulerapi.Plugins{
+					QueueSort:  schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+					PreEnqueue: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "SchedulingGates"}}},
+					Bind:       schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		name string
+		// schedulingGates is what makes the SchedulingGates PreEnqueue plugin reject the pod;
+		// the two cases below describe the same pod with and without its gate.
+		schedulingGates    []string
+		expectGatingPlugin string
+		expectNodeName     string
+	}{
+		{
+			name:               "gated pod is rejected before the scheduling cycle",
+			schedulingGates:    []string{"example.com/gate"},
+			expectGatingPlugin: "SchedulingGates",
+			expectNodeName:     "",
+		},
+		{
+			name:               "the same pod without the gate is scheduled",
+			schedulingGates:    nil,
+			expectGatingPlugin: "",
+			expectNodeName:     "node1",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			client := fake.NewClientset()
+			sim, err := NewSchedulingSimulator(ctx, cfg, ReadonlyClient{client: client}, informers.NewSharedInformerFactory(client, 0))
+			if err != nil {
+				t.Fatalf("failed to create simulator: %v", err)
+			}
+
+			node := st.MakeNode().Name("node1").Capacity(
+				map[v1.ResourceName]string{
+					v1.ResourcePods: "110",
+				},
+			).Obj()
+			snap, err := sim.NewClusterSnapshot(ctx, nil, []*v1.Node{node}, nil, nil)
+			if err != nil {
+				t.Fatalf("failed to create snapshot: %v", err)
+			}
+
+			pod := st.MakePod().Name("pod1").Namespace("default").UID("uid-pod1").Obj()
+			for _, gate := range tc.schedulingGates {
+				pod.Spec.SchedulingGates = append(pod.Spec.SchedulingGates, v1.PodSchedulingGate{Name: gate})
+			}
+
+			placement, err := snap.MakePlacement([]string{"node1"})
+			if err != nil {
+				t.Fatalf("MakePlacement failed: %v", err)
+			}
+			results, err := snap.SchedulePods(ctx, []*v1.Pod{pod}, placement, snapshot.SchedulePodsOptions{})
+			if err != nil {
+				t.Fatalf("SchedulePods failed: %v", err)
+			}
+			if len(results) != 1 {
+				t.Fatalf("Expected 1 result, got %d", len(results))
+			}
+			if results[0].GatingPlugin != tc.expectGatingPlugin {
+				t.Errorf("Expected GatingPlugin %q, got %q (status %v)", tc.expectGatingPlugin, results[0].GatingPlugin, results[0].Status)
+			}
+			if gated := tc.expectGatingPlugin != ""; gated == results[0].Status.IsSuccess() {
+				t.Errorf("Expected gated = %v, got status %v", gated, results[0].Status)
+			}
+			if results[0].SelectedNodeName != tc.expectNodeName || results[0].Pod.Spec.NodeName != tc.expectNodeName {
+				t.Errorf("Expected node %q, got SelectedNodeName %q and NodeName %q",
+					tc.expectNodeName, results[0].SelectedNodeName, results[0].Pod.Spec.NodeName)
+			}
+			if pod.Spec.NodeName != "" {
+				t.Errorf("SchedulePods mutated caller-owned pod: NodeName is %q, want empty", pod.Spec.NodeName)
+			}
+		})
+	}
+}
+
+// TestClusterState_GangPreEnqueue checks the whole NewClusterState path: the scheduler cache the
+// caller receives as ClusterState.Cache must be the one the profiles read the pod groups from, or
+// the gang plugins reject every member of every gang.
+func TestClusterState_GangPreEnqueue(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.GenericWorkload, true)
+
+	cfg := &schedulerapi.KubeSchedulerConfiguration{
+		Profiles: []schedulerapi.KubeSchedulerProfile{
+			{
+				SchedulerName: "default-scheduler",
+				Plugins: &schedulerapi.Plugins{
+					QueueSort:  schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+					PreEnqueue: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "GangScheduling"}}},
+					Bind:       schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+				},
+			},
+		},
+	}
+
+	const minCount = 2
+
+	tests := []struct {
+		name string
+		// members is how many pods of the gang are known to the cache; the gang needs minCount of
+		// them before any of its pods may enter the scheduling queue.
+		members            int
+		expectGatingPlugin string
+	}{
+		{
+			name:               "complete gang is admitted",
+			members:            minCount,
+			expectGatingPlugin: "",
+		},
+		{
+			name:               "incomplete gang is gated",
+			members:            minCount - 1,
+			expectGatingPlugin: "GangScheduling",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			logger := klog.FromContext(ctx)
+			client := fake.NewClientset()
+			sim, err := NewSchedulingSimulator(ctx, cfg, ReadonlyClient{client: client}, informers.NewSharedInformerFactory(client, 0))
+			if err != nil {
+				t.Fatalf("failed to create simulator: %v", err)
+			}
+
+			state, err := sim.NewClusterState(ctx)
+			if err != nil {
+				t.Fatalf("failed to create cluster state: %v", err)
+			}
+
+			state.Cache.AddNode(logger, st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{
+				v1.ResourcePods: "110",
+			}).Obj())
+			state.Cache.AddPodGroup(st.MakePodGroup().Name("gang").Namespace("default").MinCount(minCount).Obj())
+
+			var members []*v1.Pod
+			for i := range tc.members {
+				pod := st.MakePod().Name(fmt.Sprintf("member-%d", i)).Namespace("default").
+					UID(fmt.Sprintf("uid-member-%d", i)).PodGroupName("gang").Obj()
+				state.Cache.AddPodGroupMember(pod)
+				members = append(members, pod)
+			}
+			if err := state.SyncSnapshot(logger); err != nil {
+				t.Fatalf("SyncSnapshot failed: %v", err)
+			}
+
+			snap := state.GetAssociatedSnapshot()
+			placement, err := snap.MakePlacement([]string{"node1"})
+			if err != nil {
+				t.Fatalf("MakePlacement failed: %v", err)
+			}
+			results, err := snap.SchedulePods(ctx, []*v1.Pod{members[0]}, placement, snapshot.NewSchedulePodsOptions(true, false))
+			if err != nil {
+				t.Fatalf("SchedulePods failed: %v", err)
+			}
+			if len(results) != 1 {
+				t.Fatalf("Expected 1 result, got %d", len(results))
+			}
+			if results[0].GatingPlugin != tc.expectGatingPlugin {
+				t.Errorf("Expected GatingPlugin %q, got %q (status %v)", tc.expectGatingPlugin, results[0].GatingPlugin, results[0].Status)
+			}
+		})
 	}
 }

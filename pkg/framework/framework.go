@@ -52,8 +52,10 @@ var InitMetricsOnce = sync.OnceFunc(metrics.InitMetrics)
 // while still running the very same plugins as kube-scheduler.
 //
 // The client is used by the plugins and the informers to read the cluster state; it must never be
-// allowed to mutate it (see simulator.ReadonlyClient). The snap is shared with all the built
-// frameworks, so mutating it in place is immediately visible to every plugin.
+// allowed to mutate it (see simulator.ReadonlyClient). Both snap and schedulerCache are shared with
+// all the built frameworks, so mutating either in place is immediately visible to every plugin:
+// snap is where the plugins read the nodes and the pods from, and schedulerCache is where they read
+// the pod groups from. Both must be the instances the caller keeps feeding, hence being passed in.
 // A nil informerFactory makes the function create one, and a nil cfg selects the default profile.
 func NewProfileMap(ctx context.Context, client kubernetes.Interface, informerFactory informers.SharedInformerFactory, snap *cache.Snapshot, cfg *schedulerapi.KubeSchedulerConfiguration) (*upstreamsync.ProfileMap, error) {
 	InitMetricsOnce()

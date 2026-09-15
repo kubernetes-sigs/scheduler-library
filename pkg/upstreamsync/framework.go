@@ -129,10 +129,12 @@ func WithProfiles(p ...schedulerapi.KubeSchedulerProfile) Option {
 //
 // UPSTREAM-DIFF: extracted from scheduler.New, keeping only the framework construction. Everything
 // that a running scheduler needs and a simulation does not — the scheduling queue, the event
-// handlers, the cache and its debugger, the binding machinery — is dropped. The snapshot, the
-// nominator, the activator and the API cacher are supplied by the caller instead of being created
-// here, so that the caller can share the snapshot with the frameworks and neutralize the extension
-// points that would otherwise reach the API server (see pkg/framework).
+// handlers, the cache debugger, the binding machinery — is dropped. The snapshot, the scheduler
+// cache, the nominator, the activator and the API cacher are supplied by the caller instead of
+// being created here, so that the caller can share the two pieces of cluster state — the snapshot
+// the plugins read the nodes and pods from, and the cache they read the pod groups from — with the
+// frameworks, and neutralize the extension points that would otherwise reach the API server
+// (see pkg/framework).
 func NewProfileMap(ctx context.Context,
 	client clientset.Interface,
 	informerFactory informers.SharedInformerFactory,
@@ -210,8 +212,6 @@ func NewProfileMap(ctx context.Context,
 		apiDispatcher = apidispatcher.New(client, int(options.parallelism), apicalls.Relevances)
 	}
 
-	schedulerCache := internalcache.New(ctx, apiDispatcher, feature.DefaultFeatureGate.Enabled(features.GenericWorkload), feature.DefaultFeatureGate.Enabled(features.CompositePodGroup))
-
 	profileMap, err := profile.NewMap(ctx, options.profiles, registry, recorderFactory,
 		frameworkruntime.WithClientSet(client),
 		frameworkruntime.WithInformerFactory(informerFactory),
@@ -227,7 +227,11 @@ func NewProfileMap(ctx context.Context,
 		frameworkruntime.WithPodsInPreBind(podsInPreBind),
 		frameworkruntime.WithAPIDispatcher(apiDispatcher),
 		frameworkruntime.WithSharedCSIManager(sharedCSIManager),
-		frameworkruntime.WithPodGroupManager(schedulerCache),
+		// UPSTREAM-DIFF: on the library side, PodGroupManager is constructed from snapshot
+		// because at the moment of creating ProfileMap the snapshot is already created. On the
+		// scheduler side, this should be configurable because the scheduler does not have a
+		// snapshot created yet when building the profile map.
+		frameworkruntime.WithPodGroupManager(snapshot),
 	)
 	if err != nil {
 		return nil, err

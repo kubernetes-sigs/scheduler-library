@@ -54,6 +54,11 @@ func SetupSnapshotTest(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (*
 							{Name: "PrioritySort"},
 						},
 					},
+					PreEnqueue: schedulerapi.PluginSet{
+						Enabled: []schedulerapi.Plugin{
+							{Name: "SchedulingGates"},
+						},
+					},
 					PreFilter: schedulerapi.PluginSet{
 						Enabled: []schedulerapi.Plugin{
 							{Name: "NodeResourcesFit"},
@@ -85,6 +90,7 @@ func SetupSnapshotTest(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (*
 	}
 
 	snap := cache.NewSnapshot(pods, nodes)
+	framework.InitMetricsOnce()
 	profileMap, err := framework.NewProfileMap(ctx,
 		client,
 		nil,
