@@ -43,6 +43,8 @@ func init() {
 }
 
 func TestClusterState_AddPod(t *testing.T) {
+	node1 := st.MakeNode().Name("node1").Obj()
+
 	tests := []struct {
 		name         string
 		existingPods []*v1.Pod
@@ -78,7 +80,7 @@ func TestClusterState_AddPod(t *testing.T) {
 			sharedSnap := cache.NewEmptySnapshot()
 			state := New(cache.New(ctx, nil, false, false), newDummyProfileMap(), sharedSnap)
 
-			state.Cache.AddNode(logger, st.MakeNode().Name("node1").Obj())
+			state.Cache.AddNode(logger, node1)
 
 			for _, p := range tc.existingPods {
 				if err := state.Cache.AddPod(logger, p); err != nil {
@@ -103,6 +105,8 @@ func TestClusterState_AddPod(t *testing.T) {
 }
 
 func TestClusterState_RemovePod(t *testing.T) {
+	node1 := st.MakeNode().Name("node1").Obj()
+
 	tests := []struct {
 		name         string
 		existingPods []*v1.Pod
@@ -136,7 +140,7 @@ func TestClusterState_RemovePod(t *testing.T) {
 			sharedSnap := cache.NewEmptySnapshot()
 			state := New(cache.New(ctx, nil, false, false), newDummyProfileMap(), sharedSnap)
 
-			state.Cache.AddNode(logger, st.MakeNode().Name("node1").Obj())
+			state.Cache.AddNode(logger, node1)
 
 			for _, p := range tc.existingPods {
 				if err := state.Cache.AddPod(logger, p); err != nil {
