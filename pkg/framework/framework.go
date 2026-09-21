@@ -55,7 +55,10 @@ var InitMetricsOnce = sync.OnceFunc(metrics.InitMetrics)
 // allowed to mutate it (see simulator.ReadonlyClient). The snap is shared with all the built
 // frameworks, so mutating it in place is immediately visible to every plugin.
 // A nil informerFactory makes the function create one, and a nil cfg selects the default profile.
-func NewProfileMap(ctx context.Context, client kubernetes.Interface, informerFactory informers.SharedInformerFactory, snap *cache.Snapshot, cfg *schedulerapi.KubeSchedulerConfiguration) (*upstreamsync.ProfileMap, error) {
+//
+// The opts are applied after the ones derived from cfg, so a caller can override them; see
+// upstreamsync.WithSharedDRAManager for showing the plugins DRA objects of its own.
+func NewProfileMap(ctx context.Context, client kubernetes.Interface, informerFactory informers.SharedInformerFactory, snap *cache.Snapshot, cfg *schedulerapi.KubeSchedulerConfiguration, opts ...upstreamsync.Option) (*upstreamsync.ProfileMap, error) {
 	InitMetricsOnce()
 
 	recorderFactory := func(name string) events.EventRecorderLogger {
@@ -66,10 +69,11 @@ func NewProfileMap(ctx context.Context, client kubernetes.Interface, informerFac
 		informerFactory = scheduler.NewInformerFactory(client, 0, nil)
 	}
 
-	opts := []upstreamsync.Option{}
+	profileOpts := []upstreamsync.Option{}
 	if cfg != nil {
-		opts = append(opts, upstreamsync.WithProfiles(cfg.Profiles...))
+		profileOpts = append(profileOpts, upstreamsync.WithProfiles(cfg.Profiles...))
 	}
+	profileOpts = append(profileOpts, opts...)
 
 	return upstreamsync.NewProfileMap(
 		ctx,
@@ -80,7 +84,7 @@ func NewProfileMap(ctx context.Context, client kubernetes.Interface, informerFac
 		&noopPodActivator{},
 		&noopAPICacher{},
 		snap,
-		opts...,
+		profileOpts...,
 	)
 }
 
