@@ -30,7 +30,8 @@
 //	    real cluster.
 //	  - simulator.NewSchedulingSimulator starts the informers and holds the configuration used to
 //	    build the scheduling profiles. cfg may be nil, which selects the default kube-scheduler
-//	    profile, and so may informerFactory, which makes the simulator create its own.
+//	    profile, and so may informerFactory, which makes the simulator create its own. Its ctx owns
+//	    the informers, so it has to outlive every state and snapshot taken from the simulator.
 //
 // # Obtaining a snapshot
 //

@@ -17,12 +17,14 @@ package simulator
 import (
 	"context"
 	"testing"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
@@ -520,5 +522,94 @@ func TestNewClusterSnapshot_PodGroupScheduling(t *testing.T) {
 		if r.SelectedNodeName != "node1" {
 			t.Errorf("Expected pod %s on node1, got %q", r.Pod.Name, r.SelectedNodeName)
 		}
+	}
+}
+
+func minimalConfig() *schedulerapi.KubeSchedulerConfiguration {
+	return &schedulerapi.KubeSchedulerConfiguration{
+		Profiles: []schedulerapi.KubeSchedulerProfile{
+			{
+				SchedulerName: "default-scheduler",
+				Plugins: &schedulerapi.Plugins{
+					QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+					Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+				},
+			},
+		},
+	}
+}
+
+// recordingInformerFactory remembers the context each start ran under. Both start methods are
+// overridden: embedding does not route the factory's own Start through the StartWithContext below.
+type recordingInformerFactory struct {
+	informers.SharedInformerFactory
+	startedWith []context.Context
+}
+
+func (f *recordingInformerFactory) Start(stopCh <-chan struct{}) {
+	f.startedWith = append(f.startedWith, wait.ContextForChannel(stopCh))
+	f.SharedInformerFactory.Start(stopCh)
+}
+
+func (f *recordingInformerFactory) StartWithContext(ctx context.Context) {
+	f.startedWith = append(f.startedWith, ctx)
+	f.SharedInformerFactory.StartWithContext(ctx)
+}
+
+func TestInformersRunForTheSimulatorsLifetime(t *testing.T) {
+	client := fake.NewClientset()
+	informerFactory := &recordingInformerFactory{SharedInformerFactory: informers.NewSharedInformerFactory(client, 0)}
+	simulatorCtx, shutdown := context.WithCancel(t.Context())
+	sim, err := NewSchedulingSimulator(simulatorCtx, minimalConfig(), ReadonlyClient{client: client}, informerFactory)
+	if err != nil {
+		t.Fatalf("failed to create simulator: %v", err)
+	}
+	// Only the informers the snapshot registers are in question; the simulator started its own.
+	informerFactory.startedWith = nil
+
+	snapshotCtx, cancel := context.WithCancel(t.Context())
+	if _, err := sim.NewClusterSnapshot(snapshotCtx, nil, nil, nil, nil); err != nil {
+		t.Fatalf("failed to create snapshot: %v", err)
+	}
+	cancel()
+
+	if len(informerFactory.startedWith) == 0 {
+		t.Fatal("Expected the snapshot to have started the informers it registered")
+	}
+	for _, startCtx := range informerFactory.startedWith {
+		if err := startCtx.Err(); err != nil {
+			t.Errorf("The informers were started with a context that is already done (%v), so they stop with the call that registered them", err)
+		}
+	}
+
+	shutdown()
+	for _, startCtx := range informerFactory.startedWith {
+		if startCtx.Err() == nil {
+			t.Error("The informers were started with a context that outlives the simulator, so they never stop")
+		}
+	}
+}
+
+func TestNewClusterSnapshotFailsOnceTheSimulatorContextIsDone(t *testing.T) {
+	client := fake.NewClientset()
+	simulatorCtx, shutdown := context.WithCancel(t.Context())
+	sim, err := NewSchedulingSimulator(simulatorCtx, minimalConfig(), ReadonlyClient{client: client}, informers.NewSharedInformerFactory(client, 0))
+	if err != nil {
+		t.Fatalf("failed to create simulator: %v", err)
+	}
+	shutdown()
+
+	returned := make(chan error, 1)
+	go func() {
+		_, err := sim.NewClusterSnapshot(t.Context(), nil, nil, nil, nil)
+		returned <- err
+	}()
+	select {
+	case err := <-returned:
+		if err == nil {
+			t.Error("Expected an error from a simulator whose context is done, got nil")
+		}
+	case <-time.After(wait.ForeverTestTimeout):
+		t.Fatal("NewClusterSnapshot did not return; it is waiting for informers that can no longer sync")
 	}
 }
