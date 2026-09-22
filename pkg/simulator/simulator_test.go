@@ -37,8 +37,8 @@ import (
 	testutils "sigs.k8s.io/scheduler-library/pkg/upstreamsync/testutils"
 )
 
-func TestNewSchedulingSimulator(t *testing.T) {
-	cfg := &schedulerapi.KubeSchedulerConfiguration{
+func minimalConfig() *schedulerapi.KubeSchedulerConfiguration {
+	return &schedulerapi.KubeSchedulerConfiguration{
 		Profiles: []schedulerapi.KubeSchedulerProfile{
 			{
 				SchedulerName: "default-scheduler",
@@ -49,6 +49,10 @@ func TestNewSchedulingSimulator(t *testing.T) {
 			},
 		},
 	}
+}
+
+func TestNewSchedulingSimulator(t *testing.T) {
+	cfg := minimalConfig()
 	client := fake.NewClientset()
 	informerFactory := informers.NewSharedInformerFactory(client, 0)
 	sim, err := NewSchedulingSimulator(t.Context(), cfg, ReadonlyClient{client: fake.NewClientset()}, informerFactory)
@@ -61,17 +65,7 @@ func TestNewSchedulingSimulator(t *testing.T) {
 }
 
 func TestNewSchedulingSimulatorWithNilInformerFactory(t *testing.T) {
-	cfg := &schedulerapi.KubeSchedulerConfiguration{
-		Profiles: []schedulerapi.KubeSchedulerProfile{
-			{
-				SchedulerName: "default-scheduler",
-				Plugins: &schedulerapi.Plugins{
-					QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
-					Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
-				},
-			},
-		},
-	}
+	cfg := minimalConfig()
 	sim, err := NewSchedulingSimulator(t.Context(), cfg, ReadonlyClient{client: fake.NewClientset()}, nil)
 	if err != nil {
 		t.Fatalf("failed to create simulator with nil informerFactory: %v", err)
@@ -319,17 +313,7 @@ func TestNewClusterSnapshot(t *testing.T) {
 
 func TestNewClusterSnapshot_Scheduling(t *testing.T) {
 	ctx := context.Background()
-	cfg := &schedulerapi.KubeSchedulerConfiguration{
-		Profiles: []schedulerapi.KubeSchedulerProfile{
-			{
-				SchedulerName: "default-scheduler",
-				Plugins: &schedulerapi.Plugins{
-					QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
-					Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
-				},
-			},
-		},
-	}
+	cfg := minimalConfig()
 	client := fake.NewClientset()
 	informerFactory := informers.NewSharedInformerFactory(client, 0)
 	sim, err := NewSchedulingSimulator(ctx, cfg, ReadonlyClient{client: fake.NewClientset()}, informerFactory)
@@ -385,17 +369,7 @@ func TestNewClusterSnapshot_Scheduling(t *testing.T) {
 
 func TestClusterState_Scheduling(t *testing.T) {
 	ctx := context.Background()
-	cfg := &schedulerapi.KubeSchedulerConfiguration{
-		Profiles: []schedulerapi.KubeSchedulerProfile{
-			{
-				SchedulerName: "default-scheduler",
-				Plugins: &schedulerapi.Plugins{
-					QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
-					Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
-				},
-			},
-		},
-	}
+	cfg := minimalConfig()
 	client := fake.NewClientset()
 	informerFactory := informers.NewSharedInformerFactory(client, 0)
 	sim, err := NewSchedulingSimulator(ctx, cfg, ReadonlyClient{client: fake.NewClientset()}, informerFactory)
@@ -522,20 +496,6 @@ func TestNewClusterSnapshot_PodGroupScheduling(t *testing.T) {
 		if r.SelectedNodeName != "node1" {
 			t.Errorf("Expected pod %s on node1, got %q", r.Pod.Name, r.SelectedNodeName)
 		}
-	}
-}
-
-func minimalConfig() *schedulerapi.KubeSchedulerConfiguration {
-	return &schedulerapi.KubeSchedulerConfiguration{
-		Profiles: []schedulerapi.KubeSchedulerProfile{
-			{
-				SchedulerName: "default-scheduler",
-				Plugins: &schedulerapi.Plugins{
-					QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
-					Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
-				},
-			},
-		},
 	}
 }
 
