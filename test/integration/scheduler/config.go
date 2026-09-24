@@ -33,6 +33,15 @@ func withTopologyPlacementGenerator(plugins *schedulerapi.Plugins) {
 	}
 }
 
+// withDynamicResources enables the DynamicResources plugin, so that pods with resource claims
+// are filtered and reserved with their devices.
+func withDynamicResources(plugins *schedulerapi.Plugins) {
+	dynamicResources := schedulerapi.Plugin{Name: "DynamicResources"}
+	plugins.PreFilter.Enabled = append(plugins.PreFilter.Enabled, dynamicResources)
+	plugins.Filter.Enabled = append(plugins.Filter.Enabled, dynamicResources)
+	plugins.Reserve.Enabled = append(plugins.Reserve.Enabled, dynamicResources)
+}
+
 // newKubeSchedulerConfig returns the scheduler configuration shared by the simulator integration
 // tests: the smallest set of plugins that still exercises a real filter and bind cycle.
 // Additional plugins can be enabled via optional configOpt mutators.
@@ -64,6 +73,11 @@ func newKubeSchedulerConfig(opts ...configOpt) *schedulerapi.KubeSchedulerConfig
 							MinCandidateNodesPercentage: 10,
 							MinCandidateNodesAbsolute:   100,
 						},
+					},
+					{
+						// Used only when withDynamicResources enables the plugin.
+						Name: "DynamicResources",
+						Args: &schedulerapi.DynamicResourcesArgs{},
 					},
 				},
 			},
