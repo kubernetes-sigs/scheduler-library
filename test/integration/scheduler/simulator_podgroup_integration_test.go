@@ -776,13 +776,13 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 				t.Fatalf("MakePlacement failed: %v", err)
 			}
 			probePod := makePod(ns, "probe-pod", "", tt.probePodCPU)
-			feasibleNodes, _, err := snap.CanSchedulePod(ctx, probePod, placement)
+			result, err := snap.CanSchedulePod(ctx, probePod, placement)
 			if err != nil {
 				t.Fatalf("CanSchedulePod failed: %v", err)
 			}
-			gotFits := len(feasibleNodes) == 1
+			gotFits := len(result.FeasibleNodeNames) == 1
 			if gotFits != tt.wantProbeFits {
-				t.Errorf("CanSchedulePod(probe %s CPU) fits = %v, want %v (feasibleNodes: %v)", tt.probePodCPU, gotFits, tt.wantProbeFits, feasibleNodes)
+				t.Errorf("CanSchedulePod(probe %s CPU) fits = %v, want %v (feasibleNodes: %v)", tt.probePodCPU, gotFits, tt.wantProbeFits, result.FeasibleNodeNames)
 			}
 		})
 	}

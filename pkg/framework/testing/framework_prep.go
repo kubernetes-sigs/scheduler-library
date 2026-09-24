@@ -34,6 +34,9 @@ import (
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
 )
 
+// NoFilterPluginsSchedulerName is the profile SetupSnapshotTest adds with no PreFilter or Filter plugins.
+const NoFilterPluginsSchedulerName = "no-filter-plugins"
+
 // SetupSnapshotTest initializes a fake clientset, snapshot, and default profile map for unit tests.
 func SetupSnapshotTest(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (*upstreamsync.ProfileMap, *cache.Snapshot, error) {
 	framework.InitMetricsOnce()
@@ -81,6 +84,20 @@ func SetupSnapshotTest(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (*
 							ScoringStrategy: &schedulerapi.ScoringStrategy{
 								Type: schedulerapi.LeastAllocated,
 							},
+						},
+					},
+				},
+			},
+			{SchedulerName: NoFilterPluginsSchedulerName,
+				Plugins: &schedulerapi.Plugins{
+					QueueSort: schedulerapi.PluginSet{
+						Enabled: []schedulerapi.Plugin{
+							{Name: "PrioritySort"},
+						},
+					},
+					Bind: schedulerapi.PluginSet{
+						Enabled: []schedulerapi.Plugin{
+							{Name: "DefaultBinder"},
 						},
 					},
 				},

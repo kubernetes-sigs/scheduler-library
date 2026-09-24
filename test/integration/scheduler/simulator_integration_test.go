@@ -15,15 +15,18 @@
 package scheduler
 
 import (
+	"strings"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/noderesources"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	testutils "k8s.io/kubernetes/test/integration/util"
 	"sigs.k8s.io/scheduler-library/pkg/simulator"
+	"sigs.k8s.io/scheduler-library/pkg/state"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
 )
 
@@ -97,10 +100,11 @@ func TestSimulatorIntegrationFlow(t *testing.T) {
 		t.Fatalf("MakePlacement failed: %v", err)
 	}
 
-	feasibleNodes, diag, err := snap.CanSchedulePod(ctx, simPod, placement)
+	res, err := snap.CanSchedulePod(ctx, simPod, placement)
 	if err != nil {
 		t.Fatalf("CanSchedulePod failed: %v", err)
 	}
+	feasibleNodes, diag := res.FeasibleNodeNames, res.Diagnosis
 	if len(feasibleNodes) != 1 || feasibleNodes[0] != "node1" {
 		t.Fatalf("Expected node1 to be feasible, got nodes %v, diagnosis: %v", feasibleNodes, diag)
 	}
@@ -122,10 +126,11 @@ func TestSimulatorIntegrationFlow(t *testing.T) {
 		v1.ResourceCPU: "6",
 	}).Obj()
 
-	feasibleNodes, _, err = snap.CanSchedulePod(ctx, hugePod, placement)
+	res, err = snap.CanSchedulePod(ctx, hugePod, placement)
 	if err != nil {
 		t.Fatalf("CanSchedulePod failed for hugePod: %v", err)
 	}
+	feasibleNodes = res.FeasibleNodeNames
 	if len(feasibleNodes) != 0 {
 		t.Errorf("Expected hugePod to not fit on node1 due to CPU capacity, but got feasible nodes: %v", feasibleNodes)
 	}
@@ -137,16 +142,181 @@ func TestSimulatorIntegrationFlow(t *testing.T) {
 	}
 
 	// After SyncSnapshot reverts mutations, hugePod should fit on node1 again (2 existing CPU + 6 = 8 <= 10 CPU capacity)
-	feasibleNodes, diag, err = snap.CanSchedulePod(ctx, hugePod, placement)
+	res, err = snap.CanSchedulePod(ctx, hugePod, placement)
 	if err != nil {
 		t.Fatalf("CanSchedulePod failed for hugePod after SyncSnapshot: %v", err)
 	}
+	feasibleNodes, diag = res.FeasibleNodeNames, res.Diagnosis
 	if len(feasibleNodes) != 1 || feasibleNodes[0] != "node1" {
 		t.Errorf("Expected hugePod to fit on node1 after SyncSnapshot reverted mutations, got feasible nodes %v, diagnosis: %v", feasibleNodes, diag)
 	}
 }
 
 func TestSimulatorIntegrationFlowWithAssumingPodsInCache(t *testing.T) {
+	testCtx, cs := setupClusterStateWithExistingPod(t)
+	ctx := testCtx.Ctx
+	logger := klog.FromContext(ctx)
+	snap := cs.GetAssociatedSnapshot()
+
+	// 6. Simulate adding a pod requesting 4 CPU (2 existing + 4 new = 6 <= 10 CPU capacity)
+	simPod := st.MakePod().Name("sim-pod").Namespace(testCtx.NS.Name).UID("uid-sim-pod").Req(map[v1.ResourceName]string{
+		v1.ResourceCPU: "4",
+	}).Obj()
+
+	placement, err := snap.MakePlacement([]string{"node1"})
+	if err != nil {
+		t.Fatalf("MakePlacement failed: %v", err)
+	}
+
+	results, err := snap.SchedulePods(ctx, []*v1.Pod{simPod}, placement, snapshot.SchedulePodsOptions{})
+	if err != nil {
+		t.Fatalf("SchedulePods failed: %v", err)
+	}
+	if len(results) != 1 || !results[0].Status.IsSuccess() {
+		t.Fatalf("Expected scheduling success, got results: %+v", results)
+	}
+	if results[0].SelectedNodeName != "node1" {
+		t.Errorf("Expected pod to be scheduled on node1, got %q", results[0].SelectedNodeName)
+	}
+	cycleState := results[0].CycleState
+	nodeName := results[0].SelectedNodeName
+
+	// 7. Assume and reserve simulated pod requesting 4 CPU (2 existing + 4 new = 6 <= 10 CPU capacity)
+	if err := cs.AssumeAndReserve(ctx, simPod, cycleState, nodeName); err != nil {
+		t.Fatalf("failed to assume pod: %v", err)
+	}
+
+	// 8. Take snapshot and run simulations
+	if err := cs.SyncSnapshot(logger); err != nil {
+		t.Fatalf("Snapshot failed: %v", err)
+	}
+	snap = cs.GetAssociatedSnapshot()
+
+	// 9. Now try simulating a pod that requires 6 CPU (2 existing + 4 scheduled + 6 = 12 > 10 capacity)
+	hugePod := st.MakePod().Name("huge-pod").Namespace(testCtx.NS.Name).UID("uid-huge-pod").Req(map[v1.ResourceName]string{
+		v1.ResourceCPU: "6",
+	}).Obj()
+
+	res, err := snap.CanSchedulePod(ctx, hugePod, placement)
+	if err != nil {
+		t.Fatalf("CanSchedulePod failed for hugePod: %v", err)
+	}
+	feasibleNodes := res.FeasibleNodeNames
+	if len(feasibleNodes) != 0 {
+		t.Errorf("Expected hugePod to not fit on node1 due to CPU capacity, but got feasible nodes: %v", feasibleNodes)
+	}
+
+	// 10. Release the reservation (4 CPU)
+	if err := cs.UnreserveAndForget(ctx, simPod); err != nil {
+		t.Fatalf("failed to unreserve and forget pod: %v", err)
+	}
+
+	// 11. Take new snapshot
+	if err := cs.SyncSnapshot(logger); err != nil {
+		t.Fatalf("Snapshot failed: %v", err)
+	}
+	placement, err = snap.MakePlacement([]string{"node1"})
+	if err != nil {
+		t.Fatalf("MakePlacement failed: %v", err)
+	}
+
+	// 12. Check if huge pod fits on node1 (2 existing + 6 new = 8 <= 10 CPU capacity)
+	res, err = snap.CanSchedulePod(ctx, hugePod, placement)
+	if err != nil {
+		t.Fatalf("CanSchedulePod failed for hugePod: %v", err)
+	}
+	feasibleNodes, diag := res.FeasibleNodeNames, res.Diagnosis
+	if len(feasibleNodes) != 1 || feasibleNodes[0] != "node1" {
+		t.Fatalf("Expected node1 to be feasible, got nodes %v, diagnosis: %v", feasibleNodes, diag)
+	}
+
+	// 13. Try scheduling huge pod on the snapshot
+	results, err = snap.SchedulePods(ctx, []*v1.Pod{hugePod}, placement, snapshot.SchedulePodsOptions{})
+	if err != nil {
+		t.Fatalf("SchedulePods failed: %v", err)
+	}
+	if len(results) != 1 || !results[0].Status.IsSuccess() {
+		t.Fatalf("Expected scheduling success, got results: %+v", results)
+	}
+	if results[0].SelectedNodeName != "node1" {
+		t.Errorf("Expected pod to be scheduled on node1, got %q", results[0].SelectedNodeName)
+	}
+}
+
+func TestSimulatorIntegrationFlowWithReservingFeasibleNode(t *testing.T) {
+	testCtx, cs := setupClusterStateWithExistingPod(t)
+	ctx := testCtx.Ctx
+	logger := klog.FromContext(ctx)
+	snap := cs.GetAssociatedSnapshot()
+
+	// 6. Check that a pod requesting 4 CPU fits (2 existing + 4 new = 6 <= 10 CPU capacity)
+	simPod := st.MakePod().Name("sim-pod").Namespace(testCtx.NS.Name).UID("uid-sim-pod").Req(map[v1.ResourceName]string{
+		v1.ResourceCPU: "4",
+	}).Obj()
+
+	placement, err := snap.MakePlacement([]string{"node1"})
+	if err != nil {
+		t.Fatalf("MakePlacement failed: %v", err)
+	}
+
+	res, err := snap.CanSchedulePod(ctx, simPod, placement)
+	if err != nil {
+		t.Fatalf("CanSchedulePod failed: %v", err)
+	}
+	if len(res.FeasibleNodeNames) != 1 || res.FeasibleNodeNames[0] != "node1" {
+		t.Fatalf("Expected node1 to be feasible, got nodes %v, diagnosis: %v", res.FeasibleNodeNames, res.Diagnosis)
+	}
+	if res.CycleState == nil {
+		t.Fatal("Expected CanSchedulePod to return a cycle state, got nil")
+	}
+	if res.Diagnosis == nil || res.Diagnosis.UnschedulablePlugins.Len() != 0 {
+		t.Errorf("Expected no unschedulable plugins, got diagnosis: %+v", res.Diagnosis)
+	}
+
+	// 7. Assume and reserve the pod on the feasible node with the cycle state CanSchedulePod returned
+	if err := cs.AssumeAndReserve(ctx, simPod, res.CycleState, res.FeasibleNodeNames[0]); err != nil {
+		t.Fatalf("failed to assume pod: %v", err)
+	}
+
+	// 8. Sync snapshot and check the reservation holds, by trying to schedule a "huge pod" (2 existing + 4 reserved + 6 new = 12 > 10 capacity)
+	if err := cs.SyncSnapshot(logger); err != nil {
+		t.Fatalf("Snapshot failed: %v", err)
+	}
+	snap = cs.GetAssociatedSnapshot()
+	placement, err = snap.MakePlacement([]string{"node1"})
+	if err != nil {
+		t.Fatalf("MakePlacement failed: %v", err)
+	}
+
+	hugePod := st.MakePod().Name("huge-pod").Namespace(testCtx.NS.Name).UID("uid-huge-pod").Req(map[v1.ResourceName]string{
+		v1.ResourceCPU: "6",
+	}).Obj()
+
+	res, err = snap.CanSchedulePod(ctx, hugePod, placement)
+	if err != nil {
+		t.Fatalf("CanSchedulePod failed for hugePod: %v", err)
+	}
+	if len(res.FeasibleNodeNames) != 0 {
+		t.Errorf("Expected hugePod to not fit on node1 due to CPU capacity, but got feasible nodes: %v", res.FeasibleNodeNames)
+	}
+	if res.CycleState == nil {
+		t.Error("Expected CanSchedulePod to return a cycle state for hugePod, got nil")
+	}
+	if res.Diagnosis == nil {
+		t.Fatal("Expected a diagnosis for hugePod, got nil")
+	}
+	if !res.Diagnosis.UnschedulablePlugins.Has(noderesources.Name) {
+		t.Errorf("Expected %s in unschedulable plugins, got %v", noderesources.Name, res.Diagnosis.UnschedulablePlugins)
+	}
+	if status := res.Diagnosis.NodeToStatus.Get("node1"); !strings.Contains(status.Message(), "Insufficient cpu") {
+		t.Errorf("Expected node1 to be rejected for insufficient cpu, got status: %v", status)
+	}
+}
+
+// setupClusterStateWithExistingPod creates node1 with 10 CPU and a pod using 2 CPU on it, in the
+// API server and in a new ClusterState, and syncs the snapshot.
+func setupClusterStateWithExistingPod(t *testing.T) (*testutils.TestContext, *state.ClusterState) {
+	t.Helper()
 	testCtx := testutils.InitTestAPIServer(t, "simulator-test", nil)
 	if testCtx == nil {
 		t.Fatal("Expected testCtx to be non-nil")
@@ -203,87 +373,6 @@ func TestSimulatorIntegrationFlowWithAssumingPodsInCache(t *testing.T) {
 	if err := cs.SyncSnapshot(logger); err != nil {
 		t.Fatalf("Snapshot failed: %v", err)
 	}
-	snap := cs.GetAssociatedSnapshot()
 
-	// 6. Simulate adding a pod requesting 4 CPU (2 existing + 4 new = 6 <= 10 CPU capacity)
-	simPod := st.MakePod().Name("sim-pod").Namespace(testCtx.NS.Name).UID("uid-sim-pod").Req(map[v1.ResourceName]string{
-		v1.ResourceCPU: "4",
-	}).Obj()
-
-	placement, err := snap.MakePlacement([]string{"node1"})
-	if err != nil {
-		t.Fatalf("MakePlacement failed: %v", err)
-	}
-
-	results, err := snap.SchedulePods(ctx, []*v1.Pod{simPod}, placement, snapshot.SchedulePodsOptions{})
-	if err != nil {
-		t.Fatalf("SchedulePods failed: %v", err)
-	}
-	if len(results) != 1 || !results[0].Status.IsSuccess() {
-		t.Fatalf("Expected scheduling success, got results: %+v", results)
-	}
-	if results[0].SelectedNodeName != "node1" {
-		t.Errorf("Expected pod to be scheduled on node1, got %q", results[0].SelectedNodeName)
-	}
-	cycleState := results[0].CycleState
-	nodeName := results[0].SelectedNodeName
-
-	// 7. Assume and reserve simulated pod requesting 4 CPU (2 existing + 4 new = 6 <= 10 CPU capacity)
-	if err := cs.AssumeAndReserve(ctx, simPod, cycleState, nodeName); err != nil {
-		t.Fatalf("failed to assume pod: %v", err)
-	}
-
-	// 8. Take snapshot and run simulations
-	if err := cs.SyncSnapshot(logger); err != nil {
-		t.Fatalf("Snapshot failed: %v", err)
-	}
-	snap = cs.GetAssociatedSnapshot()
-
-	// 9. Now try simulating a pod that requires 6 CPU (2 existing + 4 scheduled + 6 = 12 > 10 capacity)
-	hugePod := st.MakePod().Name("huge-pod").Namespace(testCtx.NS.Name).UID("uid-huge-pod").Req(map[v1.ResourceName]string{
-		v1.ResourceCPU: "6",
-	}).Obj()
-
-	feasibleNodes, _, err := snap.CanSchedulePod(ctx, hugePod, placement)
-	if err != nil {
-		t.Fatalf("CanSchedulePod failed for hugePod: %v", err)
-	}
-	if len(feasibleNodes) != 0 {
-		t.Errorf("Expected hugePod to not fit on node1 due to CPU capacity, but got feasible nodes: %v", feasibleNodes)
-	}
-
-	// 10. Release the reservation (4 CPU)
-	if err := cs.UnreserveAndForget(ctx, simPod); err != nil {
-		t.Fatalf("failed to unreserve and forget pod: %v", err)
-	}
-
-	// 11. Take new snapshot
-	if err := cs.SyncSnapshot(logger); err != nil {
-		t.Fatalf("Snapshot failed: %v", err)
-	}
-	placement, err = snap.MakePlacement([]string{"node1"})
-	if err != nil {
-		t.Fatalf("MakePlacement failed: %v", err)
-	}
-
-	// 12. Check if huge pod fits on node1 (2 existing + 6 new = 8 <= 10 CPU capacity)
-	feasibleNodes, diag, err := snap.CanSchedulePod(ctx, hugePod, placement)
-	if err != nil {
-		t.Fatalf("CanSchedulePod failed for hugePod: %v", err)
-	}
-	if len(feasibleNodes) != 1 || feasibleNodes[0] != "node1" {
-		t.Fatalf("Expected node1 to be feasible, got nodes %v, diagnosis: %v", feasibleNodes, diag)
-	}
-
-	// 13. Try scheduling huge pod on the snapshot
-	results, err = snap.SchedulePods(ctx, []*v1.Pod{hugePod}, placement, snapshot.SchedulePodsOptions{})
-	if err != nil {
-		t.Fatalf("SchedulePods failed: %v", err)
-	}
-	if len(results) != 1 || !results[0].Status.IsSuccess() {
-		t.Fatalf("Expected scheduling success, got results: %+v", results)
-	}
-	if results[0].SelectedNodeName != "node1" {
-		t.Errorf("Expected pod to be scheduled on node1, got %q", results[0].SelectedNodeName)
-	}
+	return testCtx, cs
 }
