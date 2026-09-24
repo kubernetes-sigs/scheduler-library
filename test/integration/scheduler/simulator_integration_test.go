@@ -97,10 +97,11 @@ func TestSimulatorIntegrationFlow(t *testing.T) {
 		t.Fatalf("MakePlacement failed: %v", err)
 	}
 
-	feasibleNodes, diag, err := snap.CanSchedulePod(ctx, simPod, placement)
+	res, err := snap.CanSchedulePod(ctx, simPod, placement)
 	if err != nil {
 		t.Fatalf("CanSchedulePod failed: %v", err)
 	}
+	feasibleNodes, diag := res.FeasibleNodeNames, res.Diagnosis
 	if len(feasibleNodes) != 1 || feasibleNodes[0] != "node1" {
 		t.Fatalf("Expected node1 to be feasible, got nodes %v, diagnosis: %v", feasibleNodes, diag)
 	}
@@ -122,10 +123,11 @@ func TestSimulatorIntegrationFlow(t *testing.T) {
 		v1.ResourceCPU: "6",
 	}).Obj()
 
-	feasibleNodes, _, err = snap.CanSchedulePod(ctx, hugePod, placement)
+	res, err = snap.CanSchedulePod(ctx, hugePod, placement)
 	if err != nil {
 		t.Fatalf("CanSchedulePod failed for hugePod: %v", err)
 	}
+	feasibleNodes = res.FeasibleNodeNames
 	if len(feasibleNodes) != 0 {
 		t.Errorf("Expected hugePod to not fit on node1 due to CPU capacity, but got feasible nodes: %v", feasibleNodes)
 	}
@@ -137,10 +139,11 @@ func TestSimulatorIntegrationFlow(t *testing.T) {
 	}
 
 	// After SyncSnapshot reverts mutations, hugePod should fit on node1 again (2 existing CPU + 6 = 8 <= 10 CPU capacity)
-	feasibleNodes, diag, err = snap.CanSchedulePod(ctx, hugePod, placement)
+	res, err = snap.CanSchedulePod(ctx, hugePod, placement)
 	if err != nil {
 		t.Fatalf("CanSchedulePod failed for hugePod after SyncSnapshot: %v", err)
 	}
+	feasibleNodes, diag = res.FeasibleNodeNames, res.Diagnosis
 	if len(feasibleNodes) != 1 || feasibleNodes[0] != "node1" {
 		t.Errorf("Expected hugePod to fit on node1 after SyncSnapshot reverted mutations, got feasible nodes %v, diagnosis: %v", feasibleNodes, diag)
 	}
@@ -244,10 +247,11 @@ func TestSimulatorIntegrationFlowWithAssumingPodsInCache(t *testing.T) {
 		v1.ResourceCPU: "6",
 	}).Obj()
 
-	feasibleNodes, _, err := snap.CanSchedulePod(ctx, hugePod, placement)
+	res, err := snap.CanSchedulePod(ctx, hugePod, placement)
 	if err != nil {
 		t.Fatalf("CanSchedulePod failed for hugePod: %v", err)
 	}
+	feasibleNodes := res.FeasibleNodeNames
 	if len(feasibleNodes) != 0 {
 		t.Errorf("Expected hugePod to not fit on node1 due to CPU capacity, but got feasible nodes: %v", feasibleNodes)
 	}
@@ -267,10 +271,11 @@ func TestSimulatorIntegrationFlowWithAssumingPodsInCache(t *testing.T) {
 	}
 
 	// 12. Check if huge pod fits on node1 (2 existing + 6 new = 8 <= 10 CPU capacity)
-	feasibleNodes, diag, err := snap.CanSchedulePod(ctx, hugePod, placement)
+	res, err = snap.CanSchedulePod(ctx, hugePod, placement)
 	if err != nil {
 		t.Fatalf("CanSchedulePod failed for hugePod: %v", err)
 	}
+	feasibleNodes, diag := res.FeasibleNodeNames, res.Diagnosis
 	if len(feasibleNodes) != 1 || feasibleNodes[0] != "node1" {
 		t.Fatalf("Expected node1 to be feasible, got nodes %v, diagnosis: %v", feasibleNodes, diag)
 	}

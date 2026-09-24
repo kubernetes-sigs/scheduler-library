@@ -17,6 +17,7 @@ package snapshot
 import (
 	v1 "k8s.io/api/core/v1"
 	fwk "k8s.io/kube-scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
 // CommonSchedulingOptions contains options shared across different scheduling simulation methods.
@@ -85,6 +86,20 @@ type SchedulingResult struct {
 	SelectedNodeName string
 	// CycleState is the state of the scheduling cycle.
 	CycleState fwk.CycleState
+}
+
+// FeasibilityResult is what ClusterSnapshot.CanSchedulePod reports for a single pod.
+type FeasibilityResult struct {
+	// FeasibleNodeNames are the nodes of the placement the pod can be scheduled on.
+	FeasibleNodeNames []string
+	// CycleState holds the per-node decisions the plugins recorded while filtering, which the
+	// node names alone do not carry. The DynamicResources plugin, for example, keeps there the
+	// devices it would allocate on each node, and ClusterState.AssumeAndReserve needs them to
+	// reserve one of the feasible nodes. It is nil when an error is returned or the placement
+	// has no nodes.
+	CycleState fwk.CycleState
+	// Diagnosis explains why the remaining nodes of the placement were rejected.
+	Diagnosis *framework.Diagnosis
 }
 
 // Unpreemption is the handle returned by ClusterSnapshot.PreemptPods, allowing the preempted pods
