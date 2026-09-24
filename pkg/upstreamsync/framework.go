@@ -72,6 +72,7 @@ type frameworkOptions struct {
 	extenders                  []schedulerapi.Extender
 	frameworkCapturer          FrameworkCapturer
 	parallelism                int32
+	sharedDRAManager           fwk.SharedDRAManager
 }
 
 // Option configures framework construction in NewProfileMap.
@@ -128,6 +129,19 @@ func WithProfiles(p ...schedulerapi.KubeSchedulerProfile) Option {
 	}
 }
 
+// WithSharedDRAManager makes the plugins read DRA objects through the given manager rather
+// than through the informers. A nil manager keeps the informer-backed one, which is the default.
+//
+// UPSTREAM-DIFF: library-only. Upstream has one cluster to schedule against and builds the
+// manager from its own informers. The interface is documented as the place to plug a simulated
+// state in, so a caller holding claims the cluster has never seen can have them judged by the
+// same plugin kube-scheduler runs.
+func WithSharedDRAManager(m fwk.SharedDRAManager) Option {
+	return func(o *frameworkOptions) {
+		o.sharedDRAManager = m
+	}
+}
+
 // NewProfileMap builds the scheduling profiles out of the given configuration and dependencies.
 //
 // UPSTREAM-DIFF: extracted from scheduler.New, keeping only the framework construction. Everything
@@ -135,7 +149,8 @@ func WithProfiles(p ...schedulerapi.KubeSchedulerProfile) Option {
 // handlers, the cache and its debugger, the binding machinery — is dropped. The snapshot, the
 // nominator, the activator and the API cacher are supplied by the caller instead of being created
 // here, so that the caller can share the snapshot with the frameworks and neutralize the extension
-// points that would otherwise reach the API server (see pkg/framework).
+// points that would otherwise reach the API server (see pkg/framework). The DRA manager may be
+// supplied the same way, see WithSharedDRAManager.
 func NewProfileMap(ctx context.Context,
 	client clientset.Interface,
 	informerFactory informers.SharedInformerFactory,
@@ -183,12 +198,13 @@ func NewProfileMap(ctx context.Context,
 	// podsInPreBind holds all the pods that are in the scheduler in the preBind phase
 	podsInPreBind := frameworkruntime.NewPodsInPreBindMap()
 
-	var resourceClaimCache *assumecache.AssumeCache
-	var resourceSliceTracker *resourceslicetracker.Tracker
-	var draManager fwk.SharedDRAManager
-	if feature.DefaultFeatureGate.Enabled(features.DynamicResourceAllocation) {
+	// UPSTREAM-DIFF: upstream always builds the manager from its informers. A caller-supplied
+	// one answers for the whole simulation, so the informer-backed manager is not built at all
+	// and the slice tracker it needs is never started.
+	draManager := options.sharedDRAManager
+	if draManager == nil && feature.DefaultFeatureGate.Enabled(features.DynamicResourceAllocation) {
 		resourceClaimInformer := informerFactory.Resource().V1().ResourceClaims().Informer()
-		resourceClaimCache = assumecache.NewAssumeCache(logger, resourceClaimInformer, "ResourceClaim", "", nil)
+		resourceClaimCache := assumecache.NewAssumeCache(logger, resourceClaimInformer, "ResourceClaim", "", nil)
 		resourceSliceTrackerOpts := resourceslicetracker.Options{
 			EnableDeviceTaintRules:   feature.DefaultFeatureGate.Enabled(features.DRADeviceTaintRules),
 			EnableConsumableCapacity: feature.DefaultFeatureGate.Enabled(features.DRAConsumableCapacity),
@@ -200,7 +216,7 @@ func NewProfileMap(ctx context.Context,
 		if resourceSliceTrackerOpts.EnableDeviceTaintRules {
 			resourceSliceTrackerOpts.TaintInformer = informerFactory.Resource().V1().DeviceTaintRules()
 		}
-		resourceSliceTracker, err = resourceslicetracker.StartTracker(ctx, resourceSliceTrackerOpts)
+		resourceSliceTracker, err := resourceslicetracker.StartTracker(ctx, resourceSliceTrackerOpts)
 		if err != nil {
 			return nil, fmt.Errorf("couldn't start resource slice tracker: %w", err)
 		}
