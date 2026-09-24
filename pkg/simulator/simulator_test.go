@@ -16,9 +16,11 @@ package simulator
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,9 +30,11 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/klog/v2"
+	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/features"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
+	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
 	testutils "sigs.k8s.io/scheduler-library/pkg/upstreamsync/testutils"
 )
@@ -313,6 +317,91 @@ func TestNewClusterSnapshot(t *testing.T) {
 		})
 	}
 
+}
+
+// stubDRAManager stands in for the informer-backed manager. The tests only check which
+// manager the profiles were built with, so none of the accessors are ever called.
+type stubDRAManager struct{}
+
+var _ fwk.SharedDRAManager = &stubDRAManager{}
+
+func (s *stubDRAManager) ResourceClaims() fwk.ResourceClaimTracker     { return nil }
+func (s *stubDRAManager) ResourceSlices() fwk.ResourceSliceLister      { return nil }
+func (s *stubDRAManager) DeviceClasses() fwk.DeviceClassLister         { return nil }
+func (s *stubDRAManager) DeviceClassResolver() fwk.DeviceClassResolver { return nil }
+
+func TestSharedDRAManagerOption(t *testing.T) {
+	// The informer-backed manager is the only thing here that starts the DRA informers, so
+	// whether they ran shows which manager the profiles were built with.
+	draInformers := []reflect.Type{
+		reflect.TypeFor[*resourcev1.ResourceClaim](),
+		reflect.TypeFor[*resourcev1.ResourceSlice](),
+	}
+	cfg := &schedulerapi.KubeSchedulerConfiguration{
+		Profiles: []schedulerapi.KubeSchedulerProfile{
+			{
+				SchedulerName: v1.DefaultSchedulerName,
+				Plugins: &schedulerapi.Plugins{
+					QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+					Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		name             string
+		clusterState     bool
+		opts             []upstreamsync.Option
+		wantDRAInformers bool
+	}{
+		{
+			name: "cluster snapshot built with a custom DRA manager",
+			opts: []upstreamsync.Option{upstreamsync.WithSharedDRAManager(&stubDRAManager{})},
+		},
+		{
+			name:             "cluster snapshot built with the default informer-backed DRA manager",
+			wantDRAInformers: true,
+		},
+		{
+			name:         "cluster state built with a custom DRA manager",
+			clusterState: true,
+			opts:         []upstreamsync.Option{upstreamsync.WithSharedDRAManager(&stubDRAManager{})},
+		},
+		{
+			name:             "cluster state built with the default informer-backed DRA manager",
+			clusterState:     true,
+			wantDRAInformers: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			client := fake.NewClientset()
+			informerFactory := informers.NewSharedInformerFactory(client, 0)
+			sim, err := NewSchedulingSimulator(ctx, cfg, ReadonlyClient{client: client}, informerFactory)
+			if err != nil {
+				t.Fatalf("NewSchedulingSimulator failed: %v", err)
+			}
+
+			if tc.clusterState {
+				_, err = sim.NewClusterState(ctx, tc.opts...)
+			} else {
+				_, err = sim.NewClusterSnapshot(ctx, nil, nil, nil, nil, tc.opts...)
+			}
+			if err != nil {
+				t.Fatalf("building the profiles failed: %v", err)
+			}
+
+			started := informerFactory.WaitForCacheSync(ctx.Done())
+			for _, typ := range draInformers {
+				if got := started[typ]; got != tc.wantDRAInformers {
+					t.Errorf("%v informer started = %v, want %v", typ, got, tc.wantDRAInformers)
+				}
+			}
+		})
+	}
 }
 
 func TestNewClusterSnapshot_Scheduling(t *testing.T) {

@@ -55,19 +55,23 @@ func TestNewProfileMapSharedDRAManager(t *testing.T) {
 	// DynamicResourceAllocation is locked on from 1.37, so there is no gate-off case to cover.
 	stub := &stubDRAManager{}
 
-	cases := map[string]struct {
+	tests := []struct {
+		name     string
 		opts     []upstreamsync.Option
 		wantStub bool
 	}{
-		"a supplied manager reaches the frameworks": {
+		{
+			name:     "build profile with a custom DRA Manager",
 			opts:     []upstreamsync.Option{upstreamsync.WithSharedDRAManager(stub)},
 			wantStub: true,
 		},
-		"without one the informer-backed manager is built": {},
+		{
+			name: "when no custom DRA Manager is provided, build profile with a default informer-backed manager",
+		},
 	}
 
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
 			profiles, err := framework.NewProfileMap(t.Context(), fake.NewClientset(), nil,
 				cache.NewSnapshot(nil, nil), minimalProfile(), tc.opts...)
 			if err != nil {

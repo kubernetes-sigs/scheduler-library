@@ -129,12 +129,13 @@ func NewSchedulingSimulator(
 	}, nil
 }
 
-// NewClusterState initializes a new runtime cluster state.
-func (s *SchedulingSimulator) NewClusterState(ctx context.Context) (*state.ClusterState, error) {
+// NewClusterState initializes a new runtime cluster state. The opts are applied when its
+// scheduling profiles are built; see upstreamsync.WithSharedDRAManager.
+func (s *SchedulingSimulator) NewClusterState(ctx context.Context, opts ...upstreamsync.Option) (*state.ClusterState, error) {
 	snap := cache.NewEmptySnapshot()
 
 	internalCache := cache.New(ctx, nil, utilfeature.DefaultFeatureGate.Enabled(features.GenericWorkload), utilfeature.DefaultFeatureGate.Enabled(features.CompositePodGroup))
-	profiles, err := s.buildProfileMap(ctx, snap)
+	profiles, err := s.buildProfileMap(ctx, snap, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -143,16 +144,18 @@ func (s *SchedulingSimulator) NewClusterState(ctx context.Context) (*state.Clust
 }
 
 // NewClusterSnapshot initializes a new snapshot with the provided pods, nodes, pod groups, and composite pod groups.
+// The opts are applied when its scheduling profiles are built; see upstreamsync.WithSharedDRAManager.
 func (s *SchedulingSimulator) NewClusterSnapshot(
 	ctx context.Context,
 	pods []*v1.Pod,
 	nodes []*v1.Node,
 	podGroups []*schedulingv1beta1.PodGroup,
 	compositePodGroups []*schedulingv1alpha3.CompositePodGroup,
+	opts ...upstreamsync.Option,
 ) (Simulator, error) {
 	snap := cache.NewTestSnapshotWithCompositePodGroups(pods, nodes, podGroups, compositePodGroups)
 
-	profiles, err := s.buildProfileMap(ctx, snap)
+	profiles, err := s.buildProfileMap(ctx, snap, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -160,8 +163,8 @@ func (s *SchedulingSimulator) NewClusterSnapshot(
 	return snapshot.New(snap, profiles), nil
 }
 
-func (s *SchedulingSimulator) buildProfileMap(ctx context.Context, snap *cache.Snapshot) (*upstreamsync.ProfileMap, error) {
-	profiles, err := framework.NewProfileMap(ctx, s.client, s.informerFactory, snap, s.cfg)
+func (s *SchedulingSimulator) buildProfileMap(ctx context.Context, snap *cache.Snapshot, opts ...upstreamsync.Option) (*upstreamsync.ProfileMap, error) {
+	profiles, err := framework.NewProfileMap(ctx, s.client, s.informerFactory, snap, s.cfg, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("schedlib: building scheduler: %w", err)
 	}
