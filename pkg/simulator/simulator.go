@@ -187,7 +187,7 @@ func (s *SchedulingSimulator) buildProfileMap(ctx context.Context, snap *cache.S
 		if err := s.informerCtx.Err(); err != nil {
 			return nil, fmt.Errorf("schedlib: the simulator's context is done: %w", err)
 		}
-		return nil, res.Err
+		return nil, fmt.Errorf("schedlib: %w", res.AsError())
 	}
 	return profiles, nil
 }

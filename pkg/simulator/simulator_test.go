@@ -16,11 +16,14 @@ package simulator
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -499,33 +502,14 @@ func TestNewClusterSnapshot_PodGroupScheduling(t *testing.T) {
 	}
 }
 
-// recordingInformerFactory remembers the context each start ran under. Both start methods are
-// overridden: embedding does not route the factory's own Start through the StartWithContext below.
-type recordingInformerFactory struct {
-	informers.SharedInformerFactory
-	startedWith []context.Context
-}
-
-func (f *recordingInformerFactory) Start(stopCh <-chan struct{}) {
-	f.startedWith = append(f.startedWith, wait.ContextForChannel(stopCh))
-	f.SharedInformerFactory.Start(stopCh)
-}
-
-func (f *recordingInformerFactory) StartWithContext(ctx context.Context) {
-	f.startedWith = append(f.startedWith, ctx)
-	f.SharedInformerFactory.StartWithContext(ctx)
-}
-
 func TestInformersRunForTheSimulatorsLifetime(t *testing.T) {
 	client := fake.NewClientset()
-	informerFactory := &recordingInformerFactory{SharedInformerFactory: informers.NewSharedInformerFactory(client, 0)}
+	informerFactory := informers.NewSharedInformerFactory(client, 0)
 	simulatorCtx, shutdown := context.WithCancel(t.Context())
 	sim, err := NewSchedulingSimulator(simulatorCtx, minimalConfig(), ReadonlyClient{client: client}, informerFactory)
 	if err != nil {
 		t.Fatalf("failed to create simulator: %v", err)
 	}
-	// Only the informers the snapshot registers are in question; the simulator started its own.
-	informerFactory.startedWith = nil
 
 	snapshotCtx, cancel := context.WithCancel(t.Context())
 	if _, err := sim.NewClusterSnapshot(snapshotCtx, nil, nil, nil, nil); err != nil {
@@ -533,20 +517,33 @@ func TestInformersRunForTheSimulatorsLifetime(t *testing.T) {
 	}
 	cancel()
 
-	if len(informerFactory.startedWith) == 0 {
-		t.Fatal("Expected the snapshot to have started the informers it registered")
+	// Building the profiles registers a CSINode informer on the shared factory, for the lister
+	// NodeVolumeLimits runs on, so the snapshot call is what started it.
+	csiNodes := informerFactory.Storage().V1().CSINodes().Informer()
+	if !csiNodes.HasSynced() {
+		t.Fatal("Expected building the profiles to have registered and started a CSINode informer")
 	}
-	for _, startCtx := range informerFactory.startedWith {
-		if err := startCtx.Err(); err != nil {
-			t.Errorf("The informers were started with a context that is already done (%v), so they stop with the call that registered them", err)
-		}
+
+	// The call it was registered by is over, but the informer belongs to the simulator, so it
+	// keeps watching.
+	csiNode := &storagev1.CSINode{ObjectMeta: metav1.ObjectMeta{Name: "node1"}}
+	if _, err := client.StorageV1().CSINodes().Create(t.Context(), csiNode, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to create CSINode: %v", err)
+	}
+	if err := wait.PollUntilContextTimeout(t.Context(), 10*time.Millisecond, wait.ForeverTestTimeout, true,
+		func(context.Context) (bool, error) {
+			_, seen, err := csiNodes.GetStore().GetByKey(csiNode.Name)
+			return seen, err
+		}); err != nil {
+		t.Errorf("The informer never saw a CSINode created after the snapshot that registered it was cancelled (%v), so it stops with that call", err)
 	}
 
 	shutdown()
-	for _, startCtx := range informerFactory.startedWith {
-		if startCtx.Err() == nil {
-			t.Error("The informers were started with a context that outlives the simulator, so they never stop")
-		}
+	if err := wait.PollUntilContextTimeout(t.Context(), 10*time.Millisecond, wait.ForeverTestTimeout, true,
+		func(context.Context) (bool, error) {
+			return csiNodes.IsStopped(), nil
+		}); err != nil {
+		t.Errorf("The informer is still running after the simulator was shut down (%v), so it never stops", err)
 	}
 }
 
@@ -566,8 +563,8 @@ func TestNewClusterSnapshotFailsOnceTheSimulatorContextIsDone(t *testing.T) {
 	}()
 	select {
 	case err := <-returned:
-		if err == nil {
-			t.Error("Expected an error from a simulator whose context is done, got nil")
+		if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "the simulator's context is done") {
+			t.Errorf("Expected the simulator's shutdown to be reported as the cause, got %v", err)
 		}
 	case <-time.After(wait.ForeverTestTimeout):
 		t.Fatal("NewClusterSnapshot did not return; it is waiting for informers that can no longer sync")
