@@ -15,6 +15,8 @@
 package snapshot
 
 import (
+	"iter"
+
 	v1 "k8s.io/api/core/v1"
 	fwk "k8s.io/kube-scheduler/framework"
 )
@@ -106,6 +108,7 @@ type Unpreemption struct {
 // ScheduleWorkloadOptions contains options for scheduling a workload.
 type ScheduleWorkloadOptions struct {
 	CommonSchedulingOptions
+	WorkloadPreemptionOptions
 }
 
 // NewScheduleWorkloadOptions builds the ScheduleWorkloadOptions used by ScheduleWorkload.
@@ -113,4 +116,86 @@ func NewScheduleWorkloadOptions(dryRun bool) ScheduleWorkloadOptions {
 	return ScheduleWorkloadOptions{
 		CommonSchedulingOptions: CommonSchedulingOptions{DryRun: dryRun},
 	}
+}
+
+// PreemptionVictim is an atomic unit of preemption, which can contain 1 or more pods.
+type PreemptionVictim struct {
+	// Metadata can store any auxiliary data, which can be used in callbacks such as [PreemptionFilter].
+	// It is not read by the library.
+	Metadata any
+
+	// Pods can contain 1 or more pods. Pods should not overlap across multiple victims.
+	Pods []*v1.Pod
+}
+
+// PreemptionFilter provides a fast pre-check to skip expensive fit evaluations
+// when the current set of preempted victims is known to be insufficient.
+type PreemptionFilter interface {
+	// UnpreemptVictim records that a victim has been removed from the current victim set.
+	UnpreemptVictim(PreemptionVictim)
+
+	// PreemptVictim records that a victim has been added to the current victim set.
+	PreemptVictim(PreemptionVictim)
+
+	// CanEvaluatePreemptor reports whether the preemptor could potentially fit given
+	// the current victim set.
+	//
+	// If it returns true, the scheduler runs a scheduling evaluation for the preemptor.
+	// If it returns false, the current victim set is treated as insufficient and
+	// the scheduling evaluation is skipped.
+	//
+	// Implementations must rely only on internal state updated via
+	// [PreemptionFilter.PreemptVictim] and [PreemptionFilter.UnpreemptVictim],
+	// and must not read from the cluster snapshot directly.
+	//
+	// The result must be monotonic with respect to the victim set:
+	//   - [PreemptionFilter.PreemptVictim] (adding a victim) must never change the result from true to false.
+	//   - [PreemptionFilter.UnpreemptVictim] (removing a victim) must never change the result from false to true.
+	CanEvaluatePreemptor() bool
+}
+
+// WorkloadPreemptionOptions configures victim selection and filtering for workload preemption.
+//
+// When a workload cannot be scheduled directly, preemption runs in two stages:
+//  1. Prefix search: victims from [WorkloadPreemptionOptions.PotentialVictims] are preempted
+//     in order (least to most valuable) until the workload fits.
+//  2. Reprieval: victims in that prefix are tested in reverse order (most to least valuable)
+//     and restored to the cluster if the workload still fits without preempting them.
+type WorkloadPreemptionOptions struct {
+	// PotentialVictims yields candidate victims that may be preempted to make room for the
+	// workload, ordered from least to most valuable.
+	// It is consumed during stage 1 to find the smallest prefix of victims needed for the
+	// workload to fit, after which stage 2 attempts to reprieve victims from that prefix.
+	// If nil or empty, no additional victims are considered during stage 1.
+	PotentialVictims iter.Seq[PreemptionVictim]
+
+	// CommittedVictims are victims that are preempted unconditionally before stage 1 begins.
+	// Unlike PotentialVictims, they are never candidates for reprieval in stage 2.
+	// If nil or empty, no victims are preempted upfront.
+	CommittedVictims []PreemptionVictim
+
+	// PreemptionFilter is an optional fast pre-check used during both prefix search and
+	// reprieval to skip scheduling evaluations when the current victim set is known
+	// to be insufficient.
+	// If nil, no pre-check filter is applied.
+	PreemptionFilter PreemptionFilter
+}
+
+// WorkloadSchedulingResult is the result of the ScheduleWorkload operation.
+type WorkloadSchedulingResult struct {
+	// Status is status of the scheduling without preemption or error.
+	// If status is not successful or dry-run flag is set, the results won't be saved to snapshot.
+	// If preemption was successful, [WorkloadSchedulingResult.PodResults] and [WorkloadSchedulingResult.PreemptionVictims] will be set.
+	Status *fwk.Status
+
+	// PodResults stores assignments from pods to nodes.
+	// If scheduling or preemption was unsuccessful, this will be empty.
+	// It is a subset of pods specified in the input.
+	// In particular, it can contain fewer pods than provided when the hierarchy satisfies the gang quorum without needing to schedule every pod.
+	PodResults []SchedulingResult
+
+	// PreemptionVictims is the final set of victims determined by the scheduling algorithm to be required for the workload to fit.
+	// If preemption was not needed or was unsuccessful, this will be empty.
+	// It is a subset of victims specified in [WorkloadPreemptionOptions].
+	PreemptionVictims []PreemptionVictim
 }

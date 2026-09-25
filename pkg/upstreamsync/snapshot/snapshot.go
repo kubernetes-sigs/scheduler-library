@@ -416,15 +416,15 @@ func (s *ClusterSnapshot) Unpreempt(u *Unpreemption) ([]*v1.Pod, error) {
 // ScheduleWorkload schedules the given pods belonging to the same hierarchy using the workload-aware scheduling algorithm.
 // If the pods do not belong to the same hierarchy, it returns an error.
 // The order of the returned SchedulingResult slice is non-deterministic with respect to the input pods order.
-func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, opts ScheduleWorkloadOptions) (_ []SchedulingResult, err error) {
+func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, opts ScheduleWorkloadOptions) (result WorkloadSchedulingResult) {
 	if len(pods) == 0 {
-		return nil, nil
+		return WorkloadSchedulingResult{}
 	}
 
 	initialStateVersion := s.undoLog.stateVersion
 
 	defer func() {
-		if err != nil || opts.DryRun {
+		if !result.Status.IsSuccess() || opts.DryRun {
 			s.undoLog.restoreState(initialStateVersion)
 		}
 		if initialStateVersion != s.undoLog.stateVersion {
@@ -434,12 +434,12 @@ func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, 
 
 	podGroupInfo, err := buildPodGroupHierarchy(s.schedulerSnapshot, pods)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build pod group hierarchy: %w", err)
+		return WorkloadSchedulingResult{Status: fwk.AsStatus(fmt.Errorf("failed to build pod group hierarchy: %w", err))}
 	}
 
 	schedFramework, err := s.profiles.FrameworkForPodGroup(podGroupInfo)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get framework for pod group: %w", err)
+		return WorkloadSchedulingResult{Status: fwk.AsStatus(fmt.Errorf("failed to get framework for pod group: %w", err))}
 	}
 
 	sched := upstreamsync.NewScheduler(s.schedulerSnapshot, 0, 0, 1, nil)
@@ -476,5 +476,7 @@ func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, 
 		}
 	}
 
-	return results, nil
+	return WorkloadSchedulingResult{
+		PodResults: results,
+	}
 }
