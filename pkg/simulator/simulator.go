@@ -93,12 +93,18 @@ type SchedulingSimulator struct {
 	cfg             *schedulerapi.KubeSchedulerConfiguration
 	informerFactory informers.SharedInformerFactory
 	client          kubernetes.Interface
+
+	// informerCtx is what the informers run under. The factory is shared by every state and
+	// snapshot the simulator creates, so their lifetime is the simulator's, not any one call's.
+	informerCtx context.Context
 }
 
 // NewSchedulingSimulator creates a new SchedulingSimulator.
 // The cfg may be nil, in which case the default kube-scheduler profile is used, and so may the
 // informerFactory, in which case one is created from the client. The informers are started and
 // synced before returning, so the call blocks until the cluster state has been read.
+// The ctx bounds their lifetime, including the informers that NewClusterState and
+// NewClusterSnapshot later register on the same factory.
 func NewSchedulingSimulator(
 	ctx context.Context,
 	cfg *schedulerapi.KubeSchedulerConfiguration,
@@ -126,6 +132,7 @@ func NewSchedulingSimulator(
 		cfg:             cfg,
 		informerFactory: informerFactory,
 		client:          client.client,
+		informerCtx:     ctx,
 	}, nil
 }
 
@@ -165,10 +172,22 @@ func (s *SchedulingSimulator) buildProfileMap(ctx context.Context, snap *cache.S
 	if err != nil {
 		return nil, fmt.Errorf("schedlib: building scheduler: %w", err)
 	}
-	s.informerFactory.StartWithContext(ctx)
-	res := s.informerFactory.WaitForCacheSyncWithContext(ctx)
-	if res.Err != nil {
-		return nil, res.Err
+	// The informers the profiles registered belong to the simulator: a shared informer is started
+	// once, and keeps the context of that first start for as long as it runs.
+	s.informerFactory.StartWithContext(s.informerCtx)
+
+	// Waiting for them is this call's business, but a shutting-down simulator leaves them unable
+	// to sync, so the wait watches both contexts rather than only the caller's.
+	waitCtx, stopWaiting := context.WithCancel(ctx)
+	defer stopWaiting()
+	stopWaitingOnShutdown := context.AfterFunc(s.informerCtx, stopWaiting)
+	defer stopWaitingOnShutdown()
+
+	if res := s.informerFactory.WaitForCacheSyncWithContext(waitCtx); res.Err != nil {
+		if err := s.informerCtx.Err(); err != nil {
+			return nil, fmt.Errorf("schedlib: the simulator's context is done: %w", err)
+		}
+		return nil, fmt.Errorf("schedlib: %w", res.AsError())
 	}
 	return profiles, nil
 }

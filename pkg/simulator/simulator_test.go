@@ -16,13 +16,18 @@ package simulator
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
@@ -35,8 +40,8 @@ import (
 	testutils "sigs.k8s.io/scheduler-library/pkg/upstreamsync/testutils"
 )
 
-func TestNewSchedulingSimulator(t *testing.T) {
-	cfg := &schedulerapi.KubeSchedulerConfiguration{
+func minimalConfig() *schedulerapi.KubeSchedulerConfiguration {
+	return &schedulerapi.KubeSchedulerConfiguration{
 		Profiles: []schedulerapi.KubeSchedulerProfile{
 			{
 				SchedulerName: "default-scheduler",
@@ -47,6 +52,10 @@ func TestNewSchedulingSimulator(t *testing.T) {
 			},
 		},
 	}
+}
+
+func TestNewSchedulingSimulator(t *testing.T) {
+	cfg := minimalConfig()
 	client := fake.NewClientset()
 	informerFactory := informers.NewSharedInformerFactory(client, 0)
 	sim, err := NewSchedulingSimulator(t.Context(), cfg, ReadonlyClient{client: fake.NewClientset()}, informerFactory)
@@ -59,17 +68,7 @@ func TestNewSchedulingSimulator(t *testing.T) {
 }
 
 func TestNewSchedulingSimulatorWithNilInformerFactory(t *testing.T) {
-	cfg := &schedulerapi.KubeSchedulerConfiguration{
-		Profiles: []schedulerapi.KubeSchedulerProfile{
-			{
-				SchedulerName: "default-scheduler",
-				Plugins: &schedulerapi.Plugins{
-					QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
-					Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
-				},
-			},
-		},
-	}
+	cfg := minimalConfig()
 	sim, err := NewSchedulingSimulator(t.Context(), cfg, ReadonlyClient{client: fake.NewClientset()}, nil)
 	if err != nil {
 		t.Fatalf("failed to create simulator with nil informerFactory: %v", err)
@@ -317,17 +316,7 @@ func TestNewClusterSnapshot(t *testing.T) {
 
 func TestNewClusterSnapshot_Scheduling(t *testing.T) {
 	ctx := context.Background()
-	cfg := &schedulerapi.KubeSchedulerConfiguration{
-		Profiles: []schedulerapi.KubeSchedulerProfile{
-			{
-				SchedulerName: "default-scheduler",
-				Plugins: &schedulerapi.Plugins{
-					QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
-					Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
-				},
-			},
-		},
-	}
+	cfg := minimalConfig()
 	client := fake.NewClientset()
 	informerFactory := informers.NewSharedInformerFactory(client, 0)
 	sim, err := NewSchedulingSimulator(ctx, cfg, ReadonlyClient{client: fake.NewClientset()}, informerFactory)
@@ -383,17 +372,7 @@ func TestNewClusterSnapshot_Scheduling(t *testing.T) {
 
 func TestClusterState_Scheduling(t *testing.T) {
 	ctx := context.Background()
-	cfg := &schedulerapi.KubeSchedulerConfiguration{
-		Profiles: []schedulerapi.KubeSchedulerProfile{
-			{
-				SchedulerName: "default-scheduler",
-				Plugins: &schedulerapi.Plugins{
-					QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
-					Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
-				},
-			},
-		},
-	}
+	cfg := minimalConfig()
 	client := fake.NewClientset()
 	informerFactory := informers.NewSharedInformerFactory(client, 0)
 	sim, err := NewSchedulingSimulator(ctx, cfg, ReadonlyClient{client: fake.NewClientset()}, informerFactory)
@@ -520,5 +499,74 @@ func TestNewClusterSnapshot_PodGroupScheduling(t *testing.T) {
 		if r.SelectedNodeName != "node1" {
 			t.Errorf("Expected pod %s on node1, got %q", r.Pod.Name, r.SelectedNodeName)
 		}
+	}
+}
+
+func TestInformersRunForTheSimulatorsLifetime(t *testing.T) {
+	client := fake.NewClientset()
+	informerFactory := informers.NewSharedInformerFactory(client, 0)
+	simulatorCtx, shutdown := context.WithCancel(t.Context())
+	sim, err := NewSchedulingSimulator(simulatorCtx, minimalConfig(), ReadonlyClient{client: client}, informerFactory)
+	if err != nil {
+		t.Fatalf("failed to create simulator: %v", err)
+	}
+
+	snapshotCtx, cancel := context.WithCancel(t.Context())
+	if _, err := sim.NewClusterSnapshot(snapshotCtx, nil, nil, nil, nil); err != nil {
+		t.Fatalf("failed to create snapshot: %v", err)
+	}
+	cancel()
+
+	// Building the profiles registers a CSINode informer on the shared factory, for the lister
+	// NodeVolumeLimits runs on, so the snapshot call is what started it.
+	csiNodes := informerFactory.Storage().V1().CSINodes().Informer()
+	if !csiNodes.HasSynced() {
+		t.Fatal("Expected building the profiles to have registered and started a CSINode informer")
+	}
+
+	// The call it was registered by is over, but the informer belongs to the simulator, so it
+	// keeps watching.
+	csiNode := &storagev1.CSINode{ObjectMeta: metav1.ObjectMeta{Name: "node1"}}
+	if _, err := client.StorageV1().CSINodes().Create(t.Context(), csiNode, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to create CSINode: %v", err)
+	}
+	if err := wait.PollUntilContextTimeout(t.Context(), 10*time.Millisecond, wait.ForeverTestTimeout, true,
+		func(context.Context) (bool, error) {
+			_, seen, err := csiNodes.GetStore().GetByKey(csiNode.Name)
+			return seen, err
+		}); err != nil {
+		t.Errorf("The informer never saw a CSINode created after the snapshot that registered it was cancelled (%v), so it stops with that call", err)
+	}
+
+	shutdown()
+	if err := wait.PollUntilContextTimeout(t.Context(), 10*time.Millisecond, wait.ForeverTestTimeout, true,
+		func(context.Context) (bool, error) {
+			return csiNodes.IsStopped(), nil
+		}); err != nil {
+		t.Errorf("The informer is still running after the simulator was shut down (%v), so it never stops", err)
+	}
+}
+
+func TestNewClusterSnapshotFailsOnceTheSimulatorContextIsDone(t *testing.T) {
+	client := fake.NewClientset()
+	simulatorCtx, shutdown := context.WithCancel(t.Context())
+	sim, err := NewSchedulingSimulator(simulatorCtx, minimalConfig(), ReadonlyClient{client: client}, informers.NewSharedInformerFactory(client, 0))
+	if err != nil {
+		t.Fatalf("failed to create simulator: %v", err)
+	}
+	shutdown()
+
+	returned := make(chan error, 1)
+	go func() {
+		_, err := sim.NewClusterSnapshot(t.Context(), nil, nil, nil, nil)
+		returned <- err
+	}()
+	select {
+	case err := <-returned:
+		if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "the simulator's context is done") {
+			t.Errorf("Expected the simulator's shutdown to be reported as the cause, got %v", err)
+		}
+	case <-time.After(wait.ForeverTestTimeout):
+		t.Fatal("NewClusterSnapshot did not return; it is waiting for informers that can no longer sync")
 	}
 }
