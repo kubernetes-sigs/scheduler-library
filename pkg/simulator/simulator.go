@@ -34,7 +34,6 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
-	schedFwk "k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
 // Simulator is the set of "what-if" operations that run against a single in-memory view of the
@@ -46,9 +45,10 @@ type Simulator interface {
 	MakePlacement(candidateNodeNames []string) (*fwk.Placement, error)
 
 	// CanSchedulePod reports which of the nodes in the placement fit a single pod, leaving the
-	// snapshot untouched. The returned *schedFwk.Diagnosis explains why the remaining nodes were
-	// rejected.
-	CanSchedulePod(ctx context.Context, pod *v1.Pod, placement *fwk.Placement) ([]string, *schedFwk.Diagnosis, error)
+	// snapshot untouched. The returned snapshot.FeasibilityResult carries those node names, the
+	// cycle state ClusterState.AssumeAndReserve needs to reserve one of them, and the diagnosis
+	// explaining why the remaining nodes were rejected.
+	CanSchedulePod(ctx context.Context, pod *v1.Pod, placement *fwk.Placement) (snapshot.FeasibilityResult, error)
 
 	// SchedulePods schedules the given pods one by one onto the placement and, unless opts.DryRun is
 	// set, keeps the result in the snapshot. The pods passed in are left untouched; the returned

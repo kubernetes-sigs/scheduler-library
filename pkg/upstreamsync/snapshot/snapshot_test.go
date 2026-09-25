@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/noderesources"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	ft "sigs.k8s.io/scheduler-library/pkg/framework/testing"
 	testutils "sigs.k8s.io/scheduler-library/pkg/upstreamsync/testutils"
@@ -175,7 +176,7 @@ func canSchedule(podName string, candidateNodes []string) stepFn {
 		if err != nil {
 			t.Fatalf("canSchedule: MakePlacement failed: %v", err)
 		}
-		_, _, err = sc.cs.CanSchedulePod(sc.ctx, p, placement)
+		_, err = sc.cs.CanSchedulePod(sc.ctx, p, placement)
 		if err != nil {
 			t.Fatalf("CanSchedulePod(%q) unexpected error: %v", podName, err)
 		}
@@ -591,12 +592,16 @@ func TestCanSchedulePod(t *testing.T) {
 		expectNodes    []string
 		expectErr      bool
 		expectRejected map[string]string
+		// expectPluginState is true when the plugins ran and so recorded their decisions
+		// in the caller's cycle state.
+		expectPluginState bool
 	}{
 		{
-			name:           "Success - all nodes eligible",
-			candidateNodes: []string{"node1", "node2"},
-			expectNodes:    []string{"node1", "node2"},
-			expectErr:      false,
+			name:              "Success - all nodes eligible",
+			candidateNodes:    []string{"node1", "node2"},
+			expectNodes:       []string{"node1", "node2"},
+			expectErr:         false,
+			expectPluginState: true,
 		},
 		{
 			name:           "Error - unknown scheduler name",
@@ -619,6 +624,7 @@ func TestCanSchedulePod(t *testing.T) {
 			expectRejected: map[string]string{
 				"node1": "Insufficient cpu",
 			},
+			expectPluginState: true,
 		},
 	}
 
@@ -650,9 +656,21 @@ func TestCanSchedulePod(t *testing.T) {
 				t.Fatalf("MakePlacement() error = %v", err)
 			}
 
-			nodes, diagnosis, err := cs.CanSchedulePod(ctx, pod, placement)
+			result, err := cs.CanSchedulePod(ctx, pod, placement)
 			if (err != nil) != tc.expectErr {
 				t.Fatalf("CanSchedulePod() error = %v, expectErr %v", err, tc.expectErr)
+			}
+			nodes, diagnosis := result.FeasibleNodeNames, result.Diagnosis
+
+			// NodeResourcesFit writes its PreFilter state under this key, so reading it back
+			// shows the returned state is the one the plugins filtered with rather than a fresh one.
+			gotPluginState := false
+			if result.CycleState != nil {
+				_, readErr := result.CycleState.Read(fwk.StateKey("PreFilter" + noderesources.Name))
+				gotPluginState = readErr == nil
+			}
+			if gotPluginState != tc.expectPluginState {
+				t.Errorf("CanSchedulePod() returned plugin state = %v, want %v", gotPluginState, tc.expectPluginState)
 			}
 
 			if !tc.expectErr {
