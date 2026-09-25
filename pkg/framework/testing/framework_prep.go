@@ -23,6 +23,7 @@ import (
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/kubernetes/pkg/features"
@@ -34,6 +35,7 @@ import (
 
 // SetupSnapshotTest initializes a fake clientset, snapshot, and default profile map for unit tests.
 func SetupSnapshotTest(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (*upstreamsync.ProfileMap, *cache.Snapshot, error) {
+	framework.InitMetricsOnce()
 	client := fake.NewClientset()
 	for _, n := range nodes {
 		if _, err := client.CoreV1().Nodes().Create(ctx, n, metav1.CreateOptions{}); err != nil {
@@ -85,16 +87,25 @@ func SetupSnapshotTest(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (*
 		},
 	}
 
+	informerFactory := informers.NewSharedInformerFactory(client, 0)
 	snap := cache.NewSnapshot(pods, nodes)
-	profileMap, err := framework.NewProfileMap(ctx,
-		client,
-		nil,
-		snap,
-		&prof,
-	)
+	comps, err := upstreamsync.NewFrameworkComponents(ctx, client, informerFactory, upstreamsync.WithProfiles(prof.Profiles...))
 	if err != nil {
 		return nil, nil, err
 	}
+	informerFactory.StartWithContext(ctx)
+	informerFactory.WaitForCacheSyncWithContext(ctx)
+	if err := comps.WaitForHandlersSync(ctx); err != nil {
+		return nil, nil, err
+	}
+
+	profileMap, err := upstreamsync.NewFrameworkMap(ctx, comps, framework.DiscardRecorderFactory, snap)
+	if err != nil {
+		return nil, nil, err
+	}
+	framework.ApplySimulationNeutralizers(profileMap)
+	informerFactory.StartWithContext(ctx)
+	informerFactory.WaitForCacheSyncWithContext(ctx)
 
 	return profileMap, snap, nil
 }
@@ -109,6 +120,7 @@ func SetupSnapshotTestWithPodGroups(
 	podGroups []*schedulingv1beta1.PodGroup,
 	compositePodGroups []*schedulingv1alpha3.CompositePodGroup,
 ) (*upstreamsync.ProfileMap, *cache.Snapshot, error) {
+	framework.InitMetricsOnce()
 	client := fake.NewClientset()
 	for _, n := range nodes {
 		if _, err := client.CoreV1().Nodes().Create(ctx, n, metav1.CreateOptions{}); err != nil {
@@ -152,15 +164,24 @@ func SetupSnapshotTestWithPodGroups(
 	})
 
 	snap := cache.NewTestSnapshotWithCompositePodGroups(pods, nodes, podGroups, compositePodGroups)
-	profileMap, err := framework.NewProfileMap(ctx,
-		client,
-		nil,
-		snap,
-		&prof,
-	)
+	informerFactory := informers.NewSharedInformerFactory(client, 0)
+	comps, err := upstreamsync.NewFrameworkComponents(ctx, client, informerFactory, upstreamsync.WithProfiles(prof.Profiles...))
 	if err != nil {
 		return nil, nil, err
 	}
+	informerFactory.StartWithContext(ctx)
+	informerFactory.WaitForCacheSyncWithContext(ctx)
+	if err := comps.WaitForHandlersSync(ctx); err != nil {
+		return nil, nil, err
+	}
+
+	profileMap, err := upstreamsync.NewFrameworkMap(ctx, comps, framework.DiscardRecorderFactory, snap)
+	if err != nil {
+		return nil, nil, err
+	}
+	framework.ApplySimulationNeutralizers(profileMap)
+	informerFactory.StartWithContext(ctx)
+	informerFactory.WaitForCacheSyncWithContext(ctx)
 
 	return profileMap, snap, nil
 }

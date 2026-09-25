@@ -32,10 +32,12 @@ import (
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/scheduler"
+	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/parallelize"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/dynamicresources"
+	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
 	utiltrace "k8s.io/utils/trace"
 )
@@ -74,6 +76,46 @@ type Scheduler struct {
 	nextStartNodeIndex int
 	numNodesToFind     int32
 	cache              cache.Cache
+}
+
+type schedulerOptions struct {
+	profiles                   []schedulerapi.KubeSchedulerProfile
+	extenders                  []schedulerapi.Extender
+	frameworkOutOfTreeRegistry frameworkruntime.Registry
+	parallelism                int32
+	applyDefaultProfile        bool
+}
+
+// Option configures scheduler framework components and profiles.
+type Option func(*schedulerOptions)
+
+// WithProfiles sets profiles for the scheduler framework.
+func WithProfiles(p ...schedulerapi.KubeSchedulerProfile) Option {
+	return func(o *schedulerOptions) {
+		o.profiles = p
+		o.applyDefaultProfile = false
+	}
+}
+
+// WithExtenders sets extenders for the scheduler.
+func WithExtenders(e ...schedulerapi.Extender) Option {
+	return func(o *schedulerOptions) {
+		o.extenders = e
+	}
+}
+
+// WithParallelism sets the parallelism for scheduler plugins.
+func WithParallelism(threads int32) Option {
+	return func(o *schedulerOptions) {
+		o.parallelism = threads
+	}
+}
+
+// WithFrameworkOutOfTreeRegistry registers out-of-tree plugins with the in-tree registry.
+func WithFrameworkOutOfTreeRegistry(registry frameworkruntime.Registry) Option {
+	return func(o *schedulerOptions) {
+		o.frameworkOutOfTreeRegistry = registry
+	}
 }
 
 // NewScheduler creates a Scheduler operating on the given snapshot.
