@@ -34,6 +34,7 @@ import (
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	internalcache "k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
+	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/preemption"
 )
 
 // verifyErr verifies that the given error is the error expected by the test case.
@@ -130,7 +131,7 @@ func TestNewFrameworkMap(t *testing.T) {
 	}
 
 	snap := internalcache.NewEmptySnapshot()
-	profileMap, err := NewFrameworkMap(ctx, comps, fakeRecorderFactory, snap)
+	profileMap, err := NewFrameworkMap(ctx, comps, fakeRecorderFactory, snap, preemption.NoopPreemptionManagerFactory)
 	if err != nil {
 		t.Fatalf("NewFrameworkMap failed: %v", err)
 	}
@@ -282,7 +283,7 @@ func TestNewFrameworkMapSharedDRAManager(t *testing.T) {
 				t.Fatalf("NewFrameworkComponents failed: %v", err)
 			}
 
-			profileMap, err := NewFrameworkMap(ctx, comps, fakeRecorderFactory, internalcache.NewEmptySnapshot(), tt.opts...)
+			profileMap, err := NewFrameworkMap(ctx, comps, fakeRecorderFactory, internalcache.NewEmptySnapshot(), preemption.NoopPreemptionManagerFactory, tt.opts...)
 			if err != nil {
 				t.Fatalf("NewFrameworkMap failed: %v", err)
 			}
