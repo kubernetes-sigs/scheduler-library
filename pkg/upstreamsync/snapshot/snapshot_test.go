@@ -139,26 +139,26 @@ func scheduleWorkload(podNames []string, opts ScheduleWorkloadOptions, wantSucce
 			}
 			pods = append(pods, p)
 		}
-		results, err := sc.cs.ScheduleWorkload(sc.ctx, pods, opts)
+		result := sc.cs.ScheduleWorkload(sc.ctx, pods, opts)
 		if wantSuccess {
-			if err != nil {
-				t.Fatalf("ScheduleWorkload(%v) unexpected error: %v", podNames, err)
+			if !result.Status.IsSuccess() {
+				t.Fatalf("ScheduleWorkload(%v) unexpected error: %v", podNames, result.Status.AsError())
 			}
-			for i, res := range results {
+			for i, res := range result.PodResults {
 				if !res.Status.IsSuccess() {
 					t.Fatalf("ScheduleWorkload(%v) result[%d] unexpected failure status: %v", podNames, i, res.Status)
 				}
 			}
-		} else if err == nil {
-			allSucceeded := len(results) > 0
-			for _, res := range results {
+		} else if result.Status.IsSuccess() {
+			allSucceeded := len(result.PodResults) > 0
+			for _, res := range result.PodResults {
 				if !res.Status.IsSuccess() {
 					allSucceeded = false
 					break
 				}
 			}
 			if allSucceeded {
-				t.Fatalf("ScheduleWorkload(%v) expected failure status, but all succeeded: %v", podNames, results)
+				t.Fatalf("ScheduleWorkload(%v) expected failure status, but all succeeded: %v", podNames, result)
 			}
 		}
 	}
@@ -1377,21 +1377,21 @@ func TestScheduleWorkload(t *testing.T) {
 			}
 			cs := New(snap, profileMap)
 
-			results, err := cs.ScheduleWorkload(ctx, tt.pods, tt.opts)
-			if (err != nil) != tt.expectErr {
+			result := cs.ScheduleWorkload(ctx, tt.pods, tt.opts)
+			if !result.Status.IsSuccess() != tt.expectErr {
 				t.Fatalf("ScheduleWorkload() error = %v, expectErr %v", err, tt.expectErr)
 			}
 
 			if !tt.expectErr && len(tt.expectResults) > 0 {
-				if len(results) != len(tt.expectResults) {
-					t.Fatalf("ScheduleWorkload() got %d results, want %d", len(results), len(tt.expectResults))
+				if len(result.PodResults) != len(tt.expectResults) {
+					t.Fatalf("ScheduleWorkload() got %d results, want %d", len(result.PodResults), len(tt.expectResults))
 				}
-				for i := range results {
-					if results[i].SelectedNodeName != tt.expectResults[i].SelectedNodeName {
-						t.Errorf("result[%d] SelectedNodeName = %q, want %q", i, results[i].SelectedNodeName, tt.expectResults[i].SelectedNodeName)
+				for i := range result.PodResults {
+					if result.PodResults[i].SelectedNodeName != tt.expectResults[i].SelectedNodeName {
+						t.Errorf("result[%d] SelectedNodeName = %q, want %q", i, result.PodResults[i].SelectedNodeName, tt.expectResults[i].SelectedNodeName)
 					}
-					if results[i].Status.IsSuccess() != tt.expectResults[i].Status.IsSuccess() {
-						t.Errorf("result[%d] Status.IsSuccess = %v, want %v", i, results[i].Status.IsSuccess(), tt.expectResults[i].Status.IsSuccess())
+					if result.PodResults[i].Status.IsSuccess() != tt.expectResults[i].Status.IsSuccess() {
+						t.Errorf("result[%d] Status.IsSuccess = %v, want %v", i, result.PodResults[i].Status.IsSuccess(), tt.expectResults[i].Status.IsSuccess())
 					}
 				}
 			}

@@ -31,6 +31,7 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	"sigs.k8s.io/scheduler-library/pkg/framework"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
+	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/preemption"
 )
 
 // SetupSnapshotTest initializes a fake clientset, snapshot, and default profile map for unit tests.
@@ -99,7 +100,7 @@ func SetupSnapshotTest(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (*
 		return nil, nil, err
 	}
 
-	profileMap, err := upstreamsync.NewFrameworkMap(ctx, comps, framework.DiscardRecorderFactory, snap)
+	profileMap, err := upstreamsync.NewFrameworkMap(ctx, comps, framework.DiscardRecorderFactory, snap, preemption.NoopPreemptionManagerFactory)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -175,7 +176,7 @@ func SetupSnapshotTestWithPodGroups(
 		return nil, nil, err
 	}
 
-	profileMap, err := upstreamsync.NewFrameworkMap(ctx, comps, framework.DiscardRecorderFactory, snap)
+	profileMap, err := upstreamsync.NewFrameworkMap(ctx, comps, framework.DiscardRecorderFactory, snap, preemption.NoopPreemptionManagerFactory)
 	if err != nil {
 		return nil, nil, err
 	}

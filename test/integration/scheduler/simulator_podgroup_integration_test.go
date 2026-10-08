@@ -192,15 +192,15 @@ func TestSimulatorIntegration_PodGroupScheduling(t *testing.T) {
 				t.Fatalf("SyncSnapshot failed: %v", err)
 			}
 
-			res, err := snap.ScheduleWorkload(ctx, tt.pods, snapshot.NewScheduleWorkloadOptions(false))
-			if err != nil {
+			res := snap.ScheduleWorkload(ctx, tt.pods, snapshot.NewScheduleWorkloadOptions(false))
+			if !res.Status.IsSuccess() {
 				t.Fatalf("ScheduleWorkload failed: %v", err)
 			}
-			if len(res) != tt.wantResultsCount {
-				t.Fatalf("ScheduleWorkload returned %d results, want %d", len(res), tt.wantResultsCount)
+			if len(res.PodResults) != tt.wantResultsCount {
+				t.Fatalf("ScheduleWorkload returned %d results, want %d", len(res.PodResults), tt.wantResultsCount)
 			}
 
-			for _, r := range res {
+			for _, r := range res.PodResults {
 				if r.Status.IsSuccess() != tt.wantSuccess {
 					t.Errorf("pod %s Status.IsSuccess() = %v, want %v (status: %v)", r.Pod.Name, r.Status.IsSuccess(), tt.wantSuccess, r.Status)
 				}
