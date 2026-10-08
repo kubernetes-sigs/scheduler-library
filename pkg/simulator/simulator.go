@@ -21,7 +21,6 @@ import (
 	"sigs.k8s.io/scheduler-library/pkg/framework"
 	"sigs.k8s.io/scheduler-library/pkg/state"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
-	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/preemption"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
 
 	v1 "k8s.io/api/core/v1"
@@ -66,7 +65,7 @@ type Simulator interface {
 	// ScheduleWorkload schedules the given pods belonging to the same hierarchy using the workload-aware scheduling algorithm.
 	// If the pods do not belong to the same hierarchy, it returns an error.
 	// The order of the returned SchedulingResult slice is non-deterministic with respect to the input pods order.
-	ScheduleWorkload(ctx context.Context, pods []*v1.Pod, opts snapshot.ScheduleWorkloadOptions) ([]snapshot.SchedulingResult, error)
+	ScheduleWorkload(ctx context.Context, pods []*v1.Pod, opts snapshot.ScheduleWorkloadOptions) (snapshot.WorkloadSchedulingResult, error)
 
 	// PreemptPods removes the given running pods from the snapshot and returns the handle that puts
 	// them back. The handle is single-use and is invalidated by any later permanent mutation of the
@@ -194,7 +193,7 @@ func (s *SchedulingSimulator) NewClusterSnapshot(
 }
 
 func (s *SchedulingSimulator) buildProfileMap(ctx context.Context, snap *cache.Snapshot, opts ...Option) (*upstreamsync.ProfileMap, error) {
-	profiles, err := upstreamsync.NewFrameworkMap(ctx, s.comps, framework.DiscardRecorderFactory, snap, preemption.NoopPreemptionManagerFactory, opts...)
+	profiles, err := upstreamsync.NewFrameworkMap(ctx, s.comps, framework.DiscardRecorderFactory, snap, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("schedlib: building scheduler: %w", err)
 	}

@@ -15,6 +15,8 @@
 package snapshot
 
 import (
+	"iter"
+
 	v1 "k8s.io/api/core/v1"
 	fwk "k8s.io/kube-scheduler/framework"
 )
@@ -103,9 +105,34 @@ type Unpreemption struct {
 	validPreemptionVersion uint64
 }
 
+// PreemptionVictim represents an atomic unit of preemption (a single pod or a gang of pods).
+type PreemptionVictim interface {
+	Pods() []*v1.Pod
+}
+
+// PreemptionFilter provides an optional fast pre-filter for workload preemption.
+type PreemptionFilter interface {
+	UnpreemptVictim(PreemptionVictim)
+	PreemptVictim(PreemptionVictim)
+	MayFit() bool
+}
+
+// WorkloadPreemptionOptions configures workload preemption during ScheduleWorkload.
+type WorkloadPreemptionOptions struct {
+	// PotentialVictims yields candidate victims ordered from least to most valuable.
+	// If nil, ScheduleWorkload does not attempt preemption of new victims.
+	PotentialVictims iter.Seq[PreemptionVictim]
+	// CommittedVictims are victims already selected for preemption in earlier steps.
+	// ScheduleWorkload removes them before initial scheduling and never reprieves them.
+	CommittedVictims []PreemptionVictim
+	// PreemptionFilter is an optional fast pre-filter evaluated before full scheduling attempts.
+	PreemptionFilter PreemptionFilter
+}
+
 // ScheduleWorkloadOptions contains options for scheduling a workload.
 type ScheduleWorkloadOptions struct {
 	CommonSchedulingOptions
+	WorkloadPreemptionOptions
 }
 
 // NewScheduleWorkloadOptions builds the ScheduleWorkloadOptions used by ScheduleWorkload.
@@ -113,4 +140,14 @@ func NewScheduleWorkloadOptions(dryRun bool) ScheduleWorkloadOptions {
 	return ScheduleWorkloadOptions{
 		CommonSchedulingOptions: CommonSchedulingOptions{DryRun: dryRun},
 	}
+}
+
+// WorkloadSchedulingResult contains the outcome of a ScheduleWorkload call.
+type WorkloadSchedulingResult struct {
+	// Status is the overall outcome of scheduling the workload.
+	Status *fwk.Status
+	// PodResults contains the per-pod scheduling results.
+	PodResults []SchedulingResult
+	// PreemptionVictims contains the victims selected from PotentialVictims during preemption.
+	PreemptionVictims []PreemptionVictim
 }

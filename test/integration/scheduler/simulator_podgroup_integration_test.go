@@ -15,6 +15,7 @@
 package scheduler
 
 import (
+	"slices"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
@@ -196,16 +197,111 @@ func TestSimulatorIntegration_PodGroupScheduling(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ScheduleWorkload failed: %v", err)
 			}
-			if len(res) != tt.wantResultsCount {
-				t.Fatalf("ScheduleWorkload returned %d results, want %d", len(res), tt.wantResultsCount)
+			if res.Status.IsSuccess() != tt.wantSuccess {
+				t.Errorf("workload Status.IsSuccess() = %v, want %v (status: %v)", res.Status.IsSuccess(), tt.wantSuccess, res.Status)
+			}
+			if len(res.PodResults) != tt.wantResultsCount {
+				t.Fatalf("ScheduleWorkload returned %d results, want %d", len(res.PodResults), tt.wantResultsCount)
 			}
 
-			for _, r := range res {
+			for _, r := range res.PodResults {
 				if r.Status.IsSuccess() != tt.wantSuccess {
 					t.Errorf("pod %s Status.IsSuccess() = %v, want %v (status: %v)", r.Pod.Name, r.Status.IsSuccess(), tt.wantSuccess, r.Status)
 				}
 			}
 		})
+	}
+}
+
+type integrationVictim struct {
+	pods []*v1.Pod
+}
+
+func (v *integrationVictim) Pods() []*v1.Pod {
+	return v.pods
+}
+
+func TestSimulatorIntegration_WorkloadPreemption(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.GenericWorkload:                 true,
+		features.TopologyAwareWorkloadScheduling: true,
+		features.CompositePodGroup:               true,
+	})
+
+	testCtx := testutils.InitTestAPIServer(t, "sim-pg-preempt", nil)
+	if testCtx == nil {
+		t.Fatal("Expected testCtx to be non-nil")
+	}
+	ctx := testCtx.Ctx
+	logger := klog.FromContext(ctx)
+	client := testCtx.ClientSet
+	ns := testCtx.NS.Name
+
+	cfg := newKubeSchedulerConfig(withTopologyPlacementGenerator)
+	readonlyClient, err := simulator.NewReadonlyClient(testCtx.KubeConfig)
+	if err != nil {
+		t.Fatalf("NewReadonlyClient failed: %v", err)
+	}
+
+	informerFactory := informers.NewSharedInformerFactory(client, 0)
+	sim, err := simulator.NewSchedulingSimulator(ctx, cfg, readonlyClient, informerFactory)
+	if err != nil {
+		t.Fatalf("NewSchedulingSimulator failed: %v", err)
+	}
+
+	cs, err := sim.NewClusterState(ctx)
+	if err != nil {
+		t.Fatalf("NewClusterState failed: %v", err)
+	}
+
+	node1 := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "4",
+		v1.ResourceMemory: "4Gi",
+		v1.ResourcePods:   "10",
+	}).Obj()
+	cs.Cache.AddNode(logger, node1)
+
+	v1Pod := st.MakePod().Name("victim-1").Namespace(ns).UID("uid-v1").Node("node1").Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).Obj()
+	v2Pod := st.MakePod().Name("victim-2").Namespace(ns).UID("uid-v2").Node("node1").Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).Obj()
+	v3Pod := st.MakePod().Name("victim-3").Namespace(ns).UID("uid-v3").Node("node1").Req(map[v1.ResourceName]string{v1.ResourceCPU: "2"}).Obj()
+	for _, p := range []*v1.Pod{v1Pod, v2Pod, v3Pod} {
+		if err := cs.Cache.AddPod(logger, p); err != nil {
+			t.Fatalf("Cache.AddPod(%s) failed: %v", p.Name, err)
+		}
+	}
+
+	gangPG := makePodGroup(ns, "preemptor-gang", "", 2, "")
+	cs.Cache.AddPodGroup(gangPG)
+
+	snap := cs.GetAssociatedSnapshot()
+	if err := cs.SyncSnapshot(logger); err != nil {
+		t.Fatalf("SyncSnapshot failed: %v", err)
+	}
+
+	vic1 := &integrationVictim{pods: []*v1.Pod{v1Pod}}
+	vic2 := &integrationVictim{pods: []*v1.Pod{v2Pod}}
+	vic3 := &integrationVictim{pods: []*v1.Pod{v3Pod}}
+
+	preemptorPod1 := makePod(ns, "preemptor-1", "preemptor-gang", "1")
+	preemptorPod2 := makePod(ns, "preemptor-2", "preemptor-gang", "2")
+
+	res, err := snap.ScheduleWorkload(ctx, []*v1.Pod{preemptorPod1, preemptorPod2}, snapshot.ScheduleWorkloadOptions{
+		WorkloadPreemptionOptions: snapshot.WorkloadPreemptionOptions{
+			PotentialVictims: slices.Values([]snapshot.PreemptionVictim{vic1, vic2, vic3}),
+		},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleWorkload failed: %v", err)
+	}
+	if !res.Status.IsSuccess() {
+		t.Fatalf("Expected ScheduleWorkload status Success, got: %v", res.Status)
+	}
+	if len(res.PodResults) != 2 {
+		t.Fatalf("Expected 2 PodResults, got %d", len(res.PodResults))
+	}
+	// DefaultPreemption reprieves vic2 (1 CPU) and preempts vic1 (1 CPU) and vic3 (2 CPU).
+	if len(res.PreemptionVictims) != 2 || res.PreemptionVictims[0] != vic1 || res.PreemptionVictims[1] != vic3 {
+		t.Fatalf("Expected PreemptionVictims=[vic1, vic3], got %v", res.PreemptionVictims)
 	}
 }
 

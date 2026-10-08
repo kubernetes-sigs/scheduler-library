@@ -51,7 +51,6 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
 	"k8s.io/kubernetes/pkg/scheduler/profile"
 	"k8s.io/kubernetes/pkg/scheduler/util/assumecache"
-	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/preemption"
 )
 
 /*
@@ -289,19 +288,8 @@ func buildExtenders(logger klog.Logger, extenders []schedulerapi.Extender, profi
 // (func (m Map) FrameworkForPod(pod *v1.Pod) (framework.Framework, error)).
 // Because k8s.io/kubernetes v1.37.0 does not yet include that method on profile.Map,
 // ProfileMap embeds profile.Map to attach FrameworkForPod and FrameworkForPodGroup.
-// Also k8s.io/kubernetes v1.37.0 does not yet include PreemptionManager in Framework,
-// so we embed PreemptionManager in ProfileMap for use in preemption plugins.
 type ProfileMap struct {
 	profile.Map
-	preemptionManagers map[string]preemption.PreemptionManager
-}
-
-func getProfileName(pod *v1.Pod) string {
-	name := pod.Spec.SchedulerName
-	if name == "" {
-		name = v1.DefaultSchedulerName
-	}
-	return name
 }
 
 // FrameworkForPod returns the framework registered for the pod's scheduler
@@ -309,7 +297,10 @@ func getProfileName(pod *v1.Pod) string {
 // cannot happen for pods observed via the API (the field is defaulted there),
 // but can for synthetic pods used in scheduling simulations.
 func (p *ProfileMap) FrameworkForPod(pod *v1.Pod) (framework.Framework, error) {
-	name := getProfileName(pod)
+	name := pod.Spec.SchedulerName
+	if name == "" {
+		name = v1.DefaultSchedulerName
+	}
 	f, ok := p.Map[name]
 	if !ok {
 		return nil, fmt.Errorf("profile not found for scheduler name %q", name)
@@ -322,22 +313,12 @@ func (p *ProfileMap) FrameworkForPod(pod *v1.Pod) (framework.Framework, error) {
 //
 // UPSTREAM-DIFF: adapted from Scheduler.frameworkForPodGroup in schedule_one_podgroup.go.
 // It checks its podgroup members and delegates to FrameworkForPod which looks up the podgroup member profile.
-// Also we are returning preemption.PreemptionFramework - a wrapper with the preemption manager.
-func (p *ProfileMap) FrameworkForPodGroup(podGroupInfo *framework.PodGroupInfo) (*preemption.PreemptionFramework, error) {
+func (p *ProfileMap) FrameworkForPodGroup(podGroupInfo *framework.PodGroupInfo) (framework.Framework, error) {
 	pods := podGroupInfo.GetUnscheduledPods()
 	if len(pods) == 0 {
 		return nil, fmt.Errorf("no pods in pod group")
 	}
-	name := getProfileName(pods[0])
-	f, ok := p.Map[name]
-	if !ok {
-		return nil, fmt.Errorf("profile not found for scheduler name %q", name)
-	}
-	pm, ok := p.preemptionManagers[name]
-	if !ok {
-		return nil, fmt.Errorf("preemption manager not found for scheduler name %q", name)
-	}
-	return preemption.NewPreemptionFramework(f, pm), nil
+	return p.FrameworkForPod(pods[0])
 }
 
 // NewFrameworkMap builds the map of scheduling framework profiles from the
@@ -349,14 +330,11 @@ func (p *ProfileMap) FrameworkForPodGroup(podGroupInfo *framework.PodGroupInfo) 
 // UPSTREAM-DIFF: returns *ProfileMap embedding profile.Map and omits unused upstream options
 // (componentConfigVersion, kubeConfig, captureProfile, maxBatchAge). mapOpts configure this map
 // only, see FrameworkMapOption.
-// Takes PreemptionManagerFactory to create the preemption manager for each profile.
-// In upstream it is handled by frameworkruntime options.
 func NewFrameworkMap(
 	ctx context.Context,
 	c *FrameworkComponents,
 	recorderFactory profile.RecorderFactory,
 	snapshot *internalcache.Snapshot,
-	preemptionManagerFactory preemption.PreemptionManagerFactory,
 	mapOpts ...FrameworkMapOption,
 ) (*ProfileMap, error) {
 	var mapOptions frameworkMapOptions
@@ -415,12 +393,8 @@ func NewFrameworkMap(
 	if len(profiles) == 0 {
 		return nil, errors.New("at least one profile is required")
 	}
-	preemptions := make(map[string]preemption.PreemptionManager)
-	for name := range profiles {
-		preemptions[name] = preemptionManagerFactory()
-	}
 
-	return &ProfileMap{Map: profiles, preemptionManagers: preemptions}, nil
+	return &ProfileMap{Map: profiles}, nil
 }
 
 // UPSTREAM-DIFF: sharedResolverDRAManager wraps DefaultDRAManager so that DeviceClassResolver
