@@ -17,7 +17,6 @@ package snapshot
 import (
 	"context"
 	"fmt"
-	"iter"
 
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
@@ -67,104 +66,75 @@ func (v *simPreemptionVictim) NumPDBViolations() int {
 	return 0
 }
 
-// workloadPreemptor implements preemption.PreemptionManager and preemption.ReprieveFilter
-// for a single ScheduleWorkload invocation.
-type workloadPreemptor struct {
+// prefixPreemptionManager provides candidate victims and creates a ReprieveFilter.
+type prefixPreemptionManager struct {
 	preemption.NoopPreemptionManager
-	nextVictim       func() (PreemptionVictim, bool)
-	stopIter         func()
-	iterExhausted    bool
 	victims          []*simPreemptionVictim
 	preemptionFilter PreemptionFilter
 }
 
-var _ preemption.PreemptionManager = (*workloadPreemptor)(nil)
-var _ preemption.ReprieveFilter = (*workloadPreemptor)(nil)
+var _ preemption.PreemptionManager = (*prefixPreemptionManager)(nil)
 
-func newWorkloadPreemptor(opts WorkloadPreemptionOptions) *workloadPreemptor {
-	var next func() (PreemptionVictim, bool)
-	var stop func()
-	if opts.PotentialVictims != nil {
-		next, stop = iter.Pull(opts.PotentialVictims)
-	}
-	return &workloadPreemptor{
-		nextVictim:       next,
-		stopIter:         stop,
-		iterExhausted:    opts.PotentialVictims == nil,
-		preemptionFilter: opts.PreemptionFilter,
+func newPrefixPreemptionManager(victims []*simPreemptionVictim, filter PreemptionFilter) *prefixPreemptionManager {
+	return &prefixPreemptionManager{
+		victims:          victims,
+		preemptionFilter: filter,
 	}
 }
 
-func (wp *workloadPreemptor) close() {
-	if wp.stopIter != nil {
-		wp.stopIter()
-		wp.stopIter = nil
-	}
-}
-
-// prepareNextTry pulls victims from PotentialVictims until PreemptionFilter.MayFit returns true.
-// It returns true if a new prefix is ready for evaluation, or false if the iterator is exhausted.
-func (wp *workloadPreemptor) prepareNextTry() (bool, error) {
-	if wp.iterExhausted || wp.nextVictim == nil {
-		return false, nil
-	}
-	for {
-		v, ok := wp.nextVictim()
-		if !ok {
-			wp.iterExhausted = true
-			return false, nil
-		}
-		sv, err := newSimPreemptionVictim(v)
-		if err != nil {
-			return false, err
-		}
-		wp.victims = append(wp.victims, sv)
-		if wp.preemptionFilter != nil {
-			wp.preemptionFilter.PreemptVictim(v)
-			if !wp.preemptionFilter.MayFit() {
-				continue
-			}
-		}
-		return true, nil
-	}
-}
-
-func (wp *workloadPreemptor) GenerateVictims(
+func (pm *prefixPreemptionManager) GenerateVictims(
 	_ context.Context,
 	_ fwk.PodGroupInfo,
 ) ([]preemption.PreemptionVictim, *fwk.Status) {
-	res := make([]preemption.PreemptionVictim, len(wp.victims))
-	for i, sv := range wp.victims {
+	res := make([]preemption.PreemptionVictim, len(pm.victims))
+	for i, sv := range pm.victims {
 		res[i] = sv
 	}
 	return res, fwk.NewStatus(fwk.Success)
 }
 
-func (wp *workloadPreemptor) NewReprieveFilter(
+func (pm *prefixPreemptionManager) NewReprieveFilter(
 	_ context.Context,
 	_ []preemption.PreemptionVictim,
 ) preemption.ReprieveFilter {
-	return wp
+	return &workloadReprieveFilter{filter: pm.preemptionFilter}
 }
 
-func (wp *workloadPreemptor) ShouldAttemptReprieval(
+func (pm *prefixPreemptionManager) preemptedVictims() []PreemptionVictim {
+	var res []PreemptionVictim
+	for _, sv := range pm.victims {
+		if !sv.reprieved {
+			res = append(res, sv.victim)
+		}
+	}
+	return res
+}
+
+// workloadReprieveFilter evaluates and tracks victim reprieval using PreemptionFilter.
+type workloadReprieveFilter struct {
+	filter PreemptionFilter
+}
+
+var _ preemption.ReprieveFilter = (*workloadReprieveFilter)(nil)
+
+func (rf *workloadReprieveFilter) ShouldAttemptReprieval(
 	_ context.Context,
 	victim preemption.PreemptionVictim,
 ) (bool, error) {
-	if wp.preemptionFilter == nil {
+	if rf.filter == nil {
 		return true, nil
 	}
 	sv, ok := victim.(*simPreemptionVictim)
 	if !ok {
 		return false, fmt.Errorf("unexpected PreemptionVictim type %T", victim)
 	}
-	wp.preemptionFilter.UnpreemptVictim(sv.victim)
-	mayFit := wp.preemptionFilter.MayFit()
-	wp.preemptionFilter.PreemptVictim(sv.victim)
+	rf.filter.UnpreemptVictim(sv.victim)
+	mayFit := rf.filter.MayFit()
+	rf.filter.PreemptVictim(sv.victim)
 	return mayFit, nil
 }
 
-func (wp *workloadPreemptor) OnVictimReprieved(
+func (rf *workloadReprieveFilter) OnVictimReprieved(
 	_ context.Context,
 	victim preemption.PreemptionVictim,
 ) error {
@@ -173,20 +143,10 @@ func (wp *workloadPreemptor) OnVictimReprieved(
 		return fmt.Errorf("unexpected PreemptionVictim type %T", victim)
 	}
 	sv.reprieved = true
-	if wp.preemptionFilter != nil {
-		wp.preemptionFilter.UnpreemptVictim(sv.victim)
+	if rf.filter != nil {
+		rf.filter.UnpreemptVictim(sv.victim)
 	}
 	return nil
-}
-
-func (wp *workloadPreemptor) preemptedVictims() []PreemptionVictim {
-	var res []PreemptionVictim
-	for _, sv := range wp.victims {
-		if !sv.reprieved {
-			res = append(res, sv.victim)
-		}
-	}
-	return res
 }
 
 // collectProposedAssignments extracts fwk.ProposedAssignment pointers in deterministic

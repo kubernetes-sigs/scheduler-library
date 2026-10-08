@@ -485,17 +485,6 @@ func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, 
 	}
 
 	// Stage 1b & Stage 2: Incremental prefix search and reverse-order reprieval via DefaultPreemption.
-	wp := newWorkloadPreemptor(opts.WorkloadPreemptionOptions)
-	defer wp.close()
-
-	// In k/k 1.38, preemption.NewPodGroupEvaluator(fh) reads fh.PreemptionManager() from fwk.Handle:
-	// type handleWithPreemption struct {
-	//     framework.Framework
-	//     pm fwk.PreemptionManager
-	// }
-	// func (h *handleWithPreemption) PreemptionManager() fwk.PreemptionManager { return h.pm }
-	defaultPreemption := preemption.NewDefaultPreemption(schedFramework, wp)
-
 	pgSchedulingFunc := func(ctx context.Context) (*fwk.PodGroupAssignments, *fwk.Status) {
 		trialSched := upstreamsync.NewScheduler(s.schedulerSnapshot, 0, 0, 1, nil)
 		trialState := framework.NewCycleState()
@@ -513,19 +502,30 @@ func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, 
 		}, trialRootRes.Status
 	}
 
+	var candidateVictims []*simPreemptionVictim
+	var activePM *prefixPreemptionManager
 	preemptionSucceeded := false
-	for {
-		hasNext, prepErr := wp.prepareNextTry()
-		if prepErr != nil {
-			return WorkloadSchedulingResult{}, prepErr
+
+	for v := range opts.PotentialVictims {
+		sv, err := newSimPreemptionVictim(v)
+		if err != nil {
+			return WorkloadSchedulingResult{}, err
 		}
-		if !hasNext {
-			break
+		candidateVictims = append(candidateVictims, sv)
+
+		if opts.PreemptionFilter != nil {
+			opts.PreemptionFilter.PreemptVictim(v)
+			if !opts.PreemptionFilter.MayFit() {
+				continue
+			}
 		}
 
+		pm := newPrefixPreemptionManager(candidateVictims, opts.PreemptionFilter)
+		defaultPreemption := preemption.NewDefaultPreemption(schedFramework, pm)
 		_, status := defaultPreemption.PodGroupPostFilter(ctx, framework.NewCycleState(), podGroupInfo, pgSchedulingFunc)
 		if status.IsSuccess() {
 			preemptionSucceeded = true
+			activePM = pm
 			break
 		}
 		if status.Code() != fwk.Unschedulable {
@@ -544,7 +544,7 @@ func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, 
 	}
 
 	// Stage 6: Final commit / DryRun evaluation against the base snapshot with selected victims removed.
-	preemptedVictims := wp.preemptedVictims()
+	preemptedVictims := activePM.preemptedVictims()
 	for _, v := range preemptedVictims {
 		if _, err := s.PreemptPods(ctx, v.Pods()); err != nil {
 			return WorkloadSchedulingResult{}, fmt.Errorf("failed to preempt selected victim pods: %w", err)
