@@ -17,14 +17,65 @@ package preemption
 import (
 	"context"
 
+	v1 "k8s.io/api/core/v1"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
-// PreemptionManagerFactory is a factory for creating PreemptionManager instances.
-type PreemptionManagerFactory func() PreemptionManager
+type preemptionManagerKey struct{}
 
-// PreemptionFramework is a wrapper around the kube-scheduler framework that adds preemption logic.
+// WithPreemptionManager returns a copy of ctx that carries pm.
+func WithPreemptionManager(ctx context.Context, pm PreemptionManager) context.Context {
+	return context.WithValue(ctx, preemptionManagerKey{}, pm)
+}
+
+// ManagerFromContext extracts the PreemptionManager from ctx.
+// If ctx does not carry a PreemptionManager, ManagerFromContext returns a NoopPreemptionManager.
+func ManagerFromContext(ctx context.Context) PreemptionManager {
+	if ctx != nil {
+		if pm, ok := ctx.Value(preemptionManagerKey{}).(PreemptionManager); ok && pm != nil {
+			return pm
+		}
+	}
+	return &NoopPreemptionManager{}
+}
+
+// contextPreemptionManager is a stateless PreemptionManager and PreemptionExecutor
+// that delegates context-carrying operations to the PreemptionManager in context.Context.
+type contextPreemptionManager struct {
+	NoopPreemptionManager
+}
+
+var _ PreemptionManager = &contextPreemptionManager{}
+var _ PreemptionExecutor = &contextPreemptionManager{}
+
+// NewContextPreemptionManager returns a stateless PreemptionManager that resolves
+// the active PreemptionManager from context.Context on each operation.
+func NewContextPreemptionManager() PreemptionManager {
+	return &contextPreemptionManager{}
+}
+
+func (c *contextPreemptionManager) GenerateVictims(ctx context.Context, pgInfo fwk.PodGroupInfo) ([]PreemptionVictim, *fwk.Status) {
+	return ManagerFromContext(ctx).GenerateVictims(ctx, pgInfo)
+}
+
+func (c *contextPreemptionManager) Executor() PreemptionExecutor {
+	return c
+}
+
+func (c *contextPreemptionManager) NewReprieveFilter(ctx context.Context, allVictims []PreemptionVictim) ReprieveFilter {
+	return ManagerFromContext(ctx).NewReprieveFilter(ctx, allVictims)
+}
+
+func (c *contextPreemptionManager) ActuatePodPreemption(ctx context.Context, candidate PreemptionCandidate, pod *v1.Pod, pluginName string) *fwk.Status {
+	return ManagerFromContext(ctx).Executor().ActuatePodPreemption(ctx, candidate, pod, pluginName)
+}
+
+func (c *contextPreemptionManager) ActuatePodGroupPreemption(ctx context.Context, candidate PreemptionCandidate, pgInfo fwk.PodGroupInfo, pluginName string) *fwk.Status {
+	return ManagerFromContext(ctx).Executor().ActuatePodGroupPreemption(ctx, candidate, pgInfo, pluginName)
+}
+
+// PreemptionFramework wraps framework.Framework to run PodGroup preemption.
 type PreemptionFramework struct {
 	framework.Framework
 	PreemptionManager PreemptionManager
@@ -32,21 +83,23 @@ type PreemptionFramework struct {
 
 // NewPreemptionFramework creates a new PreemptionFramework.
 func NewPreemptionFramework(fw framework.Framework, preemptionManager PreemptionManager) *PreemptionFramework {
+	if preemptionManager == nil {
+		preemptionManager = NewContextPreemptionManager()
+	}
 	return &PreemptionFramework{
 		Framework:         fw,
 		PreemptionManager: preemptionManager,
 	}
 }
 
-// RunPodGroupPostFilterPlugins is implementation of framework.Framework.RunPodGroupPostFilterPlugins.
-// UPSTREAM-DIFF: It runs only one plugin - defaultPreemption.
+// RunPodGroupPostFilterPlugins runs DefaultPreemption for the pod group.
+// UPSTREAM-DIFF: Runs only DefaultPreemption.
 func (f *PreemptionFramework) RunPodGroupPostFilterPlugins(ctx context.Context, state *framework.CycleState, podGroupInfo fwk.PodGroupInfo, podGroupSchedulingFunc fwk.PodGroupSchedulingFunc) (postFilterResult *fwk.PodGroupPostFilterResult, status *fwk.Status) {
-	defaultPreemption := NewDefaultPreemption(f.Framework, f.PreemptionManager)
+	pm := f.PreemptionManager
+	if pm == nil {
+		pm = NewContextPreemptionManager()
+	}
+	defaultPreemption := NewDefaultPreemption(f.Framework, pm)
 	postFilterResult, status = defaultPreemption.PodGroupPostFilter(ctx, state, podGroupInfo, podGroupSchedulingFunc)
 	return postFilterResult, status
-}
-
-// NoopPreemptionManagerFactory is a PreemptionManagerFactory that return dummy PreemptionManager.
-func NoopPreemptionManagerFactory() PreemptionManager {
-	return &NoopPreemptionManager{}
 }
