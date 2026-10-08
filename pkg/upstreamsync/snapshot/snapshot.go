@@ -495,21 +495,39 @@ func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, 
 	}
 
 	// Stage 1b and Stage 2: Pull PotentialVictims and run PodGroup preemption with reprieval.
-	wp := newWorkloadPreemptor(opts.WorkloadPreemptionOptions)
-	defer wp.close()
-
-	preemptCtx := preemption.WithPreemptionManager(ctx, wp)
 	pgSchedulingFunc := buildPodGroupSchedulingFunc(sched, schedFramework, podGroupInfo)
 
+	var candidateVictims []*simPreemptionVictim
+	var activePM *prefixPreemptionManager
 	preemptionSucceeded := false
-	for wp.prepareNextTry() {
+
+	for v := range opts.PotentialVictims {
+		if v == nil || len(v.Pods()) == 0 {
+			continue
+		}
+		sv, err := newSimPreemptionVictim(v)
+		if err != nil {
+			return WorkloadSchedulingResult{Status: fwk.AsStatus(err)}, err
+		}
+		candidateVictims = append(candidateVictims, sv)
+
+		if opts.PreemptionFilter != nil {
+			opts.PreemptionFilter.PreemptVictim(v)
+			if !opts.PreemptionFilter.MayFit() {
+				continue
+			}
+		}
+
+		pm := newPrefixPreemptionManager(candidateVictims, opts.PreemptionFilter)
+		preemptCtx := preemption.WithPreemptionManager(ctx, pm)
 		_, postFilterStatus := schedFramework.RunPodGroupPostFilterPlugins(preemptCtx, podGroupCycleState, podGroupInfo, pgSchedulingFunc)
 		if postFilterStatus.IsError() {
 			err = postFilterStatus.AsError()
 			return WorkloadSchedulingResult{Status: postFilterStatus}, err
 		}
-		if postFilterStatus.IsSuccess() && wp.actuated {
+		if postFilterStatus.IsSuccess() && pm.actuated {
 			preemptionSucceeded = true
+			activePM = pm
 			break
 		}
 	}
@@ -519,7 +537,7 @@ func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, 
 	}
 
 	// Final Commit: Remove non-reprieved victims and run the scheduling algorithm to commit placements.
-	preemptedVictims := wp.preemptedVictims()
+	preemptedVictims := activePM.preemptedVictims()
 	for _, v := range preemptedVictims {
 		if len(v.Pods()) > 0 {
 			if _, err := s.PreemptPods(ctx, v.Pods()); err != nil {
