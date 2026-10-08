@@ -764,7 +764,7 @@ func TestWithSharedDRAManager(t *testing.T) {
 				t.Fatalf("NewSchedulingSimulator failed: %v", err)
 			}
 
-			profiles, err := sim.buildProfileMap(ctx, cache.NewEmptySnapshot(), tc.opts...)
+			profiles, err := sim.buildProfileMap(ctx, cache.NewEmptySnapshot(), snapshot.NewPreemptionManager().Factory(), tc.opts...)
 			if err != nil {
 				t.Fatalf("buildProfileMap failed: %v", err)
 			}

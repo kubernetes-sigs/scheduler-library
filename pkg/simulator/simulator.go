@@ -165,12 +165,13 @@ func WithSharedDRAManager(m fwk.SharedDRAManager) Option {
 func (s *SchedulingSimulator) NewClusterState(ctx context.Context, opts ...Option) (*state.ClusterState, error) {
 	snap := cache.NewEmptySnapshot()
 	internalCache := cache.New(ctx, nil, utilfeature.DefaultFeatureGate.Enabled(features.GenericWorkload), utilfeature.DefaultFeatureGate.Enabled(features.CompositePodGroup))
-	profiles, err := s.buildProfileMap(ctx, snap, opts...)
+	pm := snapshot.NewPreemptionManager()
+	profiles, err := s.buildProfileMap(ctx, snap, pm.Factory(), opts...)
 	if err != nil {
 		return nil, err
 	}
 
-	return state.New(internalCache, profiles, snap), nil
+	return state.New(internalCache, profiles, snap, snapshot.WithPreemptionManager(pm)), nil
 }
 
 // NewClusterSnapshot initializes a new snapshot with the provided pods, nodes, pod groups, and composite pod groups.
@@ -185,16 +186,17 @@ func (s *SchedulingSimulator) NewClusterSnapshot(
 	opts ...Option,
 ) (Simulator, error) {
 	snap := cache.NewTestSnapshotWithCompositePodGroups(pods, nodes, podGroups, compositePodGroups)
-	profiles, err := s.buildProfileMap(ctx, snap, opts...)
+	pm := snapshot.NewPreemptionManager()
+	profiles, err := s.buildProfileMap(ctx, snap, pm.Factory(), opts...)
 	if err != nil {
 		return nil, err
 	}
 
-	return snapshot.New(snap, profiles), nil
+	return snapshot.New(snap, profiles, snapshot.WithPreemptionManager(pm)), nil
 }
 
-func (s *SchedulingSimulator) buildProfileMap(ctx context.Context, snap *cache.Snapshot, opts ...Option) (*upstreamsync.ProfileMap, error) {
-	profiles, err := upstreamsync.NewFrameworkMap(ctx, s.comps, framework.DiscardRecorderFactory, snap, preemption.NoopPreemptionManagerFactory, opts...)
+func (s *SchedulingSimulator) buildProfileMap(ctx context.Context, snap *cache.Snapshot, pmFactory preemption.PreemptionManagerFactory, opts ...Option) (*upstreamsync.ProfileMap, error) {
+	profiles, err := upstreamsync.NewFrameworkMap(ctx, s.comps, framework.DiscardRecorderFactory, snap, pmFactory, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("schedlib: building scheduler: %w", err)
 	}

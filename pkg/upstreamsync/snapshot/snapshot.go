@@ -54,6 +54,18 @@ type ClusterSnapshot struct {
 	// handles unusable, i.e. whenever the state they would be restoring into is no longer the one
 	// they were taken from. Unpreempt compares it with the value recorded in the handle.
 	stateVersionForPreemption uint64
+	// preemptionManager bridges ProfileMap's PreemptionManager to per-call workloadPreemptor instances.
+	preemptionManager *PreemptionManager
+}
+
+// Option configures a ClusterSnapshot.
+type Option func(*ClusterSnapshot)
+
+// WithPreemptionManager configures the PreemptionManager bound to the snapshot's ProfileMap.
+func WithPreemptionManager(pm *PreemptionManager) Option {
+	return func(s *ClusterSnapshot) {
+		s.preemptionManager = pm
+	}
 }
 
 // undoLog is a stack of the operations reverting the mutations applied to the snapshot, most
@@ -101,11 +113,16 @@ func (ul *undoLog) undo() {
 // NewClusterSnapshot or via NewClusterState followed by state.ClusterState.Snapshot: those build
 // the full plugin chain out of the KubeSchedulerConfiguration and initialize the scheduler metrics,
 // which this constructor expects to have been done already.
-func New(s *cache.Snapshot, profiles *upstreamsync.ProfileMap) *ClusterSnapshot {
-	return &ClusterSnapshot{
+func New(s *cache.Snapshot, profiles *upstreamsync.ProfileMap, opts ...Option) *ClusterSnapshot {
+	cs := &ClusterSnapshot{
 		profiles:          profiles,
 		schedulerSnapshot: s,
+		preemptionManager: NewPreemptionManager(),
 	}
+	for _, opt := range opts {
+		opt(cs)
+	}
+	return cs
 }
 
 // ResetMutations restores the snapshot to its state prior to any mutations,
@@ -476,7 +493,15 @@ func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, 
 		}
 	}
 
-	return WorkloadSchedulingResult{
+	unschedulableResult := WorkloadSchedulingResult{
 		PodResults: results,
 	}
+	if !isRootSuccess && (len(opts.CommittedVictims) > 0 || opts.PotentialVictims != nil) {
+		return s.findPreemptionVictims(ctx, sched, schedFramework, podGroupInfo, opts.WorkloadPreemptionOptions, WorkloadSchedulingResult{
+			Status:     rootResult.Status,
+			PodResults: results,
+		})
+	}
+
+	return unschedulableResult
 }

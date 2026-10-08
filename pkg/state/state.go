@@ -41,10 +41,10 @@ type ClusterState struct {
 
 // New creates a new ClusterState with an internal Kubernetes scheduler cache, frameworks,
 // and the snapshot instance shared with all frameworks via WithSnapshotSharedLister.
-func New(c cache.Cache, profiles *upstreamsync.ProfileMap, snap *cache.Snapshot) *ClusterState {
+func New(c cache.Cache, profiles *upstreamsync.ProfileMap, snap *cache.Snapshot, opts ...snapshot.Option) *ClusterState {
 	return &ClusterState{
 		Cache:                 c,
-		snapshot:              snapshot.New(snap, profiles),
+		snapshot:              snapshot.New(snap, profiles, opts...),
 		snapshotData:          snap,
 		assumedPodCycleStates: sync.Map{},
 		profiles:              profiles,
