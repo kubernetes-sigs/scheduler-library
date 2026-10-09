@@ -111,7 +111,9 @@ func TestAddPodToNode(t *testing.T) {
 			}
 
 			// Run revert function
-			revertFn()
+			if err := revertFn(); err != nil {
+				t.Fatalf("revert failed: %v", err)
+			}
 
 			nodeInfo, err = snapshot.Get(tc.targetNode)
 			if err != nil {
@@ -210,7 +212,9 @@ func TestRemovePodFromNode(t *testing.T) {
 			}
 
 			// Run revert function
-			revertFn()
+			if err := revertFn(); err != nil {
+				t.Fatalf("revert failed: %v", err)
+			}
 
 			nodeInfo, err = snapshot.Get(tc.targetNode)
 			if err != nil {
