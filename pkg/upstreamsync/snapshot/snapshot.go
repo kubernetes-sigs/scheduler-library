@@ -156,20 +156,21 @@ func (s *ClusterSnapshot) Transaction(ctx context.Context, transactionFn func() 
 }
 
 // CanSchedulePod checks feasibility of a single pod on the specified nodes by running
-// PreFilter and Filter plugins. Returns the names of nodes on which the pod can be scheduled,
-// the framework.Diagnosis for rejected nodes, and any error.
-func (s *ClusterSnapshot) CanSchedulePod(ctx context.Context, pod *v1.Pod, placement *fwk.Placement) ([]string, *framework.Diagnosis, error) {
+// PreFilter and Filter plugins, leaving the snapshot untouched. See FeasibilityResult for
+// what it reports; its CycleState is what ClusterState.AssumeAndReserve needs to reserve
+// one of the feasible nodes.
+func (s *ClusterSnapshot) CanSchedulePod(ctx context.Context, pod *v1.Pod, placement *fwk.Placement) (FeasibilityResult, error) {
 	if placement == nil || len(placement.Nodes) == 0 {
-		return nil, nil, nil
+		return FeasibilityResult{}, nil
 	}
 	schedFramework, err := s.profiles.FrameworkForPod(pod)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get framework: %w", err)
+		return FeasibilityResult{}, fmt.Errorf("failed to get framework: %w", err)
 	}
 	state := framework.NewCycleState()
 	podInfo, err := framework.NewPodInfo(pod)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create pod info: %w", err)
+		return FeasibilityResult{}, fmt.Errorf("failed to create pod info: %w", err)
 	}
 	pendingPod := &upstreamsync.PendingPod{
 		PodInfo:    podInfo,
@@ -181,7 +182,7 @@ func (s *ClusterSnapshot) CanSchedulePod(ctx context.Context, pod *v1.Pod, place
 	sched := upstreamsync.NewScheduler(s.schedulerSnapshot, 0, 0, math.MaxInt32, nil)
 	err = s.schedulerSnapshot.AssumePlacement(placement)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to assume placement: %w", err)
+		return FeasibilityResult{}, fmt.Errorf("failed to assume placement: %w", err)
 	}
 	defer s.schedulerSnapshot.ForgetPlacement()
 	nodes, diag, _, err := sched.FindAllNodesThatFitPod(ctx, schedFramework, pendingPod)
@@ -190,10 +191,10 @@ func (s *ClusterSnapshot) CanSchedulePod(ctx context.Context, pod *v1.Pod, place
 		feasibleNodes = append(feasibleNodes, node.Node().Name)
 	}
 	if err != nil {
-		return nil, &diagnosis, fmt.Errorf("failed to find nodes that fit pod: %w", err)
+		return FeasibilityResult{Diagnosis: &diagnosis}, fmt.Errorf("failed to find nodes that fit pod: %w", err)
 	}
 
-	return feasibleNodes, &diagnosis, nil
+	return FeasibilityResult{FeasibleNodeNames: feasibleNodes, CycleState: state, Diagnosis: &diagnosis}, nil
 }
 
 func schedulingResult(algRes *upstreamsync.AlgorithmResult) SchedulingResult {
