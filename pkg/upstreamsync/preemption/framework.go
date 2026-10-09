@@ -21,10 +21,7 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
-// PreemptionManagerFactory is a factory for creating PreemptionManager instances.
-type PreemptionManagerFactory func() PreemptionManager
-
-// PreemptionFramework is a wrapper around the kube-scheduler framework that adds preemption logic.
+// PreemptionFramework wraps framework.Framework to run PodGroup preemption.
 type PreemptionFramework struct {
 	framework.Framework
 	PreemptionManager PreemptionManager
@@ -32,21 +29,30 @@ type PreemptionFramework struct {
 
 // NewPreemptionFramework creates a new PreemptionFramework.
 func NewPreemptionFramework(fw framework.Framework, preemptionManager PreemptionManager) *PreemptionFramework {
+	if preemptionManager == nil {
+		preemptionManager = &NoopPreemptionManager{}
+	}
 	return &PreemptionFramework{
 		Framework:         fw,
 		PreemptionManager: preemptionManager,
 	}
 }
 
-// RunPodGroupPostFilterPlugins is implementation of framework.Framework.RunPodGroupPostFilterPlugins.
-// UPSTREAM-DIFF: It runs only one plugin - defaultPreemption.
-func (f *PreemptionFramework) RunPodGroupPostFilterPlugins(ctx context.Context, state *framework.CycleState, podGroupInfo fwk.PodGroupInfo, podGroupSchedulingFunc fwk.PodGroupSchedulingFunc) (postFilterResult *fwk.PodGroupPostFilterResult, status *fwk.Status) {
-	defaultPreemption := NewDefaultPreemption(f.Framework, f.PreemptionManager)
-	postFilterResult, status = defaultPreemption.PodGroupPostFilter(ctx, state, podGroupInfo, podGroupSchedulingFunc)
-	return postFilterResult, status
+// SetPreemptionManager sets the PreemptionManager on the framework.
+func (f *PreemptionFramework) SetPreemptionManager(pm PreemptionManager) {
+	if pm == nil {
+		pm = &NoopPreemptionManager{}
+	}
+	f.PreemptionManager = pm
 }
 
-// NoopPreemptionManagerFactory is a PreemptionManagerFactory that return dummy PreemptionManager.
-func NoopPreemptionManagerFactory() PreemptionManager {
-	return &NoopPreemptionManager{}
+// RunPodGroupPostFilterPlugins runs DefaultPreemption for the pod group.
+// UPSTREAM-DIFF: Runs only DefaultPreemption.
+func (f *PreemptionFramework) RunPodGroupPostFilterPlugins(ctx context.Context, state *framework.CycleState, podGroupInfo fwk.PodGroupInfo, podGroupSchedulingFunc fwk.PodGroupSchedulingFunc) (postFilterResult *fwk.PodGroupPostFilterResult, status *fwk.Status) {
+	pm := f.PreemptionManager
+	if pm == nil {
+		pm = &NoopPreemptionManager{}
+	}
+	defaultPreemption := NewDefaultPreemption(f.Framework, pm)
+	return defaultPreemption.PodGroupPostFilter(ctx, state, podGroupInfo, podGroupSchedulingFunc)
 }
