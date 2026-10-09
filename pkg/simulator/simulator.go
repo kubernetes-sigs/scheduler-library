@@ -173,6 +173,10 @@ func (s *SchedulingSimulator) NewClusterState(ctx context.Context, opts ...Optio
 }
 
 // NewClusterSnapshot initializes a new snapshot with the provided pods, nodes, pod groups, and composite pod groups.
+// The snapshot does not list the nodes in a deterministic order: two calls with the same
+// arguments can list them differently, which can impact scheduling simulation results.
+// For deterministic order, use NewClusterState instead.
+// Objects of the ClusterSnapshot associated with a ClusterState will be in insertion order.
 // The opts are applied when its scheduling profiles are built; see WithSharedDRAManager.
 // It is not safe to call concurrently with other NewClusterState or NewClusterSnapshot calls.
 func (s *SchedulingSimulator) NewClusterSnapshot(
