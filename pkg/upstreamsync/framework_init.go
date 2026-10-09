@@ -328,7 +328,7 @@ func (p *ProfileMap) FrameworkForPodGroup(podGroupInfo *framework.PodGroupInfo) 
 // snapshot is injected into every framework profile as its SharedLister and PodGroupManager.
 //
 // UPSTREAM-DIFF: returns *ProfileMap embedding profile.Map and omits unused upstream options
-// (componentConfigVersion, kubeConfig, captureProfile, maxBatchAge). mapOpts configure this map
+// (componentConfigVersion, captureProfile, maxBatchAge). mapOpts configure this map
 // only, see FrameworkMapOption.
 func NewFrameworkMap(
 	ctx context.Context,
@@ -346,7 +346,7 @@ func NewFrameworkMap(
 	InitMetricsOnce()
 	registry := frameworkplugins.NewInTreeRegistry()
 	if err := registry.Merge(c.options.frameworkOutOfTreeRegistry); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("merging out-of-tree plugin registry: %w", err)
 	}
 	csiManager := nodevolumelimits.NewCSIManager(
 		c.informerFactory.Storage().V1().CSINodes().Lister())
@@ -366,6 +366,7 @@ func NewFrameworkMap(
 
 	opts := []frameworkruntime.Option{
 		frameworkruntime.WithClientSet(c.client),
+		frameworkruntime.WithKubeConfig(c.options.kubeConfig),
 		// UPSTREAM-DIFF: wrap informerFactory so that plugins registering indexers on Pods().Informer()
 		// (such as DynamicResources) skip already-registered indexers when NewFrameworkMap is called multiple times.
 		frameworkruntime.WithInformerFactory(&dedupPodIndexerInformerFactory{SharedInformerFactory: c.informerFactory}),
