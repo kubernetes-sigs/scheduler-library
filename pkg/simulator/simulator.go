@@ -63,9 +63,9 @@ type Simulator interface {
 	SchedulePodsByTemplate(ctx context.Context, template *v1.PodTemplateSpec, placement *fwk.Placement, maxPods int, opts snapshot.SchedulePodsByTemplateOptions) ([]snapshot.SchedulingResult, error)
 
 	// ScheduleWorkload schedules the given pods belonging to the same hierarchy using the workload-aware scheduling algorithm.
-	// If the pods do not belong to the same hierarchy, it returns an error.
+	// If the pods do not belong to the same hierarchy, it returns an error status.
 	// The order of the returned SchedulingResult slice is non-deterministic with respect to the input pods order.
-	ScheduleWorkload(ctx context.Context, pods []*v1.Pod, opts snapshot.ScheduleWorkloadOptions) ([]snapshot.SchedulingResult, error)
+	ScheduleWorkload(ctx context.Context, pods []*v1.Pod, opts snapshot.ScheduleWorkloadOptions) snapshot.WorkloadSchedulingResult
 
 	// PreemptPods removes the given running pods from the snapshot and returns the handle that puts
 	// them back. The handle is single-use and is invalidated by any later permanent mutation of the
