@@ -51,6 +51,7 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
 	"k8s.io/kubernetes/pkg/scheduler/profile"
 	"k8s.io/kubernetes/pkg/scheduler/util/assumecache"
+	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/preemption"
 )
 
 /*
@@ -292,15 +293,20 @@ type ProfileMap struct {
 	profile.Map
 }
 
+func getProfileName(pod *v1.Pod) string {
+	name := pod.Spec.SchedulerName
+	if name == "" {
+		name = v1.DefaultSchedulerName
+	}
+	return name
+}
+
 // FrameworkForPod returns the framework registered for the pod's scheduler
 // name. An empty scheduler name falls back to the default scheduler — this
 // cannot happen for pods observed via the API (the field is defaulted there),
 // but can for synthetic pods used in scheduling simulations.
 func (p *ProfileMap) FrameworkForPod(pod *v1.Pod) (framework.Framework, error) {
-	name := pod.Spec.SchedulerName
-	if name == "" {
-		name = v1.DefaultSchedulerName
-	}
+	name := getProfileName(pod)
 	f, ok := p.Map[name]
 	if !ok {
 		return nil, fmt.Errorf("profile not found for scheduler name %q", name)
@@ -313,12 +319,17 @@ func (p *ProfileMap) FrameworkForPod(pod *v1.Pod) (framework.Framework, error) {
 //
 // UPSTREAM-DIFF: adapted from Scheduler.frameworkForPodGroup in schedule_one_podgroup.go.
 // It checks its podgroup members and delegates to FrameworkForPod which looks up the podgroup member profile.
-func (p *ProfileMap) FrameworkForPodGroup(podGroupInfo *framework.PodGroupInfo) (framework.Framework, error) {
+// Also we are returning preemption.PreemptionFramework - a wrapper with the preemption manager.
+func (p *ProfileMap) FrameworkForPodGroup(podGroupInfo *framework.PodGroupInfo) (*preemption.PreemptionFramework, error) {
 	pods := podGroupInfo.GetUnscheduledPods()
 	if len(pods) == 0 {
 		return nil, fmt.Errorf("no pods in pod group")
 	}
-	return p.FrameworkForPod(pods[0])
+	f, err := p.FrameworkForPod(pods[0])
+	if err != nil {
+		return nil, err
+	}
+	return preemption.NewPreemptionFramework(f, &preemption.NoopPreemptionManager{}), nil
 }
 
 // NewFrameworkMap builds the map of scheduling framework profiles from the

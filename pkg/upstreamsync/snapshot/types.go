@@ -15,6 +15,8 @@
 package snapshot
 
 import (
+	"iter"
+
 	v1 "k8s.io/api/core/v1"
 	fwk "k8s.io/kube-scheduler/framework"
 )
@@ -103,14 +105,50 @@ type Unpreemption struct {
 	validPreemptionVersion uint64
 }
 
+// PreemptionVictim represents an atomic unit of preemption (a single pod or a workload).
+type PreemptionVictim interface {
+	Pods() []*v1.Pod
+}
+
+// PreemptionFilter tracks external constraints during victim selection and reprieval.
+type PreemptionFilter interface {
+	UnpreemptVictim(PreemptionVictim)
+	PreemptVictim(PreemptionVictim)
+	MayFit() bool
+}
+
+// WorkloadPreemptionOptions configures victim selection and reprieval for ScheduleWorkload.
+type WorkloadPreemptionOptions struct {
+	// PotentialVictims yields candidate victims in ascending priority order (lowest priority first).
+	// If nil, ScheduleWorkload does not attempt preemption of potential victims.
+	PotentialVictims iter.Seq[PreemptionVictim]
+	// CommittedVictims are removed from the snapshot before the first scheduling attempt
+	// and cannot be reprieved.
+	CommittedVictims []PreemptionVictim
+	// PreemptionFilter gates when enough victims have been accumulated and which victims can be reprieved.
+	PreemptionFilter PreemptionFilter
+}
+
 // ScheduleWorkloadOptions contains options for scheduling a workload.
 type ScheduleWorkloadOptions struct {
-	CommonSchedulingOptions
+	DryRun bool
+	WorkloadPreemptionOptions
 }
 
 // NewScheduleWorkloadOptions builds the ScheduleWorkloadOptions used by ScheduleWorkload.
 func NewScheduleWorkloadOptions(dryRun bool) ScheduleWorkloadOptions {
 	return ScheduleWorkloadOptions{
-		CommonSchedulingOptions: CommonSchedulingOptions{DryRun: dryRun},
+		DryRun: dryRun,
 	}
+}
+
+// WorkloadSchedulingResult is the outcome of a ScheduleWorkload attempt.
+type WorkloadSchedulingResult struct {
+	// Status is the overall outcome for the workload root.
+	Status *fwk.Status
+	// PodResults holds one SchedulingResult per pod in the workload.
+	PodResults []SchedulingResult
+	// PreemptionVictims lists the victims from PotentialVictims that were selected for preemption
+	// (excluding CommittedVictims and any reprieved victims).
+	PreemptionVictims []PreemptionVictim
 }
