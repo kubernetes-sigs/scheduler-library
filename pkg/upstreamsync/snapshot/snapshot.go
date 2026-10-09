@@ -32,10 +32,10 @@ import (
 )
 
 // ClusterSnapshot wraps a scheduler snapshot and its associated frameworks.
-// All ClusterSnapshot instances created from the same ClusterState share the
-// same underlying cache.Snapshot. Creating a new snapshot via ClusterState.Snapshot
-// updates that shared snapshot in-place, which invalidates any previously returned
-// ClusterSnapshot instance — callers must not use a prior snapshot after requesting a new one.
+// The ClusterSnapshot of a ClusterState (state.ClusterState.GetAssociatedSnapshot) shares its
+// underlying cache.Snapshot with that ClusterState. ClusterState.SyncSnapshot updates that shared
+// snapshot in-place and reverts the mutations made through the ClusterSnapshot since the previous
+// sync.
 // A ClusterSnapshot is not safe for concurrent use.
 type ClusterSnapshot struct {
 	// profiles holds the scheduling framework per scheduler name. All of them share
@@ -98,7 +98,7 @@ func (ul *undoLog) undo() {
 // New creates a new ClusterSnapshot stub wrapping the provided scheduler snapshot and frameworks.
 //
 // Consumers should obtain a ClusterSnapshot from simulator.SchedulingSimulator instead, either via
-// NewClusterSnapshot or via NewClusterState followed by state.ClusterState.Snapshot: those build
+// NewClusterSnapshot or via NewClusterState followed by state.ClusterState.GetAssociatedSnapshot: those build
 // the full plugin chain out of the KubeSchedulerConfiguration and initialize the scheduler metrics,
 // which this constructor expects to have been done already.
 func New(s *cache.Snapshot, profiles *upstreamsync.ProfileMap) *ClusterSnapshot {

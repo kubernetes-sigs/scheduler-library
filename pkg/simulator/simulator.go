@@ -38,7 +38,7 @@ import (
 
 // Simulator is the set of "what-if" operations that run against a single in-memory view of the
 // cluster. It is implemented by *snapshot.ClusterSnapshot — what SchedulingSimulator.NewClusterSnapshot
-// returns and what state.ClusterState.Snapshot hands out — and exists to make the entry points of a
+// returns and what state.ClusterState.GetAssociatedSnapshot hands out — and exists to make the entry points of a
 // simulation visible from this package; consumers are not expected to implement it.
 type Simulator interface {
 	// MakePlacement turns node names into the *fwk.Placement that the other methods restrict the simulation to.
