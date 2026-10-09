@@ -475,7 +475,7 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 		return result, scheduler.ErrNoNodesAvailable
 	}
 
-	feasibleNodes, diagnosis, nodeHint, err := sched.findNodesThatFitPod(ctx, fwk, podInfo, false)
+	feasibleNodes, diagnosis, nodeHint, err := sched.findNodesThatFitPod(ctx, fwk, podInfo, false, nil)
 	if err != nil {
 		return result, err
 	}
@@ -529,7 +529,20 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 // stops as soon as it has enough candidates to score. Feasibility checks (see
 // ClusterSnapshot.CanSchedulePod) do need it.
 func (sched *Scheduler) FindAllNodesThatFitPod(ctx context.Context, schedFramework framework.Framework, podInfo *PendingPod) ([]fwk.NodeInfo, framework.Diagnosis, string, error) {
-	return sched.findNodesThatFitPod(ctx, schedFramework, podInfo, true)
+	return sched.findNodesThatFitPod(ctx, schedFramework, podInfo, true, nil)
+}
+
+// FindAllNodesThatFitPodWithExclusions is FindAllNodesThatFitPod that also returns the
+// NodeExclusion of every node in the placement that does not fit the pod.
+//
+// UPSTREAM-DIFF: library-only, see NodeExclusion.
+func (sched *Scheduler) FindAllNodesThatFitPodWithExclusions(ctx context.Context, schedFramework framework.Framework, podInfo *PendingPod) ([]fwk.NodeInfo, framework.Diagnosis, []NodeExclusion, string, error) {
+	recorder := &exclusionRecorder{}
+	feasibleNodes, diagnosis, nodeHint, err := sched.findNodesThatFitPod(ctx, schedFramework, podInfo, true, recorder)
+	if err != nil {
+		return feasibleNodes, diagnosis, nil, nodeHint, err
+	}
+	return feasibleNodes, diagnosis, recorder.exclusions, nodeHint, nil
 }
 
 // Filters the nodes to find the ones that fit the pod based on the framework
@@ -539,7 +552,8 @@ func (sched *Scheduler) FindAllNodesThatFitPod(ctx context.Context, schedFramewo
 // the nominated node shortcut is skipped, because returning early with the nominated node alone
 // would hide the other feasible nodes the caller asked for. The CycleState comes from podInfo and
 // the extenders come from the framework instead of sched.Extenders.
-func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework framework.Framework, podInfo *PendingPod, findAll bool) ([]fwk.NodeInfo, framework.Diagnosis, string, error) {
+// It also takes a recorder of the excluded nodes, which needs findAll to see every node.
+func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework framework.Framework, podInfo *PendingPod, findAll bool, recorder *exclusionRecorder) ([]fwk.NodeInfo, framework.Diagnosis, string, error) {
 	state := podInfo.CycleState
 	logger := klog.FromContext(ctx)
 	diagnosis := framework.Diagnosis{
@@ -559,6 +573,8 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework 
 		}
 		// All nodes in NodeToStatus will have the same status so that they can be handled in the preemption.
 		diagnosis.NodeToStatus.SetAbsentNodesStatus(s)
+		// UPSTREAM-DIFF: records the excluded nodes.
+		recorder.recordPreFilterRejection(allNodes, s, unscheduledPlugins)
 
 		// Record the messages from PreFilter in Diagnosis.PreFilterMsg.
 		msg := s.Message()
@@ -601,8 +617,10 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework 
 			}
 		}
 		diagnosis.NodeToStatus.SetAbsentNodesStatus(fwk.NewStatus(fwk.UnschedulableAndUnresolvable, fmt.Sprintf("node(s) didn't satisfy plugin(s) %v", sets.List(unscheduledPlugins))))
+		// UPSTREAM-DIFF: records the excluded nodes before the Filter plugins join unscheduledPlugins.
+		recorder.recordNarrowing(allNodes, preRes, unscheduledPlugins)
 	}
-	feasibleNodes, err := sched.findNodesThatPassFilters(ctx, schedFramework, state, pod, &diagnosis, nodes, findAll)
+	feasibleNodes, err := sched.findNodesThatPassFilters(ctx, schedFramework, state, pod, &diagnosis, nodes, findAll, recorder)
 	// always try to update the sched.nextStartNodeIndex regardless of whether an error has occurred
 	// this is helpful to make sure that all the nodes have a chance to be searched
 	processedNodes := len(feasibleNodes) + diagnosis.NodeToStatus.Len()
@@ -628,6 +646,8 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework 
 			diagnosis.UnschedulablePlugins = sets.New[string]()
 		}
 		diagnosis.UnschedulablePlugins.Insert(framework.ExtenderName)
+		// UPSTREAM-DIFF: records the excluded nodes.
+		recorder.recordExtenderRejections(feasibleNodes, feasibleNodesAfterExtender)
 	}
 
 	return feasibleNodesAfterExtender, diagnosis, nodeHint, nil
@@ -658,7 +678,7 @@ func (sched *Scheduler) evaluateNominatedNode(ctx context.Context, pod *v1.Pod, 
 		return nil, nil
 	}
 	node := []fwk.NodeInfo{nodeInfo}
-	feasibleNodes, err := sched.findNodesThatPassFilters(ctx, schedFramework, state, pod, &diagnosis, node, false /* doesn't matter as there's only 1 node anyway */)
+	feasibleNodes, err := sched.findNodesThatPassFilters(ctx, schedFramework, state, pod, &diagnosis, node, false /* doesn't matter as there's only 1 node anyway */, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -706,6 +726,7 @@ func hasExtenderFilters(fwk framework.Framework) bool {
 // stopping early. Upstream computes the bound from PercentageOfNodesToScore via
 // Scheduler.numFeasibleNodesToFind; the library uses the caller-provided sched.numNodesToFind
 // (see NewScheduler). The body below is otherwise unchanged.
+// It also takes the recorder of findNodesThatFitPod.
 func (sched *Scheduler) findNodesThatPassFilters(
 	ctx context.Context,
 	schedFramework framework.Framework,
@@ -713,7 +734,8 @@ func (sched *Scheduler) findNodesThatPassFilters(
 	pod *v1.Pod,
 	diagnosis *framework.Diagnosis,
 	nodes []fwk.NodeInfo,
-	findAll bool) ([]fwk.NodeInfo, error) {
+	findAll bool,
+	recorder *exclusionRecorder) ([]fwk.NodeInfo, error) {
 	numAllNodes := len(nodes)
 	// UPSTREAM-DIFF: upstream always samples via sched.numFeasibleNodesToFind(
 	// schedFramework.PercentageOfNodesToScore(), int32(numAllNodes)). Here the bound is either all
@@ -790,6 +812,8 @@ func (sched *Scheduler) findNodesThatPassFilters(
 		}
 		diagnosis.NodeToStatus.Set(item.node, item.status)
 		diagnosis.AddPluginStatus(item.status)
+		// UPSTREAM-DIFF: records the excluded node.
+		recorder.recordFilterRejection(item.node, item.status)
 	}
 	if err := errCh.Receive(); err != nil {
 		statusCode = fwk.Error
