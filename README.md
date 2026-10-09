@@ -21,6 +21,12 @@ Everything a consumer needs is reachable from the [`pkg/simulator`](pkg/simulato
 3. `SchedulingSimulator.NewClusterState(ctx)` (live cluster state) or `SchedulingSimulator.NewClusterSnapshot(ctx, pods, nodes, podGroups, compositePodGroups)` (explicit state).
 4. `ClusterSnapshot.MakePlacement`, `CanSchedulePod`, `SchedulePods`, `SchedulePodsByTemplate`, `ScheduleWorkload`, `PreemptPods`, `Unpreempt` and `Transaction` — the simulation methods.
 
+### Gated pods
+
+Before a scheduling cycle, kube-scheduler runs the PreEnqueue plugins of the pod's profile; a pod any of them rejects is *gated* — it waits in the unschedulable queue and is never considered for a node. `CanSchedulePod`, `SchedulePods` and `SchedulePodsByTemplate` run those plugins too, so a pod the real scheduler would not look at is not reported as schedulable here either.
+
+A gated pod is left untouched: no node is selected, its `Spec.NodeName` is not set and the snapshot is not mutated. `SchedulingResult.GatingPlugin` names the plugin that rejected it, and `CanSchedulePod` reports it through the `Diagnosis`.
+
 The remaining packages are implementation detail: `pkg/upstreamsync` holds logic duplicated from (or destined for) the upstream kube-scheduler, and `pkg/framework` wires the upstream scheduler framework for in-memory use.
 
 ## Key capabilities

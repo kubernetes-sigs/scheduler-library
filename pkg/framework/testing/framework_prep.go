@@ -57,6 +57,11 @@ func SetupSnapshotTest(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (*
 							{Name: "PrioritySort"},
 						},
 					},
+					PreEnqueue: schedulerapi.PluginSet{
+						Enabled: []schedulerapi.Plugin{
+							{Name: "SchedulingGates"},
+						},
+					},
 					PreFilter: schedulerapi.PluginSet{
 						Enabled: []schedulerapi.Plugin{
 							{Name: "NodeResourcesFit"},
