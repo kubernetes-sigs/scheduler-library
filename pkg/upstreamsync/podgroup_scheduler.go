@@ -553,7 +553,7 @@ func (sched *Scheduler) assumeSubtreeWithRevert(
 		}
 	}()
 
-	for leafResult := range successfulLeafResults(pgi, results) {
+	for leafResult := range SuccessfulLeafResults(pgi, results) {
 		for _, podResult := range leafResult.PodResults {
 			if !podResult.status.IsSuccess() || podResult.GetNodeName() == "" {
 				continue
@@ -571,12 +571,12 @@ func (sched *Scheduler) assumeSubtreeWithRevert(
 	return revertFns, nil
 }
 
-// successfulLeafResults walks the tree down to the successful leafs.
+// SuccessfulLeafResults walks the tree down to the successful leafs.
 // A leaf is only deemed successful if its ancestors are also successful.
 // If the results are missing for a given subtree, that subtree is skipped.
 //
-// UPSTREAM-DIFF: none, copied verbatim.
-func successfulLeafResults(root *framework.PodGroupInfo, results map[fwk.EntityKey]*PodGroupAlgorithmResult) iter.Seq[*PodGroupAlgorithmResult] {
+// UPSTREAM-DIFF: exported as SuccessfulLeafResults for use by ClusterSnapshot.ScheduleWorkload.
+func SuccessfulLeafResults(root *framework.PodGroupInfo, results map[fwk.EntityKey]*PodGroupAlgorithmResult) iter.Seq[*PodGroupAlgorithmResult] {
 	return func(yield func(*PodGroupAlgorithmResult) bool) {
 		var walk func(pgi *framework.PodGroupInfo) bool
 		walk = func(pgi *framework.PodGroupInfo) bool {
@@ -704,7 +704,7 @@ func makeCompositePodGroupAssignments(
 	placementStates := make([]fwk.PlacementCycleState, 0, len(successfulResults))
 	for placement, subtreeResults := range successfulResults {
 		var combinedProposedAssignments []fwk.ProposedAssignment
-		for result := range successfulLeafResults(pgi, subtreeResults) {
+		for result := range SuccessfulLeafResults(pgi, subtreeResults) {
 			for i := range result.PodResults {
 				if result.PodResults[i].scheduleResult.SuggestedHost != "" {
 					combinedProposedAssignments = append(combinedProposedAssignments, &result.PodResults[i])
@@ -718,6 +718,50 @@ func makeCompositePodGroupAssignments(
 		placementStates = append(placementStates, subtreeResults[getEntityKey(pgi)].PlacementCycleState)
 	}
 	return placementPodGroupAssignments, placementStates
+}
+
+// BuildPodGroupSchedulingFunc constructs the PodGroupSchedulingFunc callback passed to
+// RunPodGroupPostFilterPlugins to evaluate pod group feasibility during preemption.
+//
+// UPSTREAM-DIFF: adapted from the inline podGroupSchedulingFunc in Scheduler.podGroupCycle
+// (extracted in kubernetes/kubernetes#142979, with CompositePodGroup support from
+// kubernetes/kubernetes#141852). Unlike upstream (where runRootSchedulingAlgorithm always
+// reverts reservations), RunRootSchedulingAlgorithm leaves reservations intact on success
+// and returns revertFn, which this callback invokes before returning.
+func (sched *Scheduler) BuildPodGroupSchedulingFunc(
+	schedFwk framework.Framework,
+	podGroupInfo *framework.PodGroupInfo,
+) fwk.PodGroupSchedulingFunc {
+	rootKey := getEntityKey(podGroupInfo)
+	return func(ctx context.Context) (*fwk.PodGroupAssignments, *fwk.Status) {
+		results, revertFn := sched.RunRootSchedulingAlgorithm(ctx, schedFwk, framework.NewCycleState(), podGroupInfo)
+		// Revert assumed preemptor reservations so reprieveVictim does not
+		// add ProposedAssignments on top of already-reserved preemptor pods.
+		if revertFn != nil {
+			revertFn()
+		}
+		result := results[rootKey]
+		if !result.Status.IsSuccess() {
+			return nil, result.Status
+		}
+		var proposedAssignments []fwk.ProposedAssignment
+		for res := range SuccessfulLeafResults(podGroupInfo, results) {
+			proposedAssignments = append(proposedAssignments, makeProposedAssignments(res)...)
+		}
+		return &fwk.PodGroupAssignments{
+			ProposedAssignments: proposedAssignments,
+		}, result.Status
+	}
+}
+
+func makeProposedAssignments(res *PodGroupAlgorithmResult) []fwk.ProposedAssignment {
+	proposedAssignments := make([]fwk.ProposedAssignment, 0, len(res.PodResults))
+	for i := range res.PodResults {
+		if res.PodResults[i].scheduleResult.SuggestedHost != "" {
+			proposedAssignments = append(proposedAssignments, &res.PodResults[i])
+		}
+	}
+	return proposedAssignments
 }
 
 func getEntityKey(pgi *framework.PodGroupInfo) fwk.EntityKey {

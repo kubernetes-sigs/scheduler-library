@@ -64,7 +64,7 @@ type Simulator interface {
 
 	// ScheduleWorkload schedules the given pods belonging to the same hierarchy using the workload-aware scheduling algorithm.
 	// If the pods do not belong to the same hierarchy, it returns an error status.
-	// The order of the returned PodResults slice is non-deterministic with respect to the input pods order.
+	// The order of WorkloadSchedulingResult.PodResults is not guaranteed to match the order of input pods.
 	//
 	// All PodGroup and CompositePodGroup objects in the hierarchy must exist in the snapshot before calling this method.
 	// Callers can register virtual groups (groups not present in the cluster) with AddPodGroup and AddCompositePodGroup.

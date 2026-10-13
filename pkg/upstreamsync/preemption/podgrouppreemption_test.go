@@ -1174,7 +1174,7 @@ func TestPodGroupEvaluator_Preempt_Victims(t *testing.T) {
 				return nil, fwk.NewStatus(fwk.Unschedulable)
 			}
 
-			pl := NewPodGroupEvaluator(f, mockPM)
+			pl := NewPodGroupEvaluator(NewPreemptionFramework(f, mockPM))
 
 			if err := pl.Handle.MutableSnapshotSharedLister().StartMutations(); err != nil {
 				t.Fatalf("Unexpected error: %v", err)
@@ -1292,7 +1292,7 @@ func TestPodGroupEvaluator_Preempt_NominatedNodes(t *testing.T) {
 	mockPM := &mockPreemptionManager{
 		victims: []PreemptionVictim{makeVictim(p3)},
 	}
-	pl := NewPodGroupEvaluator(f, mockPM)
+	pl := NewPodGroupEvaluator(NewPreemptionFramework(f, mockPM))
 
 	if err := pl.Handle.MutableSnapshotSharedLister().StartMutations(); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
@@ -1426,7 +1426,7 @@ func TestPodGroupEvaluator_Preempt(t *testing.T) {
 				waitingForVictims: tt.waitingForVictims,
 				generateStatus:    tt.generateStatus,
 			}
-			pl := NewPodGroupEvaluator(f, mockPM)
+			pl := NewPodGroupEvaluator(NewPreemptionFramework(f, mockPM))
 
 			mockSchedulingFunc := func(ctx context.Context) (*fwk.PodGroupAssignments, *fwk.Status) {
 				t.Fatal("podGroupSchedulingFunc should not be called when ongoing preemption or empty/failed victim generation is detected")
@@ -1556,7 +1556,7 @@ func TestPodGroupPreemptionEvaluationDurationMetric(t *testing.T) {
 			mockPM := &mockPreemptionManager{
 				victims: []PreemptionVictim{makeVictim(victimPod)},
 			}
-			pl := NewPodGroupEvaluator(fh, mockPM)
+			pl := NewPodGroupEvaluator(NewPreemptionFramework(fh, mockPM))
 
 			mockSchedulingFunc := func(ctx context.Context) (*fwk.PodGroupAssignments, *fwk.Status) {
 				cycleState := framework.NewCycleState()

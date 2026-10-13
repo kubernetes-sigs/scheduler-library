@@ -493,7 +493,7 @@ func TestNewClusterSnapshot_PodGroupScheduling(t *testing.T) {
 
 	result := snap.ScheduleWorkload(ctx, []*v1.Pod{pod1, pod2}, snapshot.NewScheduleWorkloadOptions(false))
 	if result.Status.IsError() {
-		t.Fatalf("ScheduleWorkload failed: %v", err)
+		t.Fatalf("ScheduleWorkload failed: %v", result.Status.AsError())
 	}
 	if !result.Status.IsSuccess() {
 		t.Fatalf("Expected workload to schedule, got status: %v", result.Status)

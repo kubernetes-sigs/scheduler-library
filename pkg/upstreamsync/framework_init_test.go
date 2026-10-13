@@ -21,19 +21,26 @@ NewFrameworkMap functionality in scheduler-library.
 */
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/events"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	fwk "k8s.io/kube-scheduler/framework"
+	"k8s.io/kubernetes/pkg/features"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	internalcache "k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
+	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
+	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/preemption"
 )
 
 // verifyErr verifies that the given error is the error expected by the test case.
@@ -297,5 +304,104 @@ func TestNewFrameworkMapSharedDRAManager(t *testing.T) {
 				t.Error("SharedDRAManager() returned the stub, want the default manager")
 			}
 		})
+	}
+}
+
+type fakePodGroupPostFilterPlugin struct {
+	fh      preemption.Handle
+	lastPM  preemption.PreemptionManager
+	invoked bool
+}
+
+var _ fwk.PodGroupPostFilterPlugin = (*fakePodGroupPostFilterPlugin)(nil)
+
+func (p *fakePodGroupPostFilterPlugin) Name() string {
+	return "FakePodGroupPostFilter"
+}
+
+func (p *fakePodGroupPostFilterPlugin) PodGroupPostFilter(
+	_ context.Context,
+	_ fwk.PodGroupCycleState,
+	_ fwk.PodGroupInfo,
+	_ fwk.PodGroupSchedulingFunc,
+) (*fwk.PodGroupPostFilterResult, *fwk.Status) {
+	p.invoked = true
+	p.lastPM = p.fh.PreemptionManager()
+	return &fwk.PodGroupPostFilterResult{}, fwk.NewStatus(fwk.Success)
+}
+
+func TestNewFrameworkMap_OutOfTreePodGroupPostFilterPlugin(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.GenericWorkload, true)
+	ctx := t.Context()
+	client := fake.NewClientset()
+	informerFactory := informers.NewSharedInformerFactory(client, 0)
+
+	var createdPlugin *fakePodGroupPostFilterPlugin
+	registry := frameworkruntime.Registry{
+		"FakePodGroupPostFilter": func(_ context.Context, _ runtime.Object, fh fwk.Handle) (fwk.Plugin, error) {
+			ph, ok := fh.(preemption.Handle)
+			if !ok {
+				return nil, fmt.Errorf("expected fwk.Handle to implement preemption.Handle, got %T", fh)
+			}
+			createdPlugin = &fakePodGroupPostFilterPlugin{fh: ph}
+			return createdPlugin, nil
+		},
+	}
+
+	cfg := schedulerapi.KubeSchedulerConfiguration{
+		Profiles: []schedulerapi.KubeSchedulerProfile{
+			{
+				SchedulerName: v1.DefaultSchedulerName,
+				Plugins: &schedulerapi.Plugins{
+					QueueSort:          schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+					Bind:               schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+					PodGroupPostFilter: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "FakePodGroupPostFilter"}}},
+				},
+			},
+		},
+	}
+
+	comps, err := NewFrameworkComponents(
+		ctx,
+		client,
+		informerFactory,
+		WithProfiles(cfg.Profiles...),
+		WithFrameworkOutOfTreeRegistry(registry),
+	)
+	if err != nil {
+		t.Fatalf("NewFrameworkComponents failed: %v", err)
+	}
+
+	profileMap, err := NewFrameworkMap(ctx, comps, fakeRecorderFactory, internalcache.NewEmptySnapshot())
+	if err != nil {
+		t.Fatalf("NewFrameworkMap failed: %v", err)
+	}
+	if createdPlugin == nil {
+		t.Fatal("expected FakePodGroupPostFilter plugin factory to be called")
+	}
+
+	pgInfo := &framework.PodGroupInfo{
+		PodGroup:        &schedulingv1beta1.PodGroup{},
+		UnscheduledPods: []*v1.Pod{{ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: "default"}}},
+	}
+	pf, err := profileMap.FrameworkForPodGroup(pgInfo)
+	if err != nil {
+		t.Fatalf("FrameworkForPodGroup failed: %v", err)
+	}
+
+	customPM := &preemption.NoopPreemptionManager{}
+	pf.SetPreemptionManager(customPM)
+
+	_, status := pf.RunPodGroupPostFilterPlugins(ctx, framework.NewCycleState(), pgInfo, func(context.Context) (*fwk.PodGroupAssignments, *fwk.Status) {
+		return nil, fwk.NewStatus(fwk.Success)
+	})
+	if !status.IsSuccess() {
+		t.Fatalf("RunPodGroupPostFilterPlugins failed: %v", status)
+	}
+	if !createdPlugin.invoked {
+		t.Fatal("expected FakePodGroupPostFilter.PodGroupPostFilter to be invoked")
+	}
+	if createdPlugin.lastPM != customPM {
+		t.Fatalf("plugin observed PreemptionManager = %v, want %v", createdPlugin.lastPM, customPM)
 	}
 }

@@ -53,10 +53,18 @@ type mockHandle struct {
 	fwk.Handle
 
 	mutableLister fwk.MutableSnapshotSharedLister
+	pm            PreemptionManager
 }
 
 func (m *mockHandle) MutableSnapshotSharedLister() fwk.MutableSnapshotSharedLister {
 	return m.mutableLister
+}
+
+func (m *mockHandle) PreemptionManager() PreemptionManager {
+	if m.pm == nil {
+		return &NoopPreemptionManager{}
+	}
+	return m.pm
 }
 
 type mockPodGroupEvaluator struct {
@@ -169,7 +177,10 @@ func TestDefaultPreemption_PodGroupPostFilter(t *testing.T) {
 			}
 
 			metricLabel := tt.expectedStatus.Code().String()
-			beforeMetric, _ := testutil.GetCounterMetricValue(metrics.WorkloadPreemptionAttempts.WithLabelValues(metricLabel))
+			beforeMetric, err := testutil.GetCounterMetricValue(metrics.WorkloadPreemptionAttempts.WithLabelValues(metricLabel))
+			if err != nil {
+				t.Fatalf("Failed to read WorkloadPreemptionAttempts metric before call: %v", err)
+			}
 
 			gotResult, gotStatus := dp.PodGroupPostFilter(ctx, framework.NewCycleState(), pgInfo, schedulingFunc)
 

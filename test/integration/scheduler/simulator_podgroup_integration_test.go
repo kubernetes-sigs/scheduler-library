@@ -145,7 +145,7 @@ func TestSimulatorIntegration_PodGroupScheduling(t *testing.T) {
 			podGroups:          []*schedulingv1beta1.PodGroup{failLeafPG1, failLeafPG2},
 			pods:               []*v1.Pod{failPod1, failPod2},
 			wantSuccess:        false,
-			wantResultsCount:   2,
+			wantResultsCount:   0,
 		},
 		{
 			name:             "single pod group hierarchy with TAS fails due to insufficient zone capacity",
@@ -153,7 +153,7 @@ func TestSimulatorIntegration_PodGroupScheduling(t *testing.T) {
 			podGroups:        []*schedulingv1beta1.PodGroup{tasPG},
 			pods:             []*v1.Pod{tasPod1, tasPod2},
 			wantSuccess:      false,
-			wantResultsCount: 2,
+			wantResultsCount: 0,
 		},
 		{
 			name:               "multi-level hierarchy TAS success with sufficient zone capacity",

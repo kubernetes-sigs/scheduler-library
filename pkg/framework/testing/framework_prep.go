@@ -138,10 +138,11 @@ func SetupSnapshotTestWithPodGroups(
 			{
 				SchedulerName: v1.DefaultSchedulerName,
 				Plugins: &schedulerapi.Plugins{
-					QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
-					PreFilter: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "NodeResourcesFit"}}},
-					Filter:    schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "NodeResourcesFit"}}},
-					Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+					QueueSort:          schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+					PreFilter:          schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "NodeResourcesFit"}}},
+					Filter:             schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "NodeResourcesFit"}}},
+					Bind:               schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+					PodGroupPostFilter: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultPreemption"}}},
 				},
 				PluginConfig: []schedulerapi.PluginConfig{
 					{
@@ -150,6 +151,13 @@ func SetupSnapshotTestWithPodGroups(
 							ScoringStrategy: &schedulerapi.ScoringStrategy{
 								Type: schedulerapi.LeastAllocated,
 							},
+						},
+					},
+					{
+						Name: "DefaultPreemption",
+						Args: &schedulerapi.DefaultPreemptionArgs{
+							MinCandidateNodesPercentage: 10,
+							MinCandidateNodesAbsolute:   100,
 						},
 					},
 				},
