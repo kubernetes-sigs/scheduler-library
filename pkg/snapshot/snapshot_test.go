@@ -36,6 +36,7 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	ft "sigs.k8s.io/scheduler-library/pkg/framework/testing"
+	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
 	testutils "sigs.k8s.io/scheduler-library/pkg/upstreamsync/testutils"
 )
 
@@ -1555,8 +1556,8 @@ func verifySnapshotPodGroups(
 	t.Helper()
 
 	rv := reflect.ValueOf(snap).Elem()
-	podGroupStates := writableField(rv, "podGroupStates")
-	compositePodGroupStates := writableField(rv, "compositePodGroupStates")
+	podGroupStates := upstreamsync.WritableField(rv, "podGroupStates")
+	compositePodGroupStates := upstreamsync.WritableField(rv, "compositePodGroupStates")
 
 	wantPGMap := make(map[fwk.EntityKey]*schedulingv1beta1.PodGroup, len(wantPodGroups))
 	wantChildren := make(map[fwk.EntityKey]sets.Set[fwk.EntityKey])
@@ -1583,10 +1584,10 @@ func verifySnapshotPodGroups(
 	for pgIter.Next() {
 		key := pgIter.Key().Interface().(fwk.EntityKey)
 		pgs := pgIter.Value()
-		if podGroupEmpty(pgs) {
+		if upstreamsync.PodGroupEmpty(pgs) {
 			t.Errorf("empty podGroupStateSnapshot left in snapshot for key %s", key)
 		}
-		if pgField := writableField(pgs.Elem(), "podGroup"); !pgField.IsNil() {
+		if pgField := upstreamsync.WritableField(pgs.Elem(), "podGroup"); !pgField.IsNil() {
 			gotPGMap[key] = pgField.Interface().(*schedulingv1beta1.PodGroup)
 		}
 	}
@@ -1622,10 +1623,10 @@ func verifySnapshotPodGroups(
 	for cpgIter.Next() {
 		key := cpgIter.Key().Interface().(fwk.EntityKey)
 		cpgs := cpgIter.Value()
-		if compositePodGroupEmpty(cpgs) {
+		if upstreamsync.CompositePodGroupEmpty(cpgs) {
 			t.Errorf("empty compositePodGroupStateSnapshot left in snapshot for key %s", key)
 		}
-		if cpgField := writableField(cpgs.Elem(), "compositePodGroup"); !cpgField.IsNil() {
+		if cpgField := upstreamsync.WritableField(cpgs.Elem(), "compositePodGroup"); !cpgField.IsNil() {
 			gotCPGMap[key] = cpgField.Interface().(*schedulingv1alpha3.CompositePodGroup)
 		}
 		state, err := snap.CompositePodGroupStates().Get(key.Namespace, key.Name)

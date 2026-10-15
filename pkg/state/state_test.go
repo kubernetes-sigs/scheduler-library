@@ -34,8 +34,8 @@ import (
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	slframework "sigs.k8s.io/scheduler-library/pkg/framework"
 	ft "sigs.k8s.io/scheduler-library/pkg/framework/testing"
+	"sigs.k8s.io/scheduler-library/pkg/snapshot"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
-	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
 )
 
 func init() {
