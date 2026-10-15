@@ -190,7 +190,7 @@ func (sched *Scheduler) RunRootSchedulingAlgorithm(
 		result, revertFns = sched.podGroupSchedulingRecursiveAlgorithm(ctx, schedFwk, podGroupCycleState, rootPodGroupInfo, rootPodGroupInfo, results)
 	} else {
 		result, revertFns = sched.podGroupSchedulingAlgorithm(ctx, schedFwk, podGroupCycleState, rootPodGroupInfo)
-		results[getEntityKey(rootPodGroupInfo)] = result
+		results[GetEntityKey(rootPodGroupInfo)] = result
 	}
 
 	if result.Status.IsSuccess() && !result.AnyScheduled {
@@ -217,7 +217,7 @@ func (sched *Scheduler) BuildPodGroupSchedulingFunc(
 	schedFwk framework.Framework,
 	podGroupInfo *framework.PodGroupInfo,
 ) fwk.PodGroupSchedulingFunc {
-	rootKey := getEntityKey(podGroupInfo)
+	rootKey := GetEntityKey(podGroupInfo)
 	return func(ctx context.Context) (*fwk.PodGroupAssignments, *fwk.Status) {
 		results, revertFn := sched.RunRootSchedulingAlgorithm(ctx, schedFwk, framework.NewCycleState(), podGroupInfo)
 		if revertFn != nil {
@@ -253,7 +253,7 @@ func (sched *Scheduler) podGroupSchedulingRecursiveAlgorithm(
 ) (*PodGroupAlgorithmResult, revertFns) {
 	if podGroupInfo.GetType() == fwk.PodGroupKeyType {
 		algorithmResult, childRevertFns := sched.podGroupSchedulingAlgorithm(ctx, schedFwk, podGroupCycleState, podGroupInfo)
-		results[getEntityKey(podGroupInfo)] = algorithmResult
+		results[GetEntityKey(podGroupInfo)] = algorithmResult
 		return algorithmResult, childRevertFns
 	}
 
@@ -297,7 +297,7 @@ func (sched *Scheduler) compositePodGroupSchedulingPlacementAlgorithm(
 	results map[fwk.EntityKey]*PodGroupAlgorithmResult,
 ) (finalResult *PodGroupAlgorithmResult, revertFns revertFns) {
 	defer func() {
-		results[getEntityKey(podGroupInfo)] = finalResult
+		results[GetEntityKey(podGroupInfo)] = finalResult
 	}()
 
 	allNodes, err := sched.nodeInfoSnapshot.ListNodesInPlacement()
@@ -359,7 +359,7 @@ func (sched *Scheduler) compositePodGroupSchedulingPlacementAlgorithm(
 	}
 
 	if len(successfulResults) == 0 {
-		anyResultRoot := anyResultSubtree[getEntityKey(podGroupInfo)]
+		anyResultRoot := anyResultSubtree[GetEntityKey(podGroupInfo)]
 		if anyResultRoot == nil {
 			anyResultRoot = &PodGroupAlgorithmResult{
 				PodGroupInfo: podGroupInfo,
@@ -389,7 +389,7 @@ func (sched *Scheduler) compositePodGroupSchedulingPlacementAlgorithm(
 	}
 	maps.Copy(results, bestResult)
 
-	return bestResult[getEntityKey(podGroupInfo)], revertFns
+	return bestResult[GetEntityKey(podGroupInfo)], revertFns
 }
 
 // compositePodGroupSchedulingDefaultAlgorithm schedules a composite pod group by recursively scheduling
@@ -405,7 +405,7 @@ func (sched *Scheduler) compositePodGroupSchedulingDefaultAlgorithm(
 	results map[fwk.EntityKey]*PodGroupAlgorithmResult,
 ) (result *PodGroupAlgorithmResult, revertFns revertFns) {
 	defer func() {
-		results[getEntityKey(podGroupInfo)] = result
+		results[GetEntityKey(podGroupInfo)] = result
 		if !result.Status.IsSuccess() {
 			revertFns.revert()
 			result.AnyScheduled = false
@@ -558,7 +558,7 @@ func (sched *Scheduler) podGroupSchedulingPlacementAlgorithm(
 
 	var revertFns revertFns
 	if utilfeature.DefaultFeatureGate.Enabled(features.CompositePodGroup) {
-		revertFns, err = sched.assumeSubtreeWithRevert(ctx, schedFwk, podGroupInfo, map[fwk.EntityKey]*PodGroupAlgorithmResult{getEntityKey(podGroupInfo): bestResult})
+		revertFns, err = sched.assumeSubtreeWithRevert(ctx, schedFwk, podGroupInfo, map[fwk.EntityKey]*PodGroupAlgorithmResult{GetEntityKey(podGroupInfo): bestResult})
 		if err != nil {
 			return &PodGroupAlgorithmResult{
 				PodGroupInfo: podGroupInfo,
@@ -704,7 +704,7 @@ func (sched *Scheduler) assumeSubtreeWithRevert(
 
 // CompletePodGroupAlgorithmResult ensures that the PodGroupAlgorithmResult contains the same number of PodResults as there are unscheduled pods in the pod group.
 //
-// UPSTREAM-DIFF: adapted from completePodGroupAlgorithmResult; exported for use by pkg/upstreamsync/snapshot.
+// UPSTREAM-DIFF: adapted from completePodGroupAlgorithmResult; exported for use by pkg/snapshot.
 // Uses PodGroupInfo.GetUnscheduledPods() instead of QueuedPodInfo (see PendingPod) and omits ctx and podSchedulingContext.
 func CompletePodGroupAlgorithmResult(
 	podGroupState *framework.CycleState,
@@ -751,7 +751,7 @@ func CompletePodGroupAlgorithmResult(
 // are propagated down the tree before finalizing the cycle.
 //
 // UPSTREAM-DIFF: adapted from completeCompositePodGroupAlgorithmResult; exported for use by
-// pkg/upstreamsync/snapshot. Takes *framework.PodGroupInfo instead of *framework.QueuedPodGroupInfo
+// pkg/snapshot. Takes *framework.PodGroupInfo instead of *framework.QueuedPodGroupInfo
 // and omits ctx.
 func CompleteCompositePodGroupAlgorithmResult(
 	rootPodGroupInfo *framework.PodGroupInfo,
@@ -782,7 +782,7 @@ func completeCompositePodGroupAlgorithmResultMap(
 	pgResults map[fwk.EntityKey]*PodGroupAlgorithmResult,
 	failedAncestor *PodGroupAlgorithmResult,
 ) {
-	key := getEntityKey(podGroupInfo)
+	key := GetEntityKey(podGroupInfo)
 	result, evaluated := pgResults[key]
 	if !evaluated {
 		// Groups are only skipped after an ancestor failed.
@@ -834,12 +834,12 @@ func buildAncestorFailureStatus(failedAncestor *PodGroupAlgorithmResult) *fwk.St
 // A leaf is only deemed successful if its ancestors are also successful.
 // If the results are missing for a given subtree, that subtree is skipped.
 //
-// UPSTREAM-DIFF: exported for use by pkg/upstreamsync/snapshot.
+// UPSTREAM-DIFF: exported for use by pkg/snapshot.
 func SuccessfulLeafResults(root *framework.PodGroupInfo, results map[fwk.EntityKey]*PodGroupAlgorithmResult) iter.Seq[*PodGroupAlgorithmResult] {
 	return func(yield func(*PodGroupAlgorithmResult) bool) {
 		var walk func(pgi *framework.PodGroupInfo) bool
 		walk = func(pgi *framework.PodGroupInfo) bool {
-			result, ok := results[getEntityKey(pgi)]
+			result, ok := results[GetEntityKey(pgi)]
 			// Result may be missing because it may have been skipped due to PlacementFeasible status.
 			// If the result for a given subtree is non-success (e.g. actualCount < minGroupCount), we treat all of its descendants as non-success with 0 pods scheduled.
 			if !ok || !result.Status.IsSuccess() {
@@ -977,12 +977,15 @@ func makeCompositePodGroupAssignments(
 			Placement:           placement,
 			ProposedAssignments: combinedProposedAssignments,
 		})
-		placementStates = append(placementStates, subtreeResults[getEntityKey(pgi)].PlacementCycleState)
+		placementStates = append(placementStates, subtreeResults[GetEntityKey(pgi)].PlacementCycleState)
 	}
 	return placementPodGroupAssignments, placementStates
 }
 
-func getEntityKey(pgi *framework.PodGroupInfo) fwk.EntityKey {
+// GetEntityKey returns the EntityKey for a PodGroupInfo.
+//
+// UPSTREAM-DIFF: needs to be exported in k8s.io/kubernetes (currently unexported getEntityKey) for use by pkg/snapshot.
+func GetEntityKey(pgi *framework.PodGroupInfo) fwk.EntityKey {
 	if pgi.PodGroup != nil {
 		return fwk.PodGroupKey(pgi.PodGroup.Namespace, pgi.PodGroup.Name)
 	}

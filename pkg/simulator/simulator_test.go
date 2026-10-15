@@ -45,7 +45,7 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
-	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
+	"sigs.k8s.io/scheduler-library/pkg/snapshot"
 	testutils "sigs.k8s.io/scheduler-library/pkg/upstreamsync/testutils"
 )
 
