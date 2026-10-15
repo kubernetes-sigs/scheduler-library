@@ -24,8 +24,8 @@ import (
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
+	"sigs.k8s.io/scheduler-library/pkg/snapshot"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
-	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
 )
 
 // ClusterState is a struct holding state of cluster for running simulations.

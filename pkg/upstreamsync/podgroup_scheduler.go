@@ -757,9 +757,14 @@ func makeCompositePodGroupAssignments(
 	return placementPodGroupAssignments, placementStates
 }
 
-func getEntityKey(pgi *framework.PodGroupInfo) fwk.EntityKey {
+// GetEntityKey returns the EntityKey for a PodGroupInfo.
+func GetEntityKey(pgi *framework.PodGroupInfo) fwk.EntityKey {
 	if pgi.PodGroup != nil {
 		return fwk.PodGroupKey(pgi.PodGroup.Namespace, pgi.PodGroup.Name)
 	}
 	return fwk.CompositePodGroupKey(pgi.CompositePodGroup.Namespace, pgi.CompositePodGroup.Name)
+}
+
+func getEntityKey(pgi *framework.PodGroupInfo) fwk.EntityKey {
+	return GetEntityKey(pgi)
 }
