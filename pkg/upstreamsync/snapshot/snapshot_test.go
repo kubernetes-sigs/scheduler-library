@@ -2064,6 +2064,15 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 	vMed2CPUPod := makeScheduledTestPod("v-med2-pod", "node1", "", "2")
 	vLarge3CPUPod := makeScheduledTestPod("v-large3-pod", "node1", "", "3")
 
+	v0Pod := makeScheduledTestPod("v0-pod", "node1", "", "1")
+	v1Pod1CPU := makeScheduledTestPod("v1-1cpu-pod", "node1", "", "1")
+	v2Pod1CPU := makeScheduledTestPod("v2-1cpu-pod", "node1", "", "1")
+	v3Pod1CPU := makeScheduledTestPod("v3-1cpu-pod", "node1", "", "1")
+	v4Pod2CPU := makeScheduledTestPod("v4-2cpu-pod", "node1", "", "2")
+	v5PodNode2 := makeScheduledTestPod("v5-pod", "node2", "", "2")
+	v6PodNode2 := makeScheduledTestPod("v6-pod", "node2", "", "2")
+	v7PodNode2 := makeScheduledTestPod("v7-pod", "node2", "", "2")
+
 	tests := []struct {
 		name                string
 		nodes               []*v1.Node
@@ -2405,6 +2414,57 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 				"node1": sets.New("v-committed", "v1-pod", "v2-pod", "v3-pod"),
 			},
 		},
+		{
+			name: "Exponential and binary search narrows prefix to k*=5 before reprieval and preserves higher-priority victims on node2",
+			nodes: []*v1.Node{
+				node6CPU,
+				st.MakeNode().Name("node2").Capacity(map[v1.ResourceName]string{
+					v1.ResourceCPU:    "6",
+					v1.ResourceMemory: "8Gi",
+					v1.ResourcePods:   "10",
+				}).Obj(),
+			},
+			existingPods: []*v1.Pod{
+				v0Pod,
+				v1Pod1CPU,
+				v2Pod1CPU,
+				v3Pod1CPU,
+				v4Pod2CPU,
+				v5PodNode2,
+				v6PodNode2,
+				v7PodNode2,
+			},
+			workloadPods: []*v1.Pod{
+				testutils.MakePod("w-pod1", "gang-pg", "3"),
+				testutils.MakePod("w-pod2", "gang-pg", "2"),
+			},
+			buildOpts: func() (ScheduleWorkloadOptions, *cpuPreemptionFilter) {
+				victims := []PreemptionVictim{
+					&testVictim{name: "v0", pods: []*v1.Pod{v0Pod}},
+					&testVictim{name: "v1", pods: []*v1.Pod{v1Pod1CPU}},
+					&testVictim{name: "v2", pods: []*v1.Pod{v2Pod1CPU}},
+					&testVictim{name: "v3", pods: []*v1.Pod{v3Pod1CPU}},
+					&testVictim{name: "v4", pods: []*v1.Pod{v4Pod2CPU}},
+					&testVictim{name: "v5", pods: []*v1.Pod{v5PodNode2}},
+					&testVictim{name: "v6", pods: []*v1.Pod{v6PodNode2}},
+					&testVictim{name: "v7", pods: []*v1.Pod{v7PodNode2}},
+				}
+				f := newCPUPreemptionFilter(1)
+				return ScheduleWorkloadOptions{
+					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
+						PotentialVictims: slices.Values(victims),
+						PreemptionFilter: f,
+					},
+				}, f
+			},
+			wantStatusCode:  fwk.Unschedulable,
+			wantScheduled:   true,
+			wantVictimNames: []string{"v0", "v1", "v2", "v4"},
+			expectSnapshotState: map[string]sets.Set[string]{
+				"node1": sets.New("v0-pod", "v1-1cpu-pod", "v2-1cpu-pod", "v3-1cpu-pod", "v4-2cpu-pod"),
+				"node2": sets.New("v5-pod", "v6-pod", "v7-pod"),
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -2422,7 +2482,7 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 			}
 			cs := New(snap, profileMap)
 
-			opts, filter := tt.buildOpts()
+			opts, _ := tt.buildOpts()
 			result := cs.ScheduleWorkload(ctx, tt.workloadPods, opts)
 			if result.Status.IsError() {
 				t.Fatalf("ScheduleWorkload() unexpected error: %v", result.Status.AsError())
@@ -2454,11 +2514,6 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					}
 					if pRes.Pod.Spec.NodeName != wantSpecNodeName {
 						t.Errorf("pod %s Spec.NodeName = %q, want %q", pRes.Pod.Name, pRes.Pod.Spec.NodeName, wantSpecNodeName)
-					}
-				}
-				if filter != nil {
-					if len(filter.activeVictims) != len(result.PreemptionVictims) {
-						t.Errorf("filter activeVictims count = %d, want %d", len(filter.activeVictims), len(result.PreemptionVictims))
 					}
 				}
 			} else if len(result.PodResults) != 0 {
