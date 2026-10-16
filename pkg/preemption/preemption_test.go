@@ -123,16 +123,16 @@ func TestEvaluateWorkloadPreemption(t *testing.T) {
 			wantPostFilterCalls: 0,
 		},
 		{
-			name: "nil and empty-pod victims are skipped",
+			name: "nil and empty-pod victims return Error status",
 			potentialVictims: []PreemptionVictim{
 				nil,
 				&testVictim{pods: nil},
 				&testVictim{pods: []*v1.Pod{}},
 			},
 			filter:              newFakeFilter(true),
-			wantStatusCode:      fwk.Unschedulable,
+			wantStatusCode:      fwk.Error,
 			wantPostFilterCalls: 0,
-			wantYieldedCount:    3,
+			wantYieldedCount:    1,
 			wantPreemptCalls:    0,
 		},
 		{

@@ -516,28 +516,29 @@ func (s *ClusterSnapshot) workloadPreemption(
 ) WorkloadSchedulingResult {
 
 	// Evict CommittedVictims and check if it is enough.
-	var committedVictims []PreemptionVictim
 	for _, v := range opts.CommittedVictims {
 		if v == nil || len(v.Pods()) == 0 {
-			continue
+			return WorkloadSchedulingResult{Status: fwk.AsStatus(fmt.Errorf("committed preemption victim cannot be nil nor empty"))}
 		}
 		if _, err := s.PreemptPods(ctx, v.Pods()); err != nil {
 			return WorkloadSchedulingResult{Status: fwk.AsStatus(err)}
 		}
-		committedVictims = append(committedVictims, v)
 		if opts.PreemptionFilter != nil {
 			opts.PreemptionFilter.PreemptVictim(v)
 		}
 	}
 
 	baseSchedulingFunc := sched.BuildPodGroupSchedulingFunc(schedFramework, podGroupInfo)
-	if len(committedVictims) > 0 && (opts.PreemptionFilter == nil || opts.PreemptionFilter.MayFit()) {
+	if len(opts.CommittedVictims) > 0 && (opts.PreemptionFilter == nil || opts.PreemptionFilter.MayFit()) {
 		assignments, status := baseSchedulingFunc(ctx)
+		if status.IsError() {
+			return WorkloadSchedulingResult{Status: status}
+		}
 		if status.IsSuccess() {
 			return WorkloadSchedulingResult{
 				Status:            initialStatus,
 				PodResults:        buildWorkloadPodResults(assignments),
-				PreemptionVictims: committedVictims,
+				PreemptionVictims: opts.CommittedVictims,
 			}
 		}
 	}
@@ -561,7 +562,7 @@ func (s *ClusterSnapshot) workloadPreemption(
 	return WorkloadSchedulingResult{
 		Status:            initialStatus,
 		PodResults:        buildWorkloadPodResults(assignments),
-		PreemptionVictims: slices.Concat(committedVictims, preemptedVictims),
+		PreemptionVictims: slices.Concat(opts.CommittedVictims, preemptedVictims),
 	}
 }
 

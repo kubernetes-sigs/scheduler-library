@@ -2074,6 +2074,7 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 		wantScheduled       bool
 		wantVictimNames     []string
 		expectSnapshotState map[string]sets.Set[string]
+		wantError           bool
 	}{
 		{
 			name:         "Workload fits without preemption when sufficient capacity is free",
@@ -2377,7 +2378,7 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 			},
 		},
 		{
-			name:         "CommittedVictims with spare capacity and nil entry does not mutate caller slice or include nil victims",
+			name:         "CommittedVictims with nil entry returns error",
 			nodes:        []*v1.Node{node8CPU},
 			existingPods: []*v1.Pod{vCommittedPod, v1Pod2CPU, v2Pod2CPU, v3Pod2CPU},
 			workloadPods: []*v1.Pod{
@@ -2398,12 +2399,13 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					},
 				}, nil
 			},
-			wantStatusCode:  fwk.Unschedulable,
-			wantScheduled:   true,
-			wantVictimNames: []string{"vCommitted", "v1"},
+			wantStatusCode:  fwk.Error,
+			wantScheduled:   false,
+			wantVictimNames: nil,
 			expectSnapshotState: map[string]sets.Set[string]{
 				"node1": sets.New("v-committed", "v1-pod", "v2-pod", "v3-pod"),
 			},
+			wantError: true,
 		},
 	}
 
@@ -2424,8 +2426,8 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 
 			opts, filter := tt.buildOpts()
 			result := cs.ScheduleWorkload(ctx, tt.workloadPods, opts)
-			if result.Status.IsError() {
-				t.Fatalf("ScheduleWorkload() unexpected error: %v", result.Status.AsError())
+			if result.Status.IsError() != tt.wantError {
+				t.Fatalf("ScheduleWorkload() error = %v, wantErr %v", result.Status.AsError(), tt.wantError)
 			}
 
 			if result.Status.Code() != tt.wantStatusCode {
