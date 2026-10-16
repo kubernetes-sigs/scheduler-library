@@ -12,22 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package preemption
+package preemption_test
 
 import (
-	"context"
-	"errors"
 	"slices"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
+	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
-	upstreampreemption "sigs.k8s.io/scheduler-library/pkg/upstreamsync/preemption"
+	ft "sigs.k8s.io/scheduler-library/pkg/framework/testing"
+	"sigs.k8s.io/scheduler-library/pkg/preemption"
+	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
+	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
+	testutils "sigs.k8s.io/scheduler-library/pkg/upstreamsync/testutils"
 )
 
 type testVictim struct {
+	name string
 	pods []*v1.Pod
 }
 
@@ -35,317 +40,268 @@ func (v *testVictim) Pods() []*v1.Pod {
 	return v.pods
 }
 
+func (v *testVictim) String() string {
+	return v.name
+}
+
+func makeNode(name, cpu string) *v1.Node {
+	return st.MakeNode().Name(name).Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    cpu,
+		v1.ResourceMemory: "8Gi",
+		v1.ResourcePods:   "10",
+	}).Obj()
+}
+
+func makeVictimOnNode(name, nodeName, cpu string) *testVictim {
+	pod := testutils.MakePod(name+"-pod", "", cpu)
+	pod.Spec.NodeName = nodeName
+	return &testVictim{
+		name: name,
+		pods: []*v1.Pod{pod},
+	}
+}
+
 type fakeFilter struct {
 	fit             bool
 	minVictims      int
-	preemptCalls    int
-	unpreemptCalls  int
-	activeVictimSet map[PreemptionVictim]bool
+	activeVictimSet sets.Set[preemption.PreemptionVictim]
 }
 
 func newFakeFilter(fit bool) *fakeFilter {
 	return &fakeFilter{
 		fit:             fit,
-		activeVictimSet: make(map[PreemptionVictim]bool),
+		activeVictimSet: sets.New[preemption.PreemptionVictim](),
 	}
 }
 
-func (f *fakeFilter) PreemptVictim(v PreemptionVictim) {
-	f.preemptCalls++
-	f.activeVictimSet[v] = true
+func newMinVictimsFilter(minVictims int) *fakeFilter {
+	return &fakeFilter{
+		minVictims:      minVictims,
+		activeVictimSet: sets.New[preemption.PreemptionVictim](),
+	}
 }
 
-func (f *fakeFilter) UnpreemptVictim(v PreemptionVictim) {
-	f.unpreemptCalls++
-	delete(f.activeVictimSet, v)
+func (f *fakeFilter) PreemptVictim(v preemption.PreemptionVictim) {
+	f.activeVictimSet.Insert(v)
+}
+
+func (f *fakeFilter) UnpreemptVictim(v preemption.PreemptionVictim) {
+	f.activeVictimSet.Delete(v)
 }
 
 func (f *fakeFilter) MayFit() bool {
 	if f.minVictims > 0 {
-		return len(f.activeVictimSet) >= f.minVictims
+		return f.activeVictimSet.Len() >= f.minVictims
 	}
 	return f.fit
 }
 
-type mockFramework struct {
-	framework.Framework
-	postFilterCalls int
-	postFilterFn    func(ctx context.Context, state *framework.CycleState, podGroupInfo fwk.PodGroupInfo, pgSchedulingFunc fwk.PodGroupSchedulingFunc) (*fwk.PodGroupPostFilterResult, *fwk.Status)
-}
-
-func (m *mockFramework) RunPodGroupPostFilterPlugins(
-	ctx context.Context,
-	state *framework.CycleState,
-	podGroupInfo fwk.PodGroupInfo,
-	pgSchedulingFunc fwk.PodGroupSchedulingFunc,
-) (*fwk.PodGroupPostFilterResult, *fwk.Status) {
-	m.postFilterCalls++
-	if m.postFilterFn != nil {
-		return m.postFilterFn(ctx, state, podGroupInfo, pgSchedulingFunc)
-	}
-	return nil, fwk.NewStatus(fwk.Unschedulable)
-}
-
 func TestEvaluateWorkloadPreemption(t *testing.T) {
-	ctx := context.Background()
-	pod1 := st.MakePod().Namespace("default").Name("p1").Node("n1").Obj()
-	pod2 := st.MakePod().Namespace("default").Name("p2").Node("n1").Obj()
-	pod3 := st.MakePod().Namespace("default").Name("p3").Node("n1").Obj()
+	ctx := t.Context()
 
-	v1Victim := &testVictim{pods: []*v1.Pod{pod1}}
-	v2Victim := &testVictim{pods: []*v1.Pod{pod2}}
-	v3Victim := &testVictim{pods: []*v1.Pod{pod3}}
+	gangPG := testutils.MakeGangPodGroup("gang-pg", "", 1)
 
-	assignments1 := &fwk.PodGroupAssignments{}
-	assignments2 := &fwk.PodGroupAssignments{}
-	expectedErr := errors.New("postfilter plugin error")
+	// Victims for 6-CPU node1 scenarios:
+	v2CPUa := makeVictimOnNode("v2CPUa", "node1", "2")
+	v2CPUb := makeVictimOnNode("v2CPUb", "node1", "2")
+	v2CPUc := makeVictimOnNode("v2CPUc", "node1", "2")
+	v4CPU := makeVictimOnNode("v4CPU", "node1", "4")
+
+	// Victims for 10-CPU node1 binary-search scenario (workload requests 6 CPU):
+	b0 := makeVictimOnNode("b0", "node1", "1")
+	b1 := makeVictimOnNode("b1", "node1", "1")
+	b2 := makeVictimOnNode("b2", "node1", "1")
+	b3 := makeVictimOnNode("b3", "node1", "1")
+	b4 := makeVictimOnNode("b4", "node1", "1")
+	b5 := makeVictimOnNode("b5", "node1", "1")
+	b6 := makeVictimOnNode("b6", "node1", "4")
+	b7 := makeVictimOnNode("b7", "node2", "1")
+	b8 := makeVictimOnNode("b8", "node2", "1")
+	b9 := makeVictimOnNode("b9", "node2", "1")
+	tenSearchVictims := []preemption.PreemptionVictim{b0, b1, b2, b3, b4, b5, b6, b7, b8, b9}
 
 	tests := []struct {
-		name                string
-		nilPotentialVictims bool
-		potentialVictims    []PreemptionVictim
-		filter              *fakeFilter
-		baseSchedFn         fwk.PodGroupSchedulingFunc
-		postFilterFn        func(ctx context.Context, pf *upstreampreemption.PreemptionFramework, pgInfo fwk.PodGroupInfo, pgSchedulingFunc fwk.PodGroupSchedulingFunc) (*fwk.PodGroupPostFilterResult, *fwk.Status)
-		wantStatusCode      fwk.Code
-		wantErr             error
-		wantAssignments     *fwk.PodGroupAssignments
-		wantVictims         []PreemptionVictim
-		wantPostFilterCalls int
-		wantYieldedCount    int
-		wantPreemptCalls    int
-		wantActiveVictims   map[PreemptionVictim]bool
+		name             string
+		nodes            []*v1.Node
+		workloadCPU      string
+		potentialVictims []preemption.PreemptionVictim
+		filter           *fakeFilter
+		wantStatusCode   fwk.Code
+		wantVictims      []preemption.PreemptionVictim
 	}{
 		{
-			name:                "nil PotentialVictims returns Unschedulable",
-			nilPotentialVictims: true,
-			wantStatusCode:      fwk.Unschedulable,
-			wantPostFilterCalls: 0,
+			name:           "nil PotentialVictims returns Unschedulable",
+			nodes:          []*v1.Node{makeNode("node1", "6")},
+			workloadCPU:    "4",
+			wantStatusCode: fwk.Unschedulable,
 		},
 		{
-			name: "nil and empty-pod victims are skipped",
-			potentialVictims: []PreemptionVictim{
+			name:        "nil and empty-pod victims are skipped",
+			nodes:       []*v1.Node{makeNode("node1", "6")},
+			workloadCPU: "4",
+			potentialVictims: []preemption.PreemptionVictim{
 				nil,
-				&testVictim{pods: nil},
-				&testVictim{pods: []*v1.Pod{}},
+				&testVictim{name: "nil-pods", pods: nil},
+				&testVictim{name: "empty-pods", pods: []*v1.Pod{}},
 			},
-			filter:              newFakeFilter(true),
-			wantStatusCode:      fwk.Unschedulable,
-			wantPostFilterCalls: 0,
-			wantYieldedCount:    3,
-			wantPreemptCalls:    0,
+			filter:         newFakeFilter(true),
+			wantStatusCode: fwk.Unschedulable,
 		},
 		{
-			name: "victim with nil pod returns Error status",
-			potentialVictims: []PreemptionVictim{
-				&testVictim{pods: []*v1.Pod{nil}},
+			name:        "victim with nil pod returns Error status",
+			nodes:       []*v1.Node{makeNode("node1", "6")},
+			workloadCPU: "4",
+			potentialVictims: []preemption.PreemptionVictim{
+				&testVictim{name: "nil-pod", pods: []*v1.Pod{nil}},
 			},
-			wantStatusCode:      fwk.Error,
-			wantPostFilterCalls: 0,
-			wantYieldedCount:    1,
+			wantStatusCode: fwk.Error,
 		},
 		{
-			name:             "prefix search stops at first fitting prefix and resets PreemptionManager",
-			potentialVictims: []PreemptionVictim{v1Victim, v2Victim, v3Victim},
-			baseSchedFn: func(_ context.Context) (*fwk.PodGroupAssignments, *fwk.Status) {
-				return assignments1, fwk.NewStatus(fwk.Success)
-			},
-			postFilterFn: func(ctx context.Context, pf *upstreampreemption.PreemptionFramework, pgInfo fwk.PodGroupInfo, pgSchedulingFunc fwk.PodGroupSchedulingFunc) (*fwk.PodGroupPostFilterResult, *fwk.Status) {
-				pm := pf.PreemptionManager()
-				victims, status := pm.GenerateVictims(ctx, pgInfo)
-				if !status.IsSuccess() {
-					return nil, status
-				}
-				if len(victims) < 2 {
-					return nil, fwk.NewStatus(fwk.Unschedulable)
-				}
-				if _, schedStatus := pgSchedulingFunc(ctx); !schedStatus.IsSuccess() {
-					return nil, schedStatus
-				}
-				return &fwk.PodGroupPostFilterResult{}, fwk.NewStatus(fwk.Success)
-			},
-			wantStatusCode:      fwk.Success,
-			wantAssignments:     assignments1,
-			wantVictims:         []PreemptionVictim{v1Victim, v2Victim},
-			wantPostFilterCalls: 2,
-			wantYieldedCount:    2,
+			name:             "prefix search stops at first fitting prefix",
+			nodes:            []*v1.Node{makeNode("node1", "6")},
+			workloadCPU:      "4",
+			potentialVictims: []preemption.PreemptionVictim{v2CPUa, v2CPUb, v2CPUc},
+			wantStatusCode:   fwk.Success,
+			wantVictims:      []preemption.PreemptionVictim{v2CPUa, v2CPUb},
 		},
 		{
-			name:             "PreemptionFilter skips RunPodGroupPostFilterPlugins until MayFit is true",
-			potentialVictims: []PreemptionVictim{v1Victim, v2Victim, v3Victim},
-			filter: &fakeFilter{
-				fit:             false,
-				minVictims:      2,
-				activeVictimSet: make(map[PreemptionVictim]bool),
-			},
-			baseSchedFn: func(_ context.Context) (*fwk.PodGroupAssignments, *fwk.Status) {
-				return assignments1, fwk.NewStatus(fwk.Success)
-			},
-			postFilterFn: func(ctx context.Context, pf *upstreampreemption.PreemptionFramework, pgInfo fwk.PodGroupInfo, pgSchedulingFunc fwk.PodGroupSchedulingFunc) (*fwk.PodGroupPostFilterResult, *fwk.Status) {
-				pm := pf.PreemptionManager()
-				victims, _ := pm.GenerateVictims(ctx, pgInfo)
-				if len(victims) != 2 {
-					t.Errorf("expected 2 accumulated victims when PostFilter runs, got %d", len(victims))
-				}
-				if _, schedStatus := pgSchedulingFunc(ctx); !schedStatus.IsSuccess() {
-					return nil, schedStatus
-				}
-				return &fwk.PodGroupPostFilterResult{}, fwk.NewStatus(fwk.Success)
-			},
-			wantStatusCode:      fwk.Success,
-			wantAssignments:     assignments1,
-			wantVictims:         []PreemptionVictim{v1Victim, v2Victim},
-			wantPostFilterCalls: 1,
-			wantYieldedCount:    2,
-			wantPreemptCalls:    2,
+			name:             "PreemptionFilter skips probes until MayFit is true",
+			nodes:            []*v1.Node{makeNode("node1", "6")},
+			workloadCPU:      "2",
+			potentialVictims: []preemption.PreemptionVictim{v2CPUa, v2CPUb, v2CPUc},
+			filter:           newMinVictimsFilter(2),
+			wantStatusCode:   fwk.Success,
+			wantVictims:      []preemption.PreemptionVictim{v2CPUa, v2CPUb},
 		},
 		{
-			name:             "reprieval filters out reprieved victims and preserves last successful assignments",
-			potentialVictims: []PreemptionVictim{v1Victim, v2Victim},
+			name:             "reprieval spares unneeded lower-priority victim when second victim suffices",
+			nodes:            []*v1.Node{makeNode("node1", "6")},
+			workloadCPU:      "4",
+			potentialVictims: []preemption.PreemptionVictim{v2CPUa, v4CPU},
 			filter:           newFakeFilter(true),
-			baseSchedFn: func() fwk.PodGroupSchedulingFunc {
-				schedCalls := 0
-				return func(_ context.Context) (*fwk.PodGroupAssignments, *fwk.Status) {
-					schedCalls++
-					switch schedCalls {
-					case 1:
-						return assignments1, fwk.NewStatus(fwk.Success)
-					case 2:
-						return nil, fwk.NewStatus(fwk.Unschedulable)
-					case 3:
-						return assignments2, fwk.NewStatus(fwk.Success)
-					default:
-						return nil, fwk.NewStatus(fwk.Unschedulable)
-					}
-				}
-			}(),
-			postFilterFn: func(ctx context.Context, pf *upstreampreemption.PreemptionFramework, pgInfo fwk.PodGroupInfo, pgSchedulingFunc fwk.PodGroupSchedulingFunc) (*fwk.PodGroupPostFilterResult, *fwk.Status) {
-				pm := pf.PreemptionManager()
-				victims, _ := pm.GenerateVictims(ctx, pgInfo)
-				if len(victims) < 2 {
-					return nil, fwk.NewStatus(fwk.Unschedulable)
-				}
-				// Initial fit check with all victims removed succeeds (assignments1).
-				if _, schedStatus := pgSchedulingFunc(ctx); !schedStatus.IsSuccess() {
-					return nil, schedStatus
-				}
-				rf := pm.NewReprieveFilter(ctx, victims)
-				// Reprieving victims[1] (v2Victim) fails scheduling check (returns nil, Unschedulable).
-				if ok, err := rf.ShouldAttemptReprieval(ctx, victims[1]); err != nil || !ok {
-					t.Fatalf("expected ShouldAttemptReprieval for victims[1] to succeed, got %v, %v", ok, err)
-				}
-				if _, schedStatus := pgSchedulingFunc(ctx); schedStatus.IsSuccess() {
-					t.Fatalf("expected second scheduling call to fail")
-				}
-				// Reprieving victims[0] (v1Victim) succeeds scheduling check (assignments2).
-				if ok, err := rf.ShouldAttemptReprieval(ctx, victims[0]); err != nil || !ok {
-					t.Fatalf("expected ShouldAttemptReprieval for victims[0] to succeed, got %v, %v", ok, err)
-				}
-				if _, schedStatus := pgSchedulingFunc(ctx); !schedStatus.IsSuccess() {
-					t.Fatalf("expected third scheduling call to succeed, got %v", schedStatus)
-				}
-				if err := rf.OnVictimReprieved(ctx, victims[0]); err != nil {
-					t.Fatalf("unexpected error in OnVictimReprieved: %v", err)
-				}
-
-				return &fwk.PodGroupPostFilterResult{}, fwk.NewStatus(fwk.Success)
-			},
-			wantStatusCode:      fwk.Success,
-			wantAssignments:     assignments2,
-			wantVictims:         []PreemptionVictim{v2Victim},
-			wantPostFilterCalls: 2,
-			wantYieldedCount:    2,
-			wantPreemptCalls:    4,
-			wantActiveVictims:   map[PreemptionVictim]bool{v2Victim: true},
+			wantStatusCode:   fwk.Success,
+			wantVictims:      []preemption.PreemptionVictim{v4CPU},
 		},
 		{
-			name:             "RunPodGroupPostFilterPlugins error aborts immediately",
-			potentialVictims: []PreemptionVictim{v1Victim, v2Victim},
-			postFilterFn: func(_ context.Context, _ *upstreampreemption.PreemptionFramework, _ fwk.PodGroupInfo, _ fwk.PodGroupSchedulingFunc) (*fwk.PodGroupPostFilterResult, *fwk.Status) {
-				return nil, fwk.AsStatus(expectedErr)
+			name: "exponential and binary search narrows prefix to k*=6 before reprieval, protecting higher-priority victim b6",
+			nodes: []*v1.Node{
+				makeNode("node1", "10"),
+				makeNode("node2", "3"),
 			},
-			wantStatusCode:      fwk.Error,
-			wantErr:             expectedErr,
-			wantPostFilterCalls: 1,
-			wantYieldedCount:    1,
+			workloadCPU:      "6",
+			potentialVictims: tenSearchVictims,
+			wantStatusCode:   fwk.Success,
+			wantVictims:      []preemption.PreemptionVictim{b0, b1, b2, b3, b4, b5},
+		},
+		{
+			name:             "trailing partial exponential step when iterator ends mid-step (N=6 between 4 and 8)",
+			nodes:            []*v1.Node{makeNode("node1", "6")},
+			workloadCPU:      "6",
+			potentialVictims: []preemption.PreemptionVictim{b0, b1, b2, b3, b4, b5},
+			wantStatusCode:   fwk.Success,
+			wantVictims:      []preemption.PreemptionVictim{b0, b1, b2, b3, b4, b5},
+		},
+		{
+			name: "quota fast-forward (min 3 victims) combined with exponential/binary search and reprieval",
+			nodes: []*v1.Node{
+				makeNode("node1", "6"),
+				makeNode("node2", "3"),
+			},
+			workloadCPU: "4",
+			potentialVictims: []preemption.PreemptionVictim{
+				b7, b8, b9, b0, b1, v4CPU,
+			},
+			filter:         newMinVictimsFilter(3),
+			wantStatusCode: fwk.Success,
+			// v4CPU is kept for node1; b1, b0, b9 are reprieved;
+			// b7 and b8 are kept because MayFit() requires at least 3 victims.
+			wantVictims: []preemption.PreemptionVictim{b7, b8, v4CPU},
+		},
+		{
+			name:             "PreemptionFilter MayFit never satisfied returns Unschedulable",
+			nodes:            []*v1.Node{makeNode("node1", "6")},
+			workloadCPU:      "4",
+			potentialVictims: []preemption.PreemptionVictim{v4CPU, v2CPUa},
+			filter:           newFakeFilter(false),
+			wantStatusCode:   fwk.Unschedulable,
 		},
 		{
 			name:             "all potential victims insufficient returns Unschedulable",
-			potentialVictims: []PreemptionVictim{v1Victim, v2Victim},
-			postFilterFn: func(_ context.Context, _ *upstreampreemption.PreemptionFramework, _ fwk.PodGroupInfo, _ fwk.PodGroupSchedulingFunc) (*fwk.PodGroupPostFilterResult, *fwk.Status) {
-				return nil, fwk.NewStatus(fwk.Unschedulable)
-			},
-			wantStatusCode:      fwk.Unschedulable,
-			wantPostFilterCalls: 2,
-			wantYieldedCount:    2,
+			nodes:            []*v1.Node{makeNode("node1", "4")},
+			workloadCPU:      "6",
+			potentialVictims: []preemption.PreemptionVictim{v2CPUa, v2CPUb},
+			filter:           newFakeFilter(true),
+			wantStatusCode:   fwk.Unschedulable,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var pf *upstreampreemption.PreemptionFramework
-			mf := &mockFramework{
-				postFilterFn: func(ctx context.Context, _ *framework.CycleState, pgInfo fwk.PodGroupInfo, pgSchedulingFunc fwk.PodGroupSchedulingFunc) (*fwk.PodGroupPostFilterResult, *fwk.Status) {
-					if tt.postFilterFn != nil {
-						return tt.postFilterFn(ctx, pf, pgInfo, pgSchedulingFunc)
-					}
-					return nil, fwk.NewStatus(fwk.Unschedulable)
-				},
-			}
-			pf = upstreampreemption.NewPreemptionFramework(mf, &NoopPreemptionManager{})
-
-			yieldedCount := 0
-			var opts WorkloadPreemptionOptions
-			if tt.filter != nil {
-				opts.PreemptionFilter = tt.filter
-			}
-			if !tt.nilPotentialVictims {
-				opts.PotentialVictims = func(yield func(PreemptionVictim) bool) {
-					for _, v := range tt.potentialVictims {
-						yieldedCount++
-						if !yield(v) {
-							return
-						}
+			var existingPods []*v1.Pod
+			for _, v := range tt.potentialVictims {
+				if v == nil {
+					continue
+				}
+				for _, p := range v.Pods() {
+					if p != nil {
+						existingPods = append(existingPods, p.DeepCopy())
 					}
 				}
 			}
 
-			gotAssignments, gotVictims, gotStatus := EvaluateWorkloadPreemption(
-				ctx, pf, framework.NewCycleState(), nil, tt.baseSchedFn, opts,
+			profileMap, snap, err := ft.SetupSnapshotTestWithPodGroups(
+				ctx,
+				t,
+				existingPods,
+				tt.nodes,
+				[]*schedulingv1beta1.PodGroup{gangPG},
+				nil,
+			)
+			if err != nil {
+				t.Fatalf("SetupSnapshotTestWithPodGroups failed: %v", err)
+			}
+
+			workloadPod := testutils.MakePod("w-pod", "gang-pg", tt.workloadCPU)
+			podGroupInfo, err := snapshot.BuildGroupHierarchyForTest(snap, []*v1.Pod{workloadPod})
+			if err != nil {
+				t.Fatalf("BuildGroupHierarchyForTest failed: %v", err)
+			}
+			schedFramework, err := profileMap.FrameworkForPodGroup(podGroupInfo)
+			if err != nil {
+				t.Fatalf("FrameworkForPodGroup failed: %v", err)
+			}
+
+			sched := upstreamsync.NewScheduler(snap, 0, 0, 1, nil)
+			baseSchedFn := sched.BuildPodGroupSchedulingFunc(schedFramework, podGroupInfo)
+
+			var opts preemption.WorkloadPreemptionOptions
+			if tt.filter != nil {
+				opts.PreemptionFilter = tt.filter
+			}
+			if tt.potentialVictims != nil {
+				opts.PotentialVictims = slices.Values(tt.potentialVictims)
+			}
+
+			gotAssignments, gotVictims, gotStatus := preemption.EvaluateWorkloadPreemption(
+				ctx, schedFramework, framework.NewCycleState(), podGroupInfo, baseSchedFn, opts,
 			)
 			if gotStatus.Code() != tt.wantStatusCode {
 				t.Fatalf("EvaluateWorkloadPreemption() Status.Code() = %v, want %v (status: %v)", gotStatus.Code(), tt.wantStatusCode, gotStatus)
 			}
-			if tt.wantErr != nil && !errors.Is(gotStatus.AsError(), tt.wantErr) {
-				t.Errorf("EvaluateWorkloadPreemption() error = %v, want %v", gotStatus.AsError(), tt.wantErr)
-			}
-			if gotAssignments != tt.wantAssignments {
-				t.Errorf("EvaluateWorkloadPreemption() assignments = %v, want %v", gotAssignments, tt.wantAssignments)
-			}
 			if !slices.Equal(gotVictims, tt.wantVictims) {
 				t.Errorf("EvaluateWorkloadPreemption() victims = %v, want %v", gotVictims, tt.wantVictims)
 			}
-			if mf.postFilterCalls != tt.wantPostFilterCalls {
-				t.Errorf("RunPodGroupPostFilterPlugins calls = %d, want %d", mf.postFilterCalls, tt.wantPostFilterCalls)
+			if _, ok := schedFramework.PreemptionManager().(*preemption.NoopPreemptionManager); !ok {
+				t.Errorf("expected PreemptionManager to be reset to NoopPreemptionManager, got %T", schedFramework.PreemptionManager())
 			}
-			if yieldedCount != tt.wantYieldedCount {
-				t.Errorf("yielded victims = %d, want %d", yieldedCount, tt.wantYieldedCount)
-			}
-			if tt.filter != nil && tt.filter.preemptCalls != tt.wantPreemptCalls {
-				t.Errorf("filter.preemptCalls = %d, want %d", tt.filter.preemptCalls, tt.wantPreemptCalls)
-			}
-			if tt.wantActiveVictims != nil {
-				for v, wantActive := range tt.wantActiveVictims {
-					if tt.filter.activeVictimSet[v] != wantActive {
-						t.Errorf("filter.activeVictimSet[%v] = %v, want %v", v, tt.filter.activeVictimSet[v], wantActive)
-					}
+			if !gotStatus.IsSuccess() {
+				if gotAssignments != nil {
+					t.Errorf("EvaluateWorkloadPreemption() assignments = %v, want nil", gotAssignments)
 				}
-				if len(tt.filter.activeVictimSet) != len(tt.wantActiveVictims) {
-					t.Errorf("filter.activeVictimSet = %v, want %v", tt.filter.activeVictimSet, tt.wantActiveVictims)
-				}
+				return
 			}
-			if _, ok := pf.PreemptionManager().(*NoopPreemptionManager); !ok {
-				t.Errorf("expected PreemptionManager to be reset to NoopPreemptionManager, got %T", pf.PreemptionManager())
+			if gotAssignments == nil || len(gotAssignments.ProposedAssignments) != 1 {
+				t.Errorf("EvaluateWorkloadPreemption() assignments = %v, want 1 proposed assignment", gotAssignments)
 			}
 		})
 	}

@@ -28,13 +28,13 @@ import (
 	upstreampreemption "sigs.k8s.io/scheduler-library/pkg/upstreamsync/preemption"
 )
 
-// EvaluateWorkloadPreemption incrementally adds victims from opts.PotentialVictims
-// until the workload fits. For each victim, if opts.PreemptionFilter is set, it marks
-// the victim as preempted and skips scheduler evaluation until MayFit returns true.
-// When MayFit is true, it runs PodGroupPostFilter plugins, which remove all accumulated
-// victims, test if the workload schedules, and reprieve victims in reverse order.
-// It stops at the first fitting iteration and returns the last successful
-// PodGroupAssignments along with the victims that were not reprieved.
+// EvaluateWorkloadPreemption finds the minimal prefix of victims from opts.PotentialVictims
+// that allows the workload to fit and then reprieves unneeded victims in reverse order.
+// If opts.PreemptionFilter is set, it first fast-forwards through candidate victims until
+// MayFit returns true. Once MayFit holds, it uses exponential and binary search (with reprieval
+// disabled) to locate the minimal fitting prefix, followed by a final reprieval pass on the
+// minimal winning prefix.
+// It returns the last successful PodGroupAssignments along with the victims that were not reprieved.
 func EvaluateWorkloadPreemption(
 	ctx context.Context,
 	schedFramework *upstreampreemption.PreemptionFramework,
@@ -60,6 +60,25 @@ func EvaluateWorkloadPreemption(
 		return assignments, status
 	}
 
+	probe := func(allowReprieve bool) (bool, *fwk.Status) {
+		pm.allowReprieve = allowReprieve
+		_, status := schedFramework.RunPodGroupPostFilterPlugins(ctx, podGroupCycleState, podGroupInfo, pgSchedulingFunc)
+		if status.IsError() {
+			return false, status
+		}
+		return status.IsSuccess(), nil
+	}
+
+	// Step 2a: Quota Fast-Forward & Exponential Search over opts.PotentialVictims.
+	// base tracks the largest prefix where PreemptionFilter.MayFit() was false.
+	// Once MayFit() holds (quotaSatisfied = true), monotonicity guarantees MayFit()
+	// stays true for all prefixes > base, and we probe at base + 1, base + 2, base + 4, base + 8, ...
+	base := 0
+	lo := 0
+	offset := 1
+	found := false
+	quotaSatisfied := opts.PreemptionFilter == nil
+
 	for v := range opts.PotentialVictims {
 		if v == nil || len(v.Pods()) == 0 {
 			continue
@@ -70,23 +89,77 @@ func EvaluateWorkloadPreemption(
 		}
 		pm.addVictim(sv)
 
-		if opts.PreemptionFilter != nil {
-			opts.PreemptionFilter.PreemptVictim(v)
+		if !quotaSatisfied {
+			pm.syncFilter(pm.cursor)
 			if !opts.PreemptionFilter.MayFit() {
+				base = pm.cursor
+				lo = pm.cursor
 				continue
 			}
+			quotaSatisfied = true
 		}
 
-		_, postFilterStatus := schedFramework.RunPodGroupPostFilterPlugins(ctx, podGroupCycleState, podGroupInfo, pgSchedulingFunc)
-		if postFilterStatus.IsError() {
-			return nil, nil, postFilterStatus
+		if pm.cursor != base+offset {
+			continue
 		}
-		if postFilterStatus.IsSuccess() {
-			return lastAssignments, pm.preemptedVictims(), nil
+
+		fits, errStatus := probe(false)
+		if errStatus != nil {
+			return nil, nil, errStatus
+		}
+		if fits {
+			found = true
+			break
+		}
+		lo = pm.cursor
+		offset *= 2
+	}
+
+	// If the iterator ended mid-step with unprobed victims above lo, probe the full slice.
+	if !found {
+		if pm.cursor <= lo {
+			return nil, nil, fwk.NewStatus(fwk.Unschedulable)
+		}
+		fits, errStatus := probe(false)
+		if errStatus != nil {
+			return nil, nil, errStatus
+		}
+		if !fits {
+			return nil, nil, fwk.NewStatus(fwk.Unschedulable)
 		}
 	}
 
-	return nil, nil, fwk.NewStatus(fwk.Unschedulable)
+	// Step 2b: Binary Search over (lo, hi] with allowReprieve = false to locate minimal k* = hi.
+	hi := pm.cursor
+	for lo+1 < hi {
+		mid := lo + (hi-lo)/2
+		pm.cursor = mid
+		fits, errStatus := probe(false)
+		if errStatus != nil {
+			return nil, nil, errStatus
+		}
+		if fits {
+			hi = mid
+		} else {
+			lo = mid
+		}
+	}
+
+	// Step 3: Final Reprieval pass on minimal prefix V[0:hi] with allowReprieve = true.
+	// Note: Step 3 intentionally re-runs RunPodGroupPostFilterPlugins (and thus podGroupSchedulingFunc)
+	// on V[0:hi] to respect upstream PodGroupEvaluator.Preempt's StartMutations/EndMutations lifecycle.
+	// Avoiding the second podGroupSchedulingFunc call at hi by reusing the placement from Step 2
+	// is a potential future optimization if profiling ever indicates a bottleneck.
+	pm.cursor = hi
+	pm.syncFilter(hi)
+	fits, errStatus := probe(true)
+	if errStatus != nil {
+		return nil, nil, errStatus
+	}
+	if !fits {
+		return nil, nil, fwk.NewStatus(fwk.Unschedulable)
+	}
+	return lastAssignments, pm.preemptedVictims(), nil
 }
 
 // simPreemptionVictim adapts a PreemptionVictim to the framework's PreemptionVictim interface.
@@ -135,7 +208,10 @@ func (v *simPreemptionVictim) NumPDBViolations() int {
 type prefixPreemptionManager struct {
 	NoopPreemptionManager
 	victims          []*simPreemptionVictim
+	cursor           int
+	filterCursor     int
 	preemptionFilter PreemptionFilter
+	allowReprieve    bool
 }
 
 var _ upstreampreemption.PreemptionManager = (*prefixPreemptionManager)(nil)
@@ -148,15 +224,27 @@ func newPrefixPreemptionManager(filter PreemptionFilter) *prefixPreemptionManage
 
 func (pm *prefixPreemptionManager) addVictim(sv *simPreemptionVictim) {
 	pm.victims = append(pm.victims, sv)
+	pm.cursor++
+}
+
+func (pm *prefixPreemptionManager) syncFilter(target int) {
+	if pm.preemptionFilter == nil {
+		pm.filterCursor = target
+		return
+	}
+	for pm.filterCursor < target {
+		pm.preemptionFilter.PreemptVictim(pm.victims[pm.filterCursor].victim)
+		pm.filterCursor++
+	}
 }
 
 func (pm *prefixPreemptionManager) GenerateVictims(
 	_ context.Context,
 	_ fwk.PodGroupInfo,
 ) ([]upstreampreemption.PreemptionVictim, *fwk.Status) {
-	res := make([]upstreampreemption.PreemptionVictim, len(pm.victims))
-	for i, sv := range pm.victims {
-		res[i] = sv
+	res := make([]upstreampreemption.PreemptionVictim, pm.cursor)
+	for i := range pm.cursor {
+		res[i] = pm.victims[i]
 	}
 	return res, nil
 }
@@ -165,12 +253,15 @@ func (pm *prefixPreemptionManager) NewReprieveFilter(
 	_ context.Context,
 	_ []upstreampreemption.PreemptionVictim,
 ) upstreampreemption.ReprieveFilter {
-	return &workloadReprieveFilter{filter: pm.preemptionFilter}
+	return &workloadReprieveFilter{
+		allowReprieve: pm.allowReprieve,
+		filter:        pm.preemptionFilter,
+	}
 }
 
 func (pm *prefixPreemptionManager) preemptedVictims() []PreemptionVictim {
 	var res []PreemptionVictim
-	for _, sv := range pm.victims {
+	for _, sv := range pm.victims[:pm.cursor] {
 		if !sv.reprieved {
 			res = append(res, sv.victim)
 		}
@@ -180,7 +271,9 @@ func (pm *prefixPreemptionManager) preemptedVictims() []PreemptionVictim {
 
 // workloadReprieveFilter evaluates and tracks victim reprieval using PreemptionFilter.
 type workloadReprieveFilter struct {
-	filter PreemptionFilter
+	allowReprieve           bool
+	filter                  PreemptionFilter
+	previousVictimToPreempt PreemptionVictim
 }
 
 var _ upstreampreemption.ReprieveFilter = (*workloadReprieveFilter)(nil)
@@ -189,17 +282,27 @@ func (rf *workloadReprieveFilter) ShouldAttemptReprieval(
 	_ context.Context,
 	victim upstreampreemption.PreemptionVictim,
 ) (bool, error) {
+	if !rf.allowReprieve {
+		return false, nil
+	}
 	if rf.filter == nil {
 		return true, nil
+	}
+	if rf.previousVictimToPreempt != nil {
+		rf.filter.PreemptVictim(rf.previousVictimToPreempt)
+		rf.previousVictimToPreempt = nil
 	}
 	sv, ok := victim.(*simPreemptionVictim)
 	if !ok {
 		return false, fmt.Errorf("unexpected PreemptionVictim type %T", victim)
 	}
 	rf.filter.UnpreemptVictim(sv.victim)
-	mayFit := rf.filter.MayFit()
-	rf.filter.PreemptVictim(sv.victim)
-	return mayFit, nil
+	if !rf.filter.MayFit() {
+		rf.filter.PreemptVictim(sv.victim)
+		return false, nil
+	}
+	rf.previousVictimToPreempt = sv.victim
+	return true, nil
 }
 
 func (rf *workloadReprieveFilter) OnVictimReprieved(
@@ -211,9 +314,7 @@ func (rf *workloadReprieveFilter) OnVictimReprieved(
 		return fmt.Errorf("unexpected PreemptionVictim type %T", victim)
 	}
 	sv.reprieved = true
-	if rf.filter != nil {
-		rf.filter.UnpreemptVictim(sv.victim)
-	}
+	rf.previousVictimToPreempt = nil
 	return nil
 }
 
