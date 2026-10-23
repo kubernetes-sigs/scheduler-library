@@ -15,10 +15,8 @@
 // Package snapshot provides ClusterSnapshot, the in-memory, mutable view of the cluster that all
 // the simulation runs against.
 //
-// Although the package sits under upstreamsync — ClusterSnapshot is expected to be absorbed by
-// kube-scheduler's snapshot handling over time — its methods are the library's simulation API:
-// ClusterSnapshot.MakePlacement, CanSchedulePod, SchedulePods, SchedulePodsByTemplate,
-// PreemptPods, Unpreempt and Transaction.
+// ClusterSnapshot exposes the library's simulation API for evaluating pod and workload scheduling,
+// simulating preemption, mutating cluster state, and managing state rollbacks and transactions.
 //
 // A ClusterSnapshot should be obtained from simulator.SchedulingSimulator, either via
 // NewClusterSnapshot or via NewClusterState followed by state.ClusterState.Snapshot. Calling New

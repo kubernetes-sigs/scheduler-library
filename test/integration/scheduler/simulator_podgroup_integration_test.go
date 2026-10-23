@@ -29,8 +29,9 @@ import (
 	"k8s.io/kubernetes/pkg/features"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	testutils "k8s.io/kubernetes/test/integration/util"
+	"sigs.k8s.io/scheduler-library/pkg/preemption"
 	"sigs.k8s.io/scheduler-library/pkg/simulator"
-	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
+	"sigs.k8s.io/scheduler-library/pkg/snapshot"
 )
 
 const zoneLabel = "topology.kubernetes.io/zone"
@@ -436,7 +437,7 @@ type integrationCPUPreemptionFilter struct {
 	requiredCPU  int64
 }
 
-func (f *integrationCPUPreemptionFilter) PreemptVictim(v snapshot.PreemptionVictim) {
+func (f *integrationCPUPreemptionFilter) PreemptVictim(v preemption.PreemptionVictim) {
 	for _, p := range v.Pods() {
 		for _, c := range p.Spec.Containers {
 			cpu := c.Resources.Requests[v1.ResourceCPU]
@@ -445,7 +446,7 @@ func (f *integrationCPUPreemptionFilter) PreemptVictim(v snapshot.PreemptionVict
 	}
 }
 
-func (f *integrationCPUPreemptionFilter) UnpreemptVictim(v snapshot.PreemptionVictim) {
+func (f *integrationCPUPreemptionFilter) UnpreemptVictim(v preemption.PreemptionVictim) {
 	for _, p := range v.Pods() {
 		for _, c := range p.Spec.Containers {
 			cpu := c.Resources.Requests[v1.ResourceCPU]
@@ -526,8 +527,8 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 				makePod(ns, "w-a2", "preempt-gang", "2"),
 			},
 			opts: snapshot.ScheduleWorkloadOptions{
-				WorkloadPreemptionOptions: snapshot.WorkloadPreemptionOptions{
-					PotentialVictims: slices.Values([]snapshot.PreemptionVictim{
+				WorkloadPreemptionOptions: preemption.WorkloadPreemptionOptions{
+					PotentialVictims: slices.Values([]preemption.PreemptionVictim{
 						&integrationVictim{name: "v1", pods: []*v1.Pod{v1Pod}},
 						&integrationVictim{name: "v2", pods: []*v1.Pod{v2Pod}},
 					}),
@@ -549,8 +550,8 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 				makePod(ns, "w-free2", "preempt-gang", "1"),
 			},
 			opts: snapshot.ScheduleWorkloadOptions{
-				WorkloadPreemptionOptions: snapshot.WorkloadPreemptionOptions{
-					PotentialVictims: slices.Values([]snapshot.PreemptionVictim{
+				WorkloadPreemptionOptions: preemption.WorkloadPreemptionOptions{
+					PotentialVictims: slices.Values([]preemption.PreemptionVictim{
 						&integrationVictim{name: "vSmall", pods: []*v1.Pod{vSmallPod}},
 						&integrationVictim{name: "vMed", pods: []*v1.Pod{vMedPod}},
 						&integrationVictim{name: "vHigh", pods: []*v1.Pod{vHighPod}},
@@ -573,8 +574,8 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 				makePod(ns, "w-b2", "preempt-gang", "2"),
 			},
 			opts: snapshot.ScheduleWorkloadOptions{
-				WorkloadPreemptionOptions: snapshot.WorkloadPreemptionOptions{
-					PotentialVictims: slices.Values([]snapshot.PreemptionVictim{
+				WorkloadPreemptionOptions: preemption.WorkloadPreemptionOptions{
+					PotentialVictims: slices.Values([]preemption.PreemptionVictim{
 						&integrationVictim{name: "vSmall", pods: []*v1.Pod{vSmallPod}},
 						&integrationVictim{name: "vMed", pods: []*v1.Pod{vMedPod}},
 						&integrationVictim{name: "vHigh", pods: []*v1.Pod{vHighPod}},
@@ -597,8 +598,8 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 				makePod(ns, "w-nofilter2", "preempt-gang", "2"),
 			},
 			opts: snapshot.ScheduleWorkloadOptions{
-				WorkloadPreemptionOptions: snapshot.WorkloadPreemptionOptions{
-					PotentialVictims: slices.Values([]snapshot.PreemptionVictim{
+				WorkloadPreemptionOptions: preemption.WorkloadPreemptionOptions{
+					PotentialVictims: slices.Values([]preemption.PreemptionVictim{
 						&integrationVictim{name: "vSmall", pods: []*v1.Pod{vSmallPod}},
 						&integrationVictim{name: "vMed", pods: []*v1.Pod{vMedPod}},
 						&integrationVictim{name: "vHigh", pods: []*v1.Pod{vHighPod}},
@@ -620,8 +621,8 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 				makePod(ns, "w-c2", "preempt-gang", "2"),
 			},
 			opts: snapshot.ScheduleWorkloadOptions{
-				WorkloadPreemptionOptions: snapshot.WorkloadPreemptionOptions{
-					PotentialVictims: slices.Values([]snapshot.PreemptionVictim{
+				WorkloadPreemptionOptions: preemption.WorkloadPreemptionOptions{
+					PotentialVictims: slices.Values([]preemption.PreemptionVictim{
 						&integrationVictim{name: "vMulti", pods: []*v1.Pod{vMulti1, vMulti2}},
 						&integrationVictim{name: "vSingle", pods: []*v1.Pod{vSingle}},
 					}),
@@ -643,11 +644,11 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 				makePod(ns, "w-d2", "preempt-gang", "3"),
 			},
 			opts: snapshot.ScheduleWorkloadOptions{
-				WorkloadPreemptionOptions: snapshot.WorkloadPreemptionOptions{
-					CommittedVictims: []snapshot.PreemptionVictim{
+				WorkloadPreemptionOptions: preemption.WorkloadPreemptionOptions{
+					CommittedVictims: []preemption.PreemptionVictim{
 						&integrationVictim{name: "vCommitted", pods: []*v1.Pod{vCommittedPod}},
 					},
-					PotentialVictims: slices.Values([]snapshot.PreemptionVictim{
+					PotentialVictims: slices.Values([]preemption.PreemptionVictim{
 						&integrationVictim{name: "v1", pods: []*v1.Pod{v1Pod}},
 						&integrationVictim{name: "v2", pods: []*v1.Pod{v2Pod}},
 					}),
@@ -669,8 +670,8 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 				makePod(ns, "w-e2", "preempt-gang", "4"),
 			},
 			opts: snapshot.ScheduleWorkloadOptions{
-				WorkloadPreemptionOptions: snapshot.WorkloadPreemptionOptions{
-					PotentialVictims: slices.Values([]snapshot.PreemptionVictim{
+				WorkloadPreemptionOptions: preemption.WorkloadPreemptionOptions{
+					PotentialVictims: slices.Values([]preemption.PreemptionVictim{
 						&integrationVictim{name: "v1", pods: []*v1.Pod{v1Pod}},
 						&integrationVictim{name: "v2", pods: []*v1.Pod{v2Pod}},
 					}),
@@ -693,8 +694,8 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 			},
 			opts: snapshot.ScheduleWorkloadOptions{
 				CommonSchedulingOptions: snapshot.CommonSchedulingOptions{DryRun: true},
-				WorkloadPreemptionOptions: snapshot.WorkloadPreemptionOptions{
-					PotentialVictims: slices.Values([]snapshot.PreemptionVictim{
+				WorkloadPreemptionOptions: preemption.WorkloadPreemptionOptions{
+					PotentialVictims: slices.Values([]preemption.PreemptionVictim{
 						&integrationVictim{name: "vSmall", pods: []*v1.Pod{vSmallPod}},
 						&integrationVictim{name: "vMed", pods: []*v1.Pod{vMedPod}},
 						&integrationVictim{name: "vHigh", pods: []*v1.Pod{vHighPod}},

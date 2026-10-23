@@ -36,6 +36,8 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	ft "sigs.k8s.io/scheduler-library/pkg/framework/testing"
+	"sigs.k8s.io/scheduler-library/pkg/preemption"
+	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
 	testutils "sigs.k8s.io/scheduler-library/pkg/upstreamsync/testutils"
 )
 
@@ -1586,8 +1588,8 @@ func verifySnapshotPodGroups(
 	t.Helper()
 
 	rv := reflect.ValueOf(snap).Elem()
-	podGroupStates := writableField(rv, "podGroupStates")
-	compositePodGroupStates := writableField(rv, "compositePodGroupStates")
+	podGroupStates := upstreamsync.WritableField(rv, "podGroupStates")
+	compositePodGroupStates := upstreamsync.WritableField(rv, "compositePodGroupStates")
 
 	wantPGMap := make(map[fwk.EntityKey]*schedulingv1beta1.PodGroup, len(wantPodGroups))
 	wantChildren := make(map[fwk.EntityKey]sets.Set[fwk.EntityKey])
@@ -1614,10 +1616,10 @@ func verifySnapshotPodGroups(
 	for pgIter.Next() {
 		key := pgIter.Key().Interface().(fwk.EntityKey)
 		pgs := pgIter.Value()
-		if podGroupEmpty(pgs) {
+		if upstreamsync.PodGroupEmpty(pgs) {
 			t.Errorf("empty podGroupStateSnapshot left in snapshot for key %s", key)
 		}
-		if pgField := writableField(pgs.Elem(), "podGroup"); !pgField.IsNil() {
+		if pgField := upstreamsync.WritableField(pgs.Elem(), "podGroup"); !pgField.IsNil() {
 			gotPGMap[key] = pgField.Interface().(*schedulingv1beta1.PodGroup)
 		}
 	}
@@ -1653,10 +1655,10 @@ func verifySnapshotPodGroups(
 	for cpgIter.Next() {
 		key := cpgIter.Key().Interface().(fwk.EntityKey)
 		cpgs := cpgIter.Value()
-		if compositePodGroupEmpty(cpgs) {
+		if upstreamsync.CompositePodGroupEmpty(cpgs) {
 			t.Errorf("empty compositePodGroupStateSnapshot left in snapshot for key %s", key)
 		}
-		if cpgField := writableField(cpgs.Elem(), "compositePodGroup"); !cpgField.IsNil() {
+		if cpgField := upstreamsync.WritableField(cpgs.Elem(), "compositePodGroup"); !cpgField.IsNil() {
 			gotCPGMap[key] = cpgField.Interface().(*schedulingv1alpha3.CompositePodGroup)
 		}
 		state, err := snap.CompositePodGroupStates().Get(key.Namespace, key.Name)
@@ -1998,7 +2000,7 @@ func (v *testVictim) Pods() []*v1.Pod {
 type cpuPreemptionFilter struct {
 	availableCPU   int64
 	requiredCPU    int64
-	activeVictims  map[PreemptionVictim]bool
+	activeVictims  map[preemption.PreemptionVictim]bool
 	preemptCalls   int
 	unpreemptCalls int
 	mayFitCalls    int
@@ -2008,11 +2010,11 @@ func newCPUPreemptionFilter(availableCPU, requiredCPU int64) *cpuPreemptionFilte
 	return &cpuPreemptionFilter{
 		availableCPU:  availableCPU,
 		requiredCPU:   requiredCPU,
-		activeVictims: make(map[PreemptionVictim]bool),
+		activeVictims: make(map[preemption.PreemptionVictim]bool),
 	}
 }
 
-func (f *cpuPreemptionFilter) PreemptVictim(v PreemptionVictim) {
+func (f *cpuPreemptionFilter) PreemptVictim(v preemption.PreemptionVictim) {
 	f.preemptCalls++
 	f.activeVictims[v] = true
 	for _, p := range v.Pods() {
@@ -2023,7 +2025,7 @@ func (f *cpuPreemptionFilter) PreemptVictim(v PreemptionVictim) {
 	}
 }
 
-func (f *cpuPreemptionFilter) UnpreemptVictim(v PreemptionVictim) {
+func (f *cpuPreemptionFilter) UnpreemptVictim(v preemption.PreemptionVictim) {
 	f.unpreemptCalls++
 	delete(f.activeVictims, v)
 	for _, p := range v.Pods() {
@@ -2045,7 +2047,7 @@ func makeScheduledTestPod(name, nodeName, podGroupName, cpu string) *v1.Pod {
 	return p
 }
 
-func victimNames(victims []PreemptionVictim) []string {
+func victimNames(victims []preemption.PreemptionVictim) []string {
 	if len(victims) == 0 {
 		return nil
 	}
@@ -2131,8 +2133,8 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 				vic2 := &testVictim{name: "v2", pods: []*v1.Pod{v2Pod2CPU}}
 				f := newCPUPreemptionFilter(4, 4)
 				return ScheduleWorkloadOptions{
-					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
-						PotentialVictims: slices.Values([]PreemptionVictim{vic1, vic2}),
+					WorkloadPreemptionOptions: preemption.WorkloadPreemptionOptions{
+						PotentialVictims: slices.Values([]preemption.PreemptionVictim{vic1, vic2}),
 						PreemptionFilter: f,
 					},
 				}, f
@@ -2158,8 +2160,8 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 				vHigh := &testVictim{name: "vHigh", pods: []*v1.Pod{vHighPod}}
 				f := newCPUPreemptionFilter(0, 3)
 				return ScheduleWorkloadOptions{
-					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
-						PotentialVictims: slices.Values([]PreemptionVictim{vSmall, vMed, vHigh}),
+					WorkloadPreemptionOptions: preemption.WorkloadPreemptionOptions{
+						PotentialVictims: slices.Values([]preemption.PreemptionVictim{vSmall, vMed, vHigh}),
 						PreemptionFilter: f,
 					},
 				}, f
@@ -2185,8 +2187,8 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 				vHigh := &testVictim{name: "vHigh", pods: []*v1.Pod{vHighPod}}
 				f := newCPUPreemptionFilter(0, 3)
 				return ScheduleWorkloadOptions{
-					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
-						PotentialVictims: slices.Values([]PreemptionVictim{vSmall, vMed, vHigh}),
+					WorkloadPreemptionOptions: preemption.WorkloadPreemptionOptions{
+						PotentialVictims: slices.Values([]preemption.PreemptionVictim{vSmall, vMed, vHigh}),
 						PreemptionFilter: f,
 					},
 				}, f
@@ -2211,8 +2213,8 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 				vMed := &testVictim{name: "vMed", pods: []*v1.Pod{vMedPod}}
 				vHigh := &testVictim{name: "vHigh", pods: []*v1.Pod{vHighPod}}
 				return ScheduleWorkloadOptions{
-					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
-						PotentialVictims: slices.Values([]PreemptionVictim{vSmall, vMed, vHigh}),
+					WorkloadPreemptionOptions: preemption.WorkloadPreemptionOptions{
+						PotentialVictims: slices.Values([]preemption.PreemptionVictim{vSmall, vMed, vHigh}),
 						PreemptionFilter: nil,
 					},
 				}, nil
@@ -2244,8 +2246,8 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 				// then probes vSmall (remaining 3 CPU >= 3 -> MayFit=true, rejected by node Filter).
 				f := newCPUPreemptionFilter(0, 3)
 				return ScheduleWorkloadOptions{
-					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
-						PotentialVictims: slices.Values([]PreemptionVictim{vSmall, vMed, vLarge}),
+					WorkloadPreemptionOptions: preemption.WorkloadPreemptionOptions{
+						PotentialVictims: slices.Values([]preemption.PreemptionVictim{vSmall, vMed, vLarge}),
 						PreemptionFilter: f,
 					},
 				}, f
@@ -2270,8 +2272,8 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 				vSingle := &testVictim{name: "vSingle", pods: []*v1.Pod{vSinglePod}}
 				f := newCPUPreemptionFilter(0, 4)
 				return ScheduleWorkloadOptions{
-					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
-						PotentialVictims: slices.Values([]PreemptionVictim{vMulti, vSingle}),
+					WorkloadPreemptionOptions: preemption.WorkloadPreemptionOptions{
+						PotentialVictims: slices.Values([]preemption.PreemptionVictim{vMulti, vSingle}),
 						PreemptionFilter: f,
 					},
 				}, f
@@ -2296,8 +2298,8 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 				vSingle := &testVictim{name: "vSingle", pods: []*v1.Pod{vSinglePod}}
 				f := newCPUPreemptionFilter(0, 4)
 				return ScheduleWorkloadOptions{
-					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
-						PotentialVictims: slices.Values([]PreemptionVictim{vMulti, vSingle}),
+					WorkloadPreemptionOptions: preemption.WorkloadPreemptionOptions{
+						PotentialVictims: slices.Values([]preemption.PreemptionVictim{vMulti, vSingle}),
 						PreemptionFilter: f,
 					},
 				}, f
@@ -2323,9 +2325,9 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 				vic2 := &testVictim{name: "v2", pods: []*v1.Pod{v2Pod2CPU}}
 				f := newCPUPreemptionFilter(4, 4)
 				return ScheduleWorkloadOptions{
-					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
-						CommittedVictims: []PreemptionVictim{vCommitted},
-						PotentialVictims: slices.Values([]PreemptionVictim{vic1, vic2}),
+					WorkloadPreemptionOptions: preemption.WorkloadPreemptionOptions{
+						CommittedVictims: []preemption.PreemptionVictim{vCommitted},
+						PotentialVictims: slices.Values([]preemption.PreemptionVictim{vic1, vic2}),
 						PreemptionFilter: f,
 					},
 				}, f
@@ -2352,9 +2354,9 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 				vic3 := &testVictim{name: "v3", pods: []*v1.Pod{v3Pod2CPU}}
 				f := newCPUPreemptionFilter(2, 4)
 				return ScheduleWorkloadOptions{
-					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
-						CommittedVictims: []PreemptionVictim{vCommitted},
-						PotentialVictims: slices.Values([]PreemptionVictim{vic1, vic2, vic3}),
+					WorkloadPreemptionOptions: preemption.WorkloadPreemptionOptions{
+						CommittedVictims: []preemption.PreemptionVictim{vCommitted},
+						PotentialVictims: slices.Values([]preemption.PreemptionVictim{vic1, vic2, vic3}),
 						PreemptionFilter: f,
 					},
 				}, f
@@ -2380,9 +2382,9 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 				vic2 := &testVictim{name: "v2", pods: []*v1.Pod{v2Pod2CPU}}
 				f := newCPUPreemptionFilter(2, 4)
 				return ScheduleWorkloadOptions{
-					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
-						CommittedVictims: []PreemptionVictim{vCommitted},
-						PotentialVictims: slices.Values([]PreemptionVictim{vic1, vic2}),
+					WorkloadPreemptionOptions: preemption.WorkloadPreemptionOptions{
+						CommittedVictims: []preemption.PreemptionVictim{vCommitted},
+						PotentialVictims: slices.Values([]preemption.PreemptionVictim{vic1, vic2}),
 						PreemptionFilter: f,
 					},
 				}, f
@@ -2410,8 +2412,8 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 				f := newCPUPreemptionFilter(0, 3)
 				return ScheduleWorkloadOptions{
 					CommonSchedulingOptions: CommonSchedulingOptions{DryRun: true},
-					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
-						PotentialVictims: slices.Values([]PreemptionVictim{vSmall, vMed, vHigh}),
+					WorkloadPreemptionOptions: preemption.WorkloadPreemptionOptions{
+						PotentialVictims: slices.Values([]preemption.PreemptionVictim{vSmall, vMed, vHigh}),
 						PreemptionFilter: f,
 					},
 				}, f
@@ -2434,8 +2436,8 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 			buildOpts: func() (ScheduleWorkloadOptions, *cpuPreemptionFilter) {
 				vCommitted := &testVictim{name: "vCommitted", pods: []*v1.Pod{vCommittedPod}}
 				return ScheduleWorkloadOptions{
-					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
-						CommittedVictims: []PreemptionVictim{vCommitted},
+					WorkloadPreemptionOptions: preemption.WorkloadPreemptionOptions{
+						CommittedVictims: []preemption.PreemptionVictim{vCommitted},
 						PotentialVictims: nil,
 					},
 				}, nil
@@ -2459,13 +2461,13 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 				vCommitted := &testVictim{name: "vCommitted", pods: []*v1.Pod{vCommittedPod}}
 				vic1 := &testVictim{name: "v1", pods: []*v1.Pod{v1Pod2CPU}}
 				vic2 := &testVictim{name: "v2", pods: []*v1.Pod{v2Pod2CPU}}
-				committed := make([]PreemptionVictim, 2, 4)
+				committed := make([]preemption.PreemptionVictim, 2, 4)
 				committed[0] = nil
 				committed[1] = vCommitted
 				return ScheduleWorkloadOptions{
-					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
+					WorkloadPreemptionOptions: preemption.WorkloadPreemptionOptions{
 						CommittedVictims: committed,
-						PotentialVictims: slices.Values([]PreemptionVictim{vic1, vic2}),
+						PotentialVictims: slices.Values([]preemption.PreemptionVictim{vic1, vic2}),
 					},
 				}, nil
 			},
@@ -2502,7 +2504,7 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 				testutils.MakePod("w-pod2", "gang-pg", "2"),
 			},
 			buildOpts: func() (ScheduleWorkloadOptions, *cpuPreemptionFilter) {
-				victims := []PreemptionVictim{
+				victims := []preemption.PreemptionVictim{
 					&testVictim{name: "v0", pods: []*v1.Pod{v0Pod}},
 					&testVictim{name: "v1", pods: []*v1.Pod{v1Pod1CPU}},
 					&testVictim{name: "v2", pods: []*v1.Pod{v2Pod1CPU}},
@@ -2514,7 +2516,7 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 				}
 				f := newCPUPreemptionFilter(0, 1)
 				return ScheduleWorkloadOptions{
-					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
+					WorkloadPreemptionOptions: preemption.WorkloadPreemptionOptions{
 						PotentialVictims: slices.Values(victims),
 						PreemptionFilter: f,
 					},
