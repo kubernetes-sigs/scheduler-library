@@ -34,7 +34,8 @@ import (
 )
 
 // SetupSnapshotTest initializes a fake clientset, snapshot, and default profile map for unit tests.
-func SetupSnapshotTest(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (*upstreamsync.ProfileMap, *cache.Snapshot, error) {
+// The opts are applied after the default profile, so they can replace it.
+func SetupSnapshotTest(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node, opts ...upstreamsync.Option) (*upstreamsync.ProfileMap, *cache.Snapshot, error) {
 	framework.InitMetricsOnce()
 	client := fake.NewClientset()
 	for _, n := range nodes {
@@ -89,7 +90,8 @@ func SetupSnapshotTest(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (*
 
 	informerFactory := informers.NewSharedInformerFactory(client, 0)
 	snap := cache.NewSnapshot(pods, nodes)
-	comps, err := upstreamsync.NewFrameworkComponents(ctx, client, informerFactory, upstreamsync.WithProfiles(prof.Profiles...))
+	opts = append([]upstreamsync.Option{upstreamsync.WithProfiles(prof.Profiles...)}, opts...)
+	comps, err := upstreamsync.NewFrameworkComponents(ctx, client, informerFactory, opts...)
 	if err != nil {
 		return nil, nil, err
 	}
