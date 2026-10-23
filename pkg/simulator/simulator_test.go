@@ -896,11 +896,11 @@ func TestOutOfTreePluginAffectsScheduling(t *testing.T) {
 				t.Fatalf("MakePlacement failed: %v", err)
 			}
 
-			feasible, _, err := snap.CanSchedulePod(ctx, pod, placement)
+			result, err := snap.CanSchedulePod(ctx, pod, placement)
 			if err != nil {
 				t.Fatalf("CanSchedulePod failed: %v", err)
 			}
-			got := slices.Sorted(slices.Values(feasible))
+			got := slices.Sorted(slices.Values(result.FeasibleNodeNames))
 			if !slices.Equal(got, tc.wantFeasible) {
 				t.Errorf("CanSchedulePod feasible nodes = %v, want %v", got, tc.wantFeasible)
 			}
@@ -944,13 +944,13 @@ func TestOutOfTreeRegistryCloned(t *testing.T) {
 		t.Fatalf("MakePlacement failed: %v", err)
 	}
 
-	feasible, _, err := snap.CanSchedulePod(ctx, pod, placement)
+	result, err := snap.CanSchedulePod(ctx, pod, placement)
 	if err != nil {
 		t.Fatalf("CanSchedulePod failed: %v", err)
 	}
 	// "node1" should still be rejected because the simulator cloned the registry
-	if slices.Contains(feasible, "node1") {
-		t.Errorf("Expected node1 to be rejected despite caller deleting plugin from original map, got feasible: %v", feasible)
+	if slices.Contains(result.FeasibleNodeNames, "node1") {
+		t.Errorf("Expected node1 to be rejected despite caller deleting plugin from original map, got feasible: %v", result.FeasibleNodeNames)
 	}
 }
 
