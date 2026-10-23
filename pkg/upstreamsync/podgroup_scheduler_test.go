@@ -46,19 +46,39 @@ func TestRunRootSchedulingAlgorithm(t *testing.T) {
 	}).Obj()
 
 	gangPodGroup := testutils.MakeGangPodGroup("gang-pg", "", 2)
+	gangPodGroupMin3 := testutils.MakeGangPodGroup("gang-pg-min3", "", 3)
 	gangPod1 := testutils.MakePod("p1", "gang-pg", "3")
 	gangPod2 := testutils.MakePod("p2", "gang-pg", "3")
+	gangPod3 := testutils.MakePod("p3", "gang-pg", "3")
+	gangMin3Pod1 := testutils.MakePod("p1", "gang-pg-min3", "3")
+	gangMin3Pod2 := testutils.MakePod("p2", "gang-pg-min3", "3")
+	gangMin3Pod3 := testutils.MakePod("p3", "gang-pg-min3", "3")
 
 	basicPodGroup := testutils.MakeBasicPodGroup("basic-pg", "")
 	basicPod1 := testutils.MakePod("p1", "basic-pg", "3")
+	basicPod2 := testutils.MakePod("p2", "basic-pg", "3")
 
 	compositePodGroup1 := testutils.MakeGangCompositePodGroup("gang-cpg1", "", 2)
+	compositePodGroupMin1 := testutils.MakeGangCompositePodGroup("gang-cpg-min1", "", 1)
+	compositePodGroupMin3 := testutils.MakeGangCompositePodGroup("gang-cpg-min3", "", 3)
 	compositePodGroup1leaf1 := testutils.MakeGangPodGroup("cpg1-leaf1", "gang-cpg1", 1)
 	compositePodGroup1leaf2 := testutils.MakeGangPodGroup("cpg1-leaf2", "gang-cpg1", 1)
+	compositePodGroupMin1leaf1 := testutils.MakeGangPodGroup("cpg-min1-leaf1", "gang-cpg-min1", 1)
+	compositePodGroupMin1leaf2 := testutils.MakeGangPodGroup("cpg-min1-leaf2", "gang-cpg-min1", 1)
+	compositePodGroupMin3leaf1 := testutils.MakeGangPodGroup("cpg-min3-leaf1", "gang-cpg-min3", 1)
+	compositePodGroupMin3leaf2 := testutils.MakeGangPodGroup("cpg-min3-leaf2", "gang-cpg-min3", 1)
+	compositePodGroupMin3leaf3 := testutils.MakeGangPodGroup("cpg-min3-leaf3", "gang-cpg-min3", 1)
 	compositePodGroup1leaf1Pod2CPU := testutils.MakePod("p1", "cpg1-leaf1", "2")
 	compositePodGroup1leaf2Pod2CPU := testutils.MakePod("p2", "cpg1-leaf2", "2")
 	compositePodGroup1leaf1Pod3CPU := testutils.MakePod("p1", "cpg1-leaf1", "3")
 	compositePodGroup1leaf2Pod3CPU := testutils.MakePod("p2", "cpg1-leaf2", "3")
+	compositePodGroupMin1leaf1Pod3CPU := testutils.MakePod("p1", "cpg-min1-leaf1", "3")
+	compositePodGroupMin1leaf2Pod3CPU := testutils.MakePod("p2", "cpg-min1-leaf2", "3")
+	compositePodGroupMin3leaf1Pod2CPU := testutils.MakePod("p1", "cpg-min3-leaf1", "2")
+	compositePodGroupMin3leaf2Pod2CPU := testutils.MakePod("p2", "cpg-min3-leaf2", "2")
+	compositePodGroupMin3leaf1Pod3CPU := testutils.MakePod("p1", "cpg-min3-leaf1", "3")
+	compositePodGroupMin3leaf2Pod3CPU := testutils.MakePod("p2", "cpg-min3-leaf2", "3")
+	compositePodGroupMin3leaf3Pod3CPU := testutils.MakePod("p3", "cpg-min3-leaf3", "3")
 
 	basicCompositePodGroup := testutils.MakeBasicCompositePodGroup("root-basic", "")
 	basicLeaf1 := testutils.MakeGangPodGroup("leaf-b1", "root-basic", 1)
@@ -76,15 +96,17 @@ func TestRunRootSchedulingAlgorithm(t *testing.T) {
 	compositePodGroup2leafPod3CPU := testutils.MakePod("p2", "cpg2-leaf1", "3")
 
 	tests := []struct {
-		name               string
-		nodes              []*v1.Node
-		podGroups          []*schedulingv1beta1.PodGroup
-		compositePodGroups []*schedulingv1alpha3.CompositePodGroup
-		pods               []*v1.Pod
-		wantKey            fwk.EntityKey
-		wantSuccess        bool
-		wantPodResults     int
-		expectedNodePods   map[string]sets.Set[string]
+		name                    string
+		nodes                   []*v1.Node
+		podGroups               []*schedulingv1beta1.PodGroup
+		compositePodGroups      []*schedulingv1alpha3.CompositePodGroup
+		pods                    []*v1.Pod
+		wantKey                 fwk.EntityKey
+		wantSuccess             bool
+		wantPodResults          int
+		expectedNodePods        map[string]sets.Set[string]
+		expectedUnscheduledPods sets.Set[string]
+		expectedSkippedKeys     []fwk.EntityKey
 	}{
 		{
 			name:             "Single podgroup with gang policy",
@@ -97,13 +119,47 @@ func TestRunRootSchedulingAlgorithm(t *testing.T) {
 			expectedNodePods: map[string]sets.Set[string]{"node1": sets.New("p1", "p2")},
 		},
 		{
-			name:             "Single podgroup scheduling failure due to insufficient capacity",
-			nodes:            []*v1.Node{node4CPU},
-			podGroups:        []*schedulingv1beta1.PodGroup{gangPodGroup},
-			pods:             []*v1.Pod{gangPod1, gangPod2},
-			wantKey:          fwk.PodGroupKey("default", "gang-pg"),
+			name:                    "Single podgroup with gang policy succeeds when minCount subset fits",
+			nodes:                   []*v1.Node{node8CPU},
+			podGroups:               []*schedulingv1beta1.PodGroup{gangPodGroup},
+			pods:                    []*v1.Pod{gangPod1, gangPod2, gangPod3},
+			wantKey:                 fwk.PodGroupKey("default", "gang-pg"),
+			wantSuccess:             true,
+			wantPodResults:          3,
+			expectedNodePods:        map[string]sets.Set[string]{"node1": sets.New("p1", "p2")},
+			expectedUnscheduledPods: sets.New("p3"),
+		},
+		{
+			name:             "Single podgroup with gang policy fails early via PlacementFeasible when fewer pods than minCount",
+			nodes:            []*v1.Node{node8CPU},
+			podGroups:        []*schedulingv1beta1.PodGroup{gangPodGroupMin3},
+			pods:             []*v1.Pod{gangMin3Pod1, gangMin3Pod2},
+			wantKey:          fwk.PodGroupKey("default", "gang-pg-min3"),
 			wantSuccess:      false,
+			wantPodResults:   0,
 			expectedNodePods: map[string]sets.Set[string]{"node1": sets.New[string]()},
+		},
+		{
+			name:                    "Single podgroup with gang policy terminates loop early when minCount can no longer be met",
+			nodes:                   []*v1.Node{node4CPU},
+			podGroups:               []*schedulingv1beta1.PodGroup{gangPodGroupMin3},
+			pods:                    []*v1.Pod{gangMin3Pod1, gangMin3Pod2, gangMin3Pod3},
+			wantKey:                 fwk.PodGroupKey("default", "gang-pg-min3"),
+			wantSuccess:             false,
+			wantPodResults:          2,
+			expectedNodePods:        map[string]sets.Set[string]{"node1": sets.New[string]()},
+			expectedUnscheduledPods: sets.New("p2"),
+		},
+		{
+			name:                    "Single podgroup scheduling failure due to insufficient capacity",
+			nodes:                   []*v1.Node{node4CPU},
+			podGroups:               []*schedulingv1beta1.PodGroup{gangPodGroup},
+			pods:                    []*v1.Pod{gangPod1, gangPod2},
+			wantKey:                 fwk.PodGroupKey("default", "gang-pg"),
+			wantSuccess:             false,
+			wantPodResults:          2,
+			expectedNodePods:        map[string]sets.Set[string]{"node1": sets.New[string]()},
+			expectedUnscheduledPods: sets.New("p2"),
 		},
 		{
 			name:             "Single podgroup with basic policy",
@@ -116,6 +172,17 @@ func TestRunRootSchedulingAlgorithm(t *testing.T) {
 			expectedNodePods: map[string]sets.Set[string]{"node1": sets.New("p1")},
 		},
 		{
+			name:                    "Single podgroup with basic policy succeeds when only a subset of pods fits",
+			nodes:                   []*v1.Node{node4CPU},
+			podGroups:               []*schedulingv1beta1.PodGroup{basicPodGroup},
+			pods:                    []*v1.Pod{basicPod1, basicPod2},
+			wantKey:                 fwk.PodGroupKey("default", "basic-pg"),
+			wantSuccess:             true,
+			wantPodResults:          2,
+			expectedNodePods:        map[string]sets.Set[string]{"node1": sets.New("p1")},
+			expectedUnscheduledPods: sets.New("p2"),
+		},
+		{
 			name:               "2-Level composite podgroup with gang policy",
 			nodes:              []*v1.Node{node8CPU},
 			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{compositePodGroup1},
@@ -124,6 +191,43 @@ func TestRunRootSchedulingAlgorithm(t *testing.T) {
 			wantKey:            fwk.CompositePodGroupKey("default", "gang-cpg1"),
 			wantSuccess:        true,
 			expectedNodePods:   map[string]sets.Set[string]{"node1": sets.New("p1", "p2")},
+		},
+		{
+			name:               "2-Level composite podgroup with gang policy succeeds when minGroupCount subset fits",
+			nodes:              []*v1.Node{node4CPU},
+			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{compositePodGroupMin1},
+			podGroups:          []*schedulingv1beta1.PodGroup{compositePodGroupMin1leaf1, compositePodGroupMin1leaf2},
+			pods:               []*v1.Pod{compositePodGroupMin1leaf1Pod3CPU, compositePodGroupMin1leaf2Pod3CPU},
+			wantKey:            fwk.CompositePodGroupKey("default", "gang-cpg-min1"),
+			wantSuccess:        true,
+			expectedNodePods:   map[string]sets.Set[string]{"node1": sets.New("p1")},
+		},
+		{
+			name:               "2-Level composite podgroup with gang policy fails early via PlacementFeasible when fewer children than minGroupCount",
+			nodes:              []*v1.Node{node8CPU},
+			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{compositePodGroupMin3},
+			podGroups:          []*schedulingv1beta1.PodGroup{compositePodGroupMin3leaf1, compositePodGroupMin3leaf2},
+			pods:               []*v1.Pod{compositePodGroupMin3leaf1Pod2CPU, compositePodGroupMin3leaf2Pod2CPU},
+			wantKey:            fwk.CompositePodGroupKey("default", "gang-cpg-min3"),
+			wantSuccess:        false,
+			expectedNodePods:   map[string]sets.Set[string]{"node1": sets.New[string]()},
+			expectedSkippedKeys: []fwk.EntityKey{
+				fwk.PodGroupKey("default", "cpg-min3-leaf1"),
+				fwk.PodGroupKey("default", "cpg-min3-leaf2"),
+			},
+		},
+		{
+			name:               "2-Level composite podgroup with gang policy terminates loop early when minGroupCount can no longer be met",
+			nodes:              []*v1.Node{node4CPU},
+			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{compositePodGroupMin3},
+			podGroups:          []*schedulingv1beta1.PodGroup{compositePodGroupMin3leaf1, compositePodGroupMin3leaf2, compositePodGroupMin3leaf3},
+			pods:               []*v1.Pod{compositePodGroupMin3leaf1Pod3CPU, compositePodGroupMin3leaf2Pod3CPU, compositePodGroupMin3leaf3Pod3CPU},
+			wantKey:            fwk.CompositePodGroupKey("default", "gang-cpg-min3"),
+			wantSuccess:        false,
+			expectedNodePods:   map[string]sets.Set[string]{"node1": sets.New[string]()},
+			expectedSkippedKeys: []fwk.EntityKey{
+				fwk.PodGroupKey("default", "cpg-min3-leaf3"),
+			},
 		},
 		{
 			name:               "2-Level composite podgroup scheduling failure due to insufficient capacity",
@@ -205,22 +309,30 @@ func TestRunRootSchedulingAlgorithm(t *testing.T) {
 				if !result.Status.IsSuccess() {
 					t.Fatalf("expected pod group scheduling to succeed, got %v", result)
 				}
-				if tt.wantPodResults > 0 {
-					if len(result.PodResults) != tt.wantPodResults {
-						t.Fatalf("expected %d pod results, got %d", tt.wantPodResults, len(result.PodResults))
-					}
-					for _, pr := range result.PodResults {
-						if !pr.GetStatus().IsSuccess() {
-							t.Errorf("expected pod %s success, got %v", pr.GetPod().Name, pr.GetStatus())
-						}
-					}
-				}
 			} else {
 				if revertFn != nil {
 					t.Fatalf("expected nil revertFn on failure, got non-nil")
 				}
 				if result.Status.IsSuccess() {
 					t.Fatalf("expected scheduling failure, got success: %v", result)
+				}
+			}
+
+			if len(result.PodResults) != tt.wantPodResults {
+				t.Fatalf("expected %d pod results, got %d", tt.wantPodResults, len(result.PodResults))
+			}
+			for _, pr := range result.PodResults {
+				if tt.expectedUnscheduledPods.Has(pr.GetPod().Name) {
+					if pr.GetStatus().IsSuccess() {
+						t.Errorf("expected pod %s to be unscheduled, got success on node %s", pr.GetPod().Name, pr.GetNodeName())
+					}
+				} else if !pr.GetStatus().IsSuccess() {
+					t.Errorf("expected pod %s success, got %v", pr.GetPod().Name, pr.GetStatus())
+				}
+			}
+			for _, skippedKey := range tt.expectedSkippedKeys {
+				if _, exists := results[skippedKey]; exists {
+					t.Errorf("expected child group %v to be skipped by early PlacementFeasible termination, but found in results", skippedKey)
 				}
 			}
 
