@@ -138,6 +138,7 @@ func SetupSnapshotTestWithPodGroups(
 			{
 				SchedulerName: v1.DefaultSchedulerName,
 				Plugins: &schedulerapi.Plugins{
+					MultiPoint:         schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "GangScheduling"}}},
 					QueueSort:          schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
 					PreFilter:          schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "NodeResourcesFit"}}},
 					Filter:             schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "NodeResourcesFit"}}},
