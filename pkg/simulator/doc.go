@@ -81,10 +81,11 @@
 //
 // The types returned by this package deliberately live elsewhere:
 //
+//   - pkg/snapshot holds ClusterSnapshot, the in-memory view of the cluster and its simulation
+//     methods, options, and result types.
 //   - pkg/state holds ClusterState, the long-lived, mutable representation of the real cluster.
+//   - pkg/preemption holds workload preemption types and simulation adapters.
 //   - pkg/upstreamsync holds logic copied from (or destined for) kube-scheduler; consumers are
-//     not expected to call into it directly. pkg/upstreamsync/snapshot holds ClusterSnapshot,
-//     which is intended to be absorbed by kube-scheduler's snapshot handling over time, which is
-//     why it lives under upstreamsync despite carrying the consumer-facing methods listed above.
+//     not expected to call into it directly.
 //   - pkg/framework wires the upstream scheduler framework for in-memory use.
 package simulator
