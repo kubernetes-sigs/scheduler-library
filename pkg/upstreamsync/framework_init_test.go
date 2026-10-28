@@ -38,6 +38,7 @@ import (
 	internalcache "k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
+	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/preemption"
 )
 
 // verifyErr verifies that the given error is the error expected by the test case.
@@ -299,6 +300,88 @@ func TestNewFrameworkMapSharedDRAManager(t *testing.T) {
 				t.Error("SharedDRAManager() = nil, want the default manager")
 			case !tt.wantStub && got == stub:
 				t.Error("SharedDRAManager() returned the stub, want the default manager")
+			}
+		})
+	}
+}
+
+// stubPreemptionManager stands in for the managers a PreemptionManagerFactory creates. The test
+// only checks which manager each framework was given, so none of the methods are ever called.
+type stubPreemptionManager struct {
+	// handle is the Handle the factory created the manager for.
+	handle preemption.Handle
+}
+
+var _ preemption.PreemptionManager = &stubPreemptionManager{}
+
+func (s *stubPreemptionManager) GenerateVictims(context.Context, fwk.PodGroupInfo) ([]preemption.PreemptionVictim, *fwk.Status) {
+	return nil, nil
+}
+func (s *stubPreemptionManager) Executor() preemption.PreemptionExecutor { return nil }
+func (s *stubPreemptionManager) NewReprieveFilter(context.Context, []preemption.PreemptionVictim) preemption.ReprieveFilter {
+	return nil
+}
+
+func TestNewFrameworkMapPreemptionManager(t *testing.T) {
+	customProfile := testProfile()
+	customProfile.SchedulerName = "custom-scheduler"
+	profiles := []schedulerapi.KubeSchedulerProfile{testProfile(), customProfile}
+
+	tests := []struct {
+		name        string
+		withFactory bool
+	}{
+		{
+			name:        "the factory creates a separate PreemptionManager for each profile",
+			withFactory: true,
+		},
+		{
+			name: "without a factory the profiles have no PreemptionManager",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			client := fake.NewClientset()
+			informerFactory := informers.NewSharedInformerFactory(client, 0)
+			comps, err := NewFrameworkComponents(ctx, client, informerFactory, WithProfiles(profiles...))
+			if err != nil {
+				t.Fatalf("NewFrameworkComponents failed: %v", err)
+			}
+
+			factoryCalls := 0
+			var opts []FrameworkMapOption
+			if tt.withFactory {
+				opts = append(opts, WithPreemptionManager(func(fh preemption.Handle) preemption.PreemptionManager {
+					factoryCalls++
+					return &stubPreemptionManager{handle: fh}
+				}))
+			}
+
+			profileMap, err := NewFrameworkMap(ctx, comps, fakeRecorderFactory, internalcache.NewEmptySnapshot(), opts...)
+			if err != nil {
+				t.Fatalf("NewFrameworkMap failed: %v", err)
+			}
+
+			if tt.withFactory && factoryCalls != len(profiles) {
+				t.Errorf("factory called %d times, want once per profile (%d)", factoryCalls, len(profiles))
+			}
+			for _, prof := range profiles {
+				pf, ok := profileMap.preemptionFrameworks[prof.SchedulerName]
+				if !ok {
+					t.Fatalf("preemptionFrameworks has no entry for %q", prof.SchedulerName)
+				}
+				got := pf.PreemptionManager()
+				if !tt.withFactory {
+					if got != nil {
+						t.Errorf("profile %q: PreemptionManager() = %v, want nil", prof.SchedulerName, got)
+					}
+					continue
+				}
+				if stub, ok := got.(*stubPreemptionManager); !ok || stub.handle != pf {
+					t.Errorf("profile %q: PreemptionManager() = %v, want the one the factory created for the profile's PreemptionFramework", prof.SchedulerName, got)
+				}
 			}
 		})
 	}

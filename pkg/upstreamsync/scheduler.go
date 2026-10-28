@@ -42,6 +42,7 @@ import (
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
 	utiltrace "k8s.io/utils/trace"
+	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/preemption"
 )
 
 /*
@@ -134,7 +135,8 @@ func WithKubeConfig(cfg *restclient.Config) Option {
 }
 
 type frameworkMapOptions struct {
-	sharedDRAManager fwk.SharedDRAManager
+	sharedDRAManager         fwk.SharedDRAManager
+	preemptionManagerFactory preemption.PreemptionManagerFactory
 }
 
 // FrameworkMapOption configures a single ProfileMap built by NewFrameworkMap. Unlike Option,
@@ -155,6 +157,17 @@ type FrameworkMapOption func(*frameworkMapOptions)
 func WithSharedDRAManager(m fwk.SharedDRAManager) FrameworkMapOption {
 	return func(o *frameworkMapOptions) {
 		o.sharedDRAManager = m
+	}
+}
+
+// WithPreemptionManager sets the factory that creates the PreemptionManager of each profile in the
+// map. Without it the profiles have no PreemptionManager.
+//
+// UPSTREAM-DIFF: upstream WithPreemptionManager uses a frameworkruntime.PreemptionManagerFactory.
+// Migration Plan (1.38): Delete this function and use frameworkruntime.WithPreemptionManager.
+func WithPreemptionManager(f preemption.PreemptionManagerFactory) FrameworkMapOption {
+	return func(o *frameworkMapOptions) {
+		o.preemptionManagerFactory = f
 	}
 }
 

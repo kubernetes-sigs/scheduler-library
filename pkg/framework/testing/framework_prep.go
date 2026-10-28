@@ -30,6 +30,7 @@ import (
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	"sigs.k8s.io/scheduler-library/pkg/framework"
+	"sigs.k8s.io/scheduler-library/pkg/preemption"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
 )
 
@@ -99,7 +100,8 @@ func SetupSnapshotTest(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (*
 		return nil, nil, err
 	}
 
-	profileMap, err := upstreamsync.NewFrameworkMap(ctx, comps, framework.DiscardRecorderFactory, snap)
+	profileMap, err := upstreamsync.NewFrameworkMap(ctx, comps, framework.DiscardRecorderFactory, snap,
+		upstreamsync.WithPreemptionManager(preemption.NewPrefixPreemptionManager))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -183,7 +185,8 @@ func SetupSnapshotTestWithPodGroups(
 		return nil, nil, err
 	}
 
-	profileMap, err := upstreamsync.NewFrameworkMap(ctx, comps, framework.DiscardRecorderFactory, snap)
+	profileMap, err := upstreamsync.NewFrameworkMap(ctx, comps, framework.DiscardRecorderFactory, snap,
+		upstreamsync.WithPreemptionManager(preemption.NewPrefixPreemptionManager))
 	if err != nil {
 		return nil, nil, err
 	}
