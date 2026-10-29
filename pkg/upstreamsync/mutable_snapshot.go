@@ -15,7 +15,9 @@
 package upstreamsync
 
 import (
+	"errors"
 	"fmt"
+	"slices"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
@@ -47,23 +49,20 @@ lives here because it is proposed for the upstream snapshot, not because it was 
 // created (see RestoreState).
 type MutatingSnapshot struct {
 	*cache.Snapshot
-	addedPods   map[string]func()
-	removedPods map[string]func()
+	// undoLog holds the inverse of every AddPod/RemovePod call, oldest first.
+	undoLog []func() error
 }
 
 // NewMutatingSnapshot wraps a cache.Snapshot with reversible AddPod and RemovePod operations.
 func NewMutatingSnapshot(snapshot *cache.Snapshot) *MutatingSnapshot {
 	return &MutatingSnapshot{
-		Snapshot:    snapshot,
-		addedPods:   map[string]func(){},
-		removedPods: map[string]func(){},
+		Snapshot: snapshot,
 	}
 }
 
 // RemovePod removes a pod from its assigned node in the snapshot without advancing node generation.
 func (s *MutatingSnapshot) RemovePod(logger klog.Logger, podInfo *framework.PodInfo) error {
-	key, err := framework.GetPodKey(podInfo.Pod)
-	if err != nil {
+	if _, err := framework.GetPodKey(podInfo.Pod); err != nil {
 		return err
 	}
 
@@ -85,18 +84,13 @@ func (s *MutatingSnapshot) RemovePod(logger klog.Logger, podInfo *framework.PodI
 		return err
 	}
 
-	if _, ok := s.addedPods[key]; ok {
-		delete(s.addedPods, key)
-	} else {
-		s.removedPods[key] = func() { _ = s.AddPod(logger, podInfo) }
-	}
+	s.undoLog = append(s.undoLog, func() error { return s.AddPod(logger, podInfo) })
 	return nil
 }
 
 // AddPod adds a pod to its assigned node in the snapshot without advancing node generation.
 func (s *MutatingSnapshot) AddPod(logger klog.Logger, podInfo *framework.PodInfo) error {
-	key, err := framework.GetPodKey(podInfo.Pod)
-	if err != nil {
+	if _, err := framework.GetPodKey(podInfo.Pod); err != nil {
 		return err
 	}
 
@@ -115,25 +109,22 @@ func (s *MutatingSnapshot) AddPod(logger klog.Logger, podInfo *framework.PodInfo
 	}()
 	ni.AddPodInfo(podInfo)
 
-	if _, ok := s.removedPods[key]; ok {
-		delete(s.removedPods, key)
-	} else {
-		s.addedPods[key] = func() { _ = s.RemovePod(logger, podInfo) }
-	}
+	s.undoLog = append(s.undoLog, func() error { return s.RemovePod(logger, podInfo) })
 	return nil
 }
 
-// RestoreState reverts all pod additions and removals recorded on the MutatingSnapshot.
-func (s *MutatingSnapshot) RestoreState() {
-	for _, restoreFn := range s.addedPods {
-		restoreFn()
+// RestoreState reverts all pod additions and removals recorded on the MutatingSnapshot, most
+// recent first. It keeps going when an inverse operation fails and returns all such errors joined.
+func (s *MutatingSnapshot) RestoreState() error {
+	var errs []error
+	for _, undo := range slices.Backward(s.undoLog) {
+		if err := undo(); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	for _, restoreFn := range s.removedPods {
-		restoreFn()
-	}
-
-	s.addedPods = map[string]func(){}
-	s.removedPods = map[string]func(){}
+	// The inverse operations above go through AddPod/RemovePod, which log inverses of their own.
+	s.undoLog = nil
+	return errors.Join(errs...)
 }
 
 // GetNodeByPod returns the NodeInfo for the node specified in pod.Spec.NodeName.
