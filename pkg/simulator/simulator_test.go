@@ -45,6 +45,7 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
+	"sigs.k8s.io/scheduler-library/pkg/preemption"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
 	testutils "sigs.k8s.io/scheduler-library/pkg/upstreamsync/testutils"
 )
@@ -1051,5 +1052,96 @@ func TestOutOfTreePluginKubeConfigIsReadonly(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "mutations are not supported in scheduler library") {
 		t.Errorf("Expected a read-only transport error, got: %v", err)
+	}
+}
+
+type simulatorTestVictim struct {
+	pods []*v1.Pod
+}
+
+func (v *simulatorTestVictim) Pods() []*v1.Pod {
+	return v.pods
+}
+
+func TestCommittedVictimPluginWithFilterWildcardDisabled(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.GenericWorkload: true,
+	})
+
+	ctx := t.Context()
+	cfg := &schedulerapi.KubeSchedulerConfiguration{
+		Profiles: []schedulerapi.KubeSchedulerProfile{
+			{
+				SchedulerName: v1.DefaultSchedulerName,
+				Plugins: &schedulerapi.Plugins{
+					QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+					PreFilter: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "NodeResourcesFit"}}},
+					Filter: schedulerapi.PluginSet{
+						Disabled: []schedulerapi.Plugin{{Name: "*"}},
+						Enabled:  []schedulerapi.Plugin{{Name: "NodeResourcesFit"}},
+					},
+					Bind: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+				},
+				PluginConfig: []schedulerapi.PluginConfig{
+					{
+						Name: "NodeResourcesFit",
+						Args: &schedulerapi.NodeResourcesFitArgs{
+							ScoringStrategy: &schedulerapi.ScoringStrategy{
+								Type: schedulerapi.LeastAllocated,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	sim, err := NewSchedulingSimulator(ctx, cfg, ReadonlyClient{client: fake.NewClientset()}, nil)
+	if err != nil {
+		t.Fatalf("NewSchedulingSimulator failed: %v", err)
+	}
+
+	node1 := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "4",
+		v1.ResourceMemory: "8Gi",
+		v1.ResourcePods:   "10",
+	}).Obj()
+	pg := testutils.MakeGangPodGroup("gang-pg", "", 1)
+
+	snap, err := sim.NewClusterSnapshot(ctx, nil, []*v1.Node{node1}, []*schedulingv1beta1.PodGroup{pg}, nil)
+	if err != nil {
+		t.Fatalf("NewClusterSnapshot failed: %v", err)
+	}
+
+	committedPod := testutils.MakePod("v-committed", "", "2")
+	committedPod.Spec.NodeName = "node1"
+	res := snap.ScheduleWorkload(ctx, []*v1.Pod{testutils.MakePod("w-pod", "gang-pg", "2")}, snapshot.ScheduleWorkloadOptions{
+		WorkloadPreemptionOptions: snapshot.WorkloadPreemptionOptions{
+			CommittedVictims: []snapshot.PreemptionVictim{
+				&simulatorTestVictim{pods: []*v1.Pod{committedPod}},
+			},
+		},
+	})
+
+	if res.Status.Code() != fwk.Unschedulable {
+		t.Fatalf("Status.Code() = %v, want Unschedulable (status: %v)", res.Status.Code(), res.Status)
+	}
+	if !res.WaitingForPreemption {
+		t.Errorf("WaitingForPreemption = false, want true when only node is occupied by CommittedVictims")
+	}
+}
+
+func TestNewSchedulingSimulator_DuplicateBuiltinPluginRegistrationReturnsError(t *testing.T) {
+	ctx := t.Context()
+	cfg := minimalConfig()
+	registry := frameworkruntime.Registry{
+		preemption.CommittedVictimsPluginName: func(_ context.Context, _ runtime.Object, _ fwk.Handle) (fwk.Plugin, error) {
+			return &preemption.CommittedVictimPlugin{}, nil
+		},
+	}
+
+	_, err := NewSchedulingSimulator(ctx, cfg, ReadonlyClient{client: fake.NewClientset()}, nil, WithOutOfTreeRegistry(registry))
+	if err == nil {
+		t.Fatal("Expected NewSchedulingSimulator to return error on conflicting plugin registration, got nil")
 	}
 }

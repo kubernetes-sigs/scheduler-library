@@ -29,10 +29,33 @@ import (
 	"k8s.io/kubernetes/pkg/features"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
+	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	"sigs.k8s.io/scheduler-library/pkg/framework"
 	"sigs.k8s.io/scheduler-library/pkg/preemption"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
 )
+
+// SnapshotTestOption customizes the scheduler profile or out-of-tree plugin registry used by SetupSnapshotTestWithPodGroups.
+type SnapshotTestOption func(*snapshotTestOptions)
+
+type snapshotTestOptions struct {
+	outOfTreeRegistry frameworkruntime.Registry
+	profileModifiers  []func(*schedulerapi.KubeSchedulerProfile)
+}
+
+// WithOutOfTreeRegistry registers additional out-of-tree plugins alongside the simulator's built-in plugins.
+func WithOutOfTreeRegistry(registry frameworkruntime.Registry) SnapshotTestOption {
+	return func(o *snapshotTestOptions) {
+		o.outOfTreeRegistry = registry
+	}
+}
+
+// WithProfileModifier customizes the test scheduler profile before simulator configuration updates are applied.
+func WithProfileModifier(fn func(*schedulerapi.KubeSchedulerProfile)) SnapshotTestOption {
+	return func(o *snapshotTestOptions) {
+		o.profileModifiers = append(o.profileModifiers, fn)
+	}
+}
 
 // SetupSnapshotTest initializes a fake clientset, snapshot, and default profile map for unit tests.
 func SetupSnapshotTest(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (*upstreamsync.ProfileMap, *cache.Snapshot, error) {
@@ -121,7 +144,13 @@ func SetupSnapshotTestWithPodGroups(
 	nodes []*v1.Node,
 	podGroups []*schedulingv1beta1.PodGroup,
 	compositePodGroups []*schedulingv1alpha3.CompositePodGroup,
+	opts ...SnapshotTestOption,
 ) (*upstreamsync.ProfileMap, *cache.Snapshot, error) {
+	var testOpts snapshotTestOptions
+	for _, opt := range opts {
+		opt(&testOpts)
+	}
+
 	framework.InitMetricsOnce()
 	client := fake.NewClientset()
 	for _, n := range nodes {
@@ -166,6 +195,13 @@ func SetupSnapshotTestWithPodGroups(
 			},
 		},
 	}
+	for _, modify := range testOpts.profileModifiers {
+		modify(&prof.Profiles[0])
+	}
+	cfg, err := framework.UpdateSimulatorConfig(&prof)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
 		features.TopologyAwareWorkloadScheduling: true,
@@ -175,7 +211,22 @@ func SetupSnapshotTestWithPodGroups(
 
 	snap := cache.NewTestSnapshotWithCompositePodGroups(pods, nodes, podGroups, compositePodGroups)
 	informerFactory := informers.NewSharedInformerFactory(client, 0)
-	comps, err := upstreamsync.NewFrameworkComponents(ctx, client, informerFactory, upstreamsync.WithProfiles(prof.Profiles...))
+	registry, err := framework.SimulatorRegistry()
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(testOpts.outOfTreeRegistry) > 0 {
+		if err := registry.Merge(testOpts.outOfTreeRegistry); err != nil {
+			return nil, nil, err
+		}
+	}
+	comps, err := upstreamsync.NewFrameworkComponents(
+		ctx,
+		client,
+		informerFactory,
+		upstreamsync.WithProfiles(cfg.Profiles...),
+		upstreamsync.WithFrameworkOutOfTreeRegistry(registry),
+	)
 	if err != nil {
 		return nil, nil, err
 	}

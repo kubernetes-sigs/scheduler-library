@@ -26,8 +26,7 @@ import (
 // PreemptionVictim is an atomic unit of preemption, which can contain 1 or more pods.
 type PreemptionVictim interface {
 	// Pods can contain 1 or more pods.
-	// The returned pods must not overlap across victims and must be present in the
-	// snapshot with Spec.NodeName set.
+	// The returned pods must not overlap across victims.
 	Pods() []*v1.Pod
 }
 
@@ -72,14 +71,18 @@ type WorkloadPreemptionOptions struct {
 	// workload, ordered from least to most valuable.
 	// It is consumed during stage 1 to find the smallest prefix of victims needed for the
 	// workload to fit, after which stage 2 attempts to reprieve victims from that prefix.
+	// Provided victims must be present in the snapshot with Spec.NodeName set.
 	// If nil or empty, no additional victims are considered during stage 1.
 	PotentialVictims iter.Seq[PreemptionVictim]
 
-	// CommittedVictims are victims that are preempted after the initial scheduling attempt
-	// fails (or is skipped by [PreemptionFilter.MayFit]), but before stage 1 begins.
-	// Unlike PotentialVictims, they are never candidates for reprieval in stage 2.
-	// Each committed victim is passed to [PreemptionFilter.PreemptVictim] before stage 1.
-	// If nil or empty, no victims are preempted upfront.
+	// CommittedVictims are victims that have already been preempted by an earlier workload
+	// and removed from the snapshot by the caller before invoking ScheduleWorkload.
+	// ScheduleWorkload first attempts to schedule the workload with nodes occupied by
+	// CommittedVictims filtered out (and CommittedVictims temporarily unpreempted in
+	// PreemptionFilter, if set); if that fails, it retries across all nodes with
+	// CommittedVictims active and sets WaitingForPreemption = true if the workload fits.
+	// If the caller also uses [WorkloadPreemptionOptions.PreemptionFilter], the caller must
+	// update the filter for CommittedVictims prior to calling ScheduleWorkload.
 	CommittedVictims []PreemptionVictim
 
 	// PreemptionFilter is an optional fast pre-check used before the initial scheduling

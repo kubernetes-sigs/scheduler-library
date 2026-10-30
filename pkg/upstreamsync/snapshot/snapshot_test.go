@@ -16,6 +16,7 @@ package snapshot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
@@ -28,14 +29,18 @@ import (
 	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/features"
+	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
+	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	ft "sigs.k8s.io/scheduler-library/pkg/framework/testing"
+	"sigs.k8s.io/scheduler-library/pkg/preemption"
 	testutils "sigs.k8s.io/scheduler-library/pkg/upstreamsync/testutils"
 )
 
@@ -2106,17 +2111,18 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 	v7PodNode2 := makeScheduledTestPod("v7-pod", "node2", "", "2")
 
 	tests := []struct {
-		name                string
-		nodes               []*v1.Node
-		existingPods        []*v1.Pod
-		workloadPods        []*v1.Pod
-		buildOpts           func() (ScheduleWorkloadOptions, *cpuPreemptionFilter)
-		wantStatusCode      fwk.Code
-		wantScheduled       bool
-		wantVictimNames     []string
-		expectSnapshotState map[string]sets.Set[string]
-		wantError           bool
-		wantEmptyPodResults bool
+		name                     string
+		nodes                    []*v1.Node
+		existingPods             []*v1.Pod
+		workloadPods             []*v1.Pod
+		buildOpts                func() (ScheduleWorkloadOptions, *cpuPreemptionFilter)
+		wantStatusCode           fwk.Code
+		wantScheduled            bool
+		wantWaitingForPreemption bool
+		wantVictimNames          []string
+		expectSnapshotState      map[string]sets.Set[string]
+		wantError                bool
+		wantEmptyPodResults      bool
 	}{
 		{
 			name:         "Workload fits without preemption when sufficient capacity is free",
@@ -2137,9 +2143,10 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					},
 				}, f
 			},
-			wantStatusCode:  fwk.Success,
-			wantScheduled:   true,
-			wantVictimNames: nil,
+			wantStatusCode:           fwk.Success,
+			wantScheduled:            true,
+			wantWaitingForPreemption: false,
+			wantVictimNames:          nil,
 			expectSnapshotState: map[string]sets.Set[string]{
 				"node1": sets.New("v1-pod", "v2-pod", "w-pod1", "w-pod2"),
 			},
@@ -2164,9 +2171,10 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					},
 				}, f
 			},
-			wantStatusCode:  fwk.Unschedulable,
-			wantScheduled:   true,
-			wantVictimNames: []string{"vMed"},
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            true,
+			wantWaitingForPreemption: true,
+			wantVictimNames:          []string{"vMed"},
 			expectSnapshotState: map[string]sets.Set[string]{
 				"node1": sets.New("v-small-pod", "v-med-pod", "v-high-pod"),
 			},
@@ -2191,9 +2199,10 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					},
 				}, f
 			},
-			wantStatusCode:  fwk.Unschedulable,
-			wantScheduled:   true,
-			wantVictimNames: []string{"vMed"},
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            true,
+			wantWaitingForPreemption: true,
+			wantVictimNames:          []string{"vMed"},
 			expectSnapshotState: map[string]sets.Set[string]{
 				"node1": sets.New("v-small-pod", "v-med-pod", "v-high-pod"),
 			},
@@ -2217,9 +2226,10 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					},
 				}, nil
 			},
-			wantStatusCode:  fwk.Unschedulable,
-			wantScheduled:   true,
-			wantVictimNames: []string{"vMed"},
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            true,
+			wantWaitingForPreemption: true,
+			wantVictimNames:          []string{"vMed"},
 			expectSnapshotState: map[string]sets.Set[string]{
 				"node1": sets.New("v-small-pod", "v-med-pod", "v-high-pod"),
 			},
@@ -2250,9 +2260,10 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					},
 				}, f
 			},
-			wantStatusCode:  fwk.Unschedulable,
-			wantScheduled:   true,
-			wantVictimNames: []string{"vLarge3", "vSmall"},
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            true,
+			wantWaitingForPreemption: true,
+			wantVictimNames:          []string{"vLarge3", "vSmall"},
 			expectSnapshotState: map[string]sets.Set[string]{
 				"node1": sets.New("v-small-pod", "v-med2-pod", "v-large3-pod"),
 			},
@@ -2276,9 +2287,10 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					},
 				}, f
 			},
-			wantStatusCode:  fwk.Unschedulable,
-			wantScheduled:   true,
-			wantVictimNames: []string{"vMulti"},
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            true,
+			wantWaitingForPreemption: true,
+			wantVictimNames:          []string{"vMulti"},
 			expectSnapshotState: map[string]sets.Set[string]{
 				"node1": sets.New("v-multi-1", "v-multi-2", "v-single-1"),
 			},
@@ -2302,17 +2314,18 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					},
 				}, f
 			},
-			wantStatusCode:  fwk.Unschedulable,
-			wantScheduled:   true,
-			wantVictimNames: []string{"vSingle"},
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            true,
+			wantWaitingForPreemption: true,
+			wantVictimNames:          []string{"vSingle"},
 			expectSnapshotState: map[string]sets.Set[string]{
 				"node1": sets.New("v-multi-s1", "v-multi-s2", "v-single-1"),
 			},
 		},
 		{
-			name:         "CommittedVictims suffice without touching PotentialVictims and are included in PreemptionVictims",
+			name:         "CommittedVictims suffice without touching PotentialVictims and set WaitingForPreemption",
 			nodes:        []*v1.Node{node8CPU},
-			existingPods: []*v1.Pod{vCommittedPod, v1Pod2CPU, v2Pod2CPU},
+			existingPods: []*v1.Pod{v1Pod2CPU, v2Pod2CPU},
 			workloadPods: []*v1.Pod{
 				testutils.MakePod("w-pod1", "gang-pg", "2"),
 				testutils.MakePod("w-pod2", "gang-pg", "2"),
@@ -2321,7 +2334,8 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 				vCommitted := &testVictim{name: "vCommitted", pods: []*v1.Pod{vCommittedPod}}
 				vic1 := &testVictim{name: "v1", pods: []*v1.Pod{v1Pod2CPU}}
 				vic2 := &testVictim{name: "v2", pods: []*v1.Pod{v2Pod2CPU}}
-				f := newCPUPreemptionFilter(4, 4)
+				f := newCPUPreemptionFilter(2, 4)
+				f.PreemptVictim(vCommitted)
 				return ScheduleWorkloadOptions{
 					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
 						CommittedVictims: []PreemptionVictim{vCommitted},
@@ -2330,17 +2344,18 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					},
 				}, f
 			},
-			wantStatusCode:  fwk.Unschedulable,
-			wantScheduled:   true,
-			wantVictimNames: []string{"vCommitted"},
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            true,
+			wantWaitingForPreemption: true,
+			wantVictimNames:          nil,
 			expectSnapshotState: map[string]sets.Set[string]{
-				"node1": sets.New("v-committed", "v1-pod", "v2-pod"),
+				"node1": sets.New("v1-pod", "v2-pod"),
 			},
 		},
 		{
-			name:         "CommittedVictims combined with PotentialVictims includes CommittedVictims in PreemptionVictims",
+			name:         "CommittedVictims combined with PotentialVictims returns only newly preempted victims in PreemptionVictims",
 			nodes:        []*v1.Node{node8CPU},
-			existingPods: []*v1.Pod{vCommittedPod, v1Pod2CPU, v2Pod2CPU, v3Pod2CPU},
+			existingPods: []*v1.Pod{v1Pod2CPU, v2Pod2CPU, v3Pod2CPU},
 			workloadPods: []*v1.Pod{
 				testutils.MakePod("w-pod1", "gang-pg", "2"),
 				testutils.MakePod("w-pod2", "gang-pg", "2"),
@@ -2350,7 +2365,8 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 				vic1 := &testVictim{name: "v1", pods: []*v1.Pod{v1Pod2CPU}}
 				vic2 := &testVictim{name: "v2", pods: []*v1.Pod{v2Pod2CPU}}
 				vic3 := &testVictim{name: "v3", pods: []*v1.Pod{v3Pod2CPU}}
-				f := newCPUPreemptionFilter(2, 4)
+				f := newCPUPreemptionFilter(0, 4)
+				f.PreemptVictim(vCommitted)
 				return ScheduleWorkloadOptions{
 					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
 						CommittedVictims: []PreemptionVictim{vCommitted},
@@ -2359,17 +2375,122 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					},
 				}, f
 			},
-			wantStatusCode:  fwk.Unschedulable,
-			wantScheduled:   true,
-			wantVictimNames: []string{"vCommitted", "v1"},
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            true,
+			wantWaitingForPreemption: true,
+			wantVictimNames:          []string{"v1"},
 			expectSnapshotState: map[string]sets.Set[string]{
-				"node1": sets.New("v-committed", "v1-pod", "v2-pod", "v3-pod"),
+				"node1": sets.New("v1-pod", "v2-pod", "v3-pod"),
+			},
+		},
+		{
+			name: "Workload avoids node with CommittedVictims when another node has free capacity",
+			nodes: []*v1.Node{
+				node6CPU,
+				st.MakeNode().Name("node2").Capacity(map[v1.ResourceName]string{
+					v1.ResourceCPU:    "6",
+					v1.ResourceMemory: "8Gi",
+					v1.ResourcePods:   "10",
+				}).Obj(),
+			},
+			existingPods: nil,
+			workloadPods: []*v1.Pod{
+				testutils.MakePod("w-pod1", "gang-pg", "2"),
+				testutils.MakePod("w-pod2", "gang-pg", "2"),
+			},
+			buildOpts: func() (ScheduleWorkloadOptions, *cpuPreemptionFilter) {
+				vCommittedNode2 := &testVictim{name: "vCommittedNode2", pods: []*v1.Pod{v5PodNode2}}
+				return ScheduleWorkloadOptions{
+					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
+						CommittedVictims: []PreemptionVictim{vCommittedNode2},
+					},
+				}, nil
+			},
+			wantStatusCode:           fwk.Success,
+			wantScheduled:            true,
+			wantWaitingForPreemption: false,
+			wantVictimNames:          nil,
+			expectSnapshotState: map[string]sets.Set[string]{
+				"node1": sets.New("w-pod1", "w-pod2"),
+				"node2": nil,
+			},
+		},
+		{
+			name: "Workload fits on node without CommittedVictims but waits for preemption when PreemptionFilter only passes thanks to CommittedVictims",
+			nodes: []*v1.Node{
+				node6CPU,
+				st.MakeNode().Name("node2").Capacity(map[v1.ResourceName]string{
+					v1.ResourceCPU:    "2",
+					v1.ResourceMemory: "8Gi",
+					v1.ResourcePods:   "10",
+				}).Obj(),
+			},
+			existingPods: nil,
+			workloadPods: []*v1.Pod{
+				testutils.MakePod("w-pod1", "gang-pg", "3"),
+				testutils.MakePod("w-pod2", "gang-pg", "3"),
+			},
+			buildOpts: func() (ScheduleWorkloadOptions, *cpuPreemptionFilter) {
+				vCommittedNode2 := &testVictim{name: "vCommittedNode2", pods: []*v1.Pod{v5PodNode2}}
+				// Available external quota is 2 CPU without vCommittedNode2 (insufficient for required 4 CPU),
+				// and 4 CPU only after vCommittedNode2 (2 CPU) is preempted.
+				f := newCPUPreemptionFilter(2, 4)
+				f.PreemptVictim(vCommittedNode2)
+				return ScheduleWorkloadOptions{
+					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
+						CommittedVictims: []PreemptionVictim{vCommittedNode2},
+						PreemptionFilter: f,
+					},
+				}, f
+			},
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            true,
+			wantWaitingForPreemption: true,
+			wantVictimNames:          nil,
+			expectSnapshotState: map[string]sets.Set[string]{
+				"node1": nil,
+				"node2": nil,
+			},
+		},
+		{
+			name: "Workload fits without waiting and preserves CommittedVictims in PreemptionFilter when PreemptionFilter passes without CommittedVictims",
+			nodes: []*v1.Node{
+				node6CPU,
+				st.MakeNode().Name("node2").Capacity(map[v1.ResourceName]string{
+					v1.ResourceCPU:    "6",
+					v1.ResourceMemory: "8Gi",
+					v1.ResourcePods:   "10",
+				}).Obj(),
+			},
+			existingPods: nil,
+			workloadPods: []*v1.Pod{
+				testutils.MakePod("w-pod1", "gang-pg", "2"),
+				testutils.MakePod("w-pod2", "gang-pg", "2"),
+			},
+			buildOpts: func() (ScheduleWorkloadOptions, *cpuPreemptionFilter) {
+				vCommittedNode2 := &testVictim{name: "vCommittedNode2", pods: []*v1.Pod{v5PodNode2}}
+				f := newCPUPreemptionFilter(4, 4)
+				f.PreemptVictim(vCommittedNode2)
+				return ScheduleWorkloadOptions{
+					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
+						CommittedVictims: []PreemptionVictim{vCommittedNode2},
+						PreemptionFilter: f,
+					},
+				}, f
+			},
+			wantStatusCode:           fwk.Success,
+			wantScheduled:            true,
+			wantWaitingForPreemption: false,
+			wantVictimNames:          nil,
+			expectSnapshotState: map[string]sets.Set[string]{
+				"node1": sets.New("w-pod1", "w-pod2"),
+				"node2": nil,
 			},
 		},
 		{
 			name:         "Workload fails after exhausting all PotentialVictims and rolls back all snapshot mutations",
 			nodes:        []*v1.Node{node6CPU},
-			existingPods: []*v1.Pod{vCommittedPod, v1Pod2CPU, v2Pod2CPU},
+			existingPods: []*v1.Pod{v1Pod2CPU, v2Pod2CPU},
 			workloadPods: []*v1.Pod{
 				testutils.MakePod("w-heavy1", "gang-pg", "4"),
 				testutils.MakePod("w-heavy2", "gang-pg", "4"),
@@ -2378,7 +2499,8 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 				vCommitted := &testVictim{name: "vCommitted", pods: []*v1.Pod{vCommittedPod}}
 				vic1 := &testVictim{name: "v1", pods: []*v1.Pod{v1Pod2CPU}}
 				vic2 := &testVictim{name: "v2", pods: []*v1.Pod{v2Pod2CPU}}
-				f := newCPUPreemptionFilter(2, 4)
+				f := newCPUPreemptionFilter(0, 4)
+				f.PreemptVictim(vCommitted)
 				return ScheduleWorkloadOptions{
 					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
 						CommittedVictims: []PreemptionVictim{vCommitted},
@@ -2387,12 +2509,13 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					},
 				}, f
 			},
-			wantStatusCode:      fwk.Unschedulable,
-			wantScheduled:       false,
-			wantVictimNames:     nil,
-			wantEmptyPodResults: true,
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            false,
+			wantWaitingForPreemption: false,
+			wantVictimNames:          nil,
+			wantEmptyPodResults:      true,
 			expectSnapshotState: map[string]sets.Set[string]{
-				"node1": sets.New("v-committed", "v1-pod", "v2-pod"),
+				"node1": sets.New("v1-pod", "v2-pod"),
 			},
 		},
 		{
@@ -2416,9 +2539,10 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					},
 				}, f
 			},
-			wantStatusCode:  fwk.Unschedulable,
-			wantScheduled:   true,
-			wantVictimNames: []string{"vMed"},
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            true,
+			wantWaitingForPreemption: true,
+			wantVictimNames:          []string{"vMed"},
 			expectSnapshotState: map[string]sets.Set[string]{
 				"node1": sets.New("v-small-pod", "v-med-pod", "v-high-pod"),
 			},
@@ -2426,7 +2550,7 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 		{
 			name:         "Insufficient CommittedVictims with nil PotentialVictims returns Unschedulable without panicking",
 			nodes:        []*v1.Node{node6CPU},
-			existingPods: []*v1.Pod{vCommittedPod, v1Pod2CPU, v2Pod2CPU},
+			existingPods: []*v1.Pod{v1Pod2CPU, v2Pod2CPU},
 			workloadPods: []*v1.Pod{
 				testutils.MakePod("w-heavy1", "gang-pg", "4"),
 				testutils.MakePod("w-heavy2", "gang-pg", "4"),
@@ -2440,17 +2564,18 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					},
 				}, nil
 			},
-			wantStatusCode:  fwk.Unschedulable,
-			wantScheduled:   false,
-			wantVictimNames: nil,
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            false,
+			wantWaitingForPreemption: false,
+			wantVictimNames:          nil,
 			expectSnapshotState: map[string]sets.Set[string]{
-				"node1": sets.New("v-committed", "v1-pod", "v2-pod"),
+				"node1": sets.New("v1-pod", "v2-pod"),
 			},
 		},
 		{
 			name:         "CommittedVictims with nil entry returns error",
 			nodes:        []*v1.Node{node8CPU},
-			existingPods: []*v1.Pod{vCommittedPod, v1Pod2CPU, v2Pod2CPU, v3Pod2CPU},
+			existingPods: []*v1.Pod{v1Pod2CPU, v2Pod2CPU, v3Pod2CPU},
 			workloadPods: []*v1.Pod{
 				testutils.MakePod("w-pod1", "gang-pg", "2"),
 				testutils.MakePod("w-pod2", "gang-pg", "2"),
@@ -2459,9 +2584,9 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 				vCommitted := &testVictim{name: "vCommitted", pods: []*v1.Pod{vCommittedPod}}
 				vic1 := &testVictim{name: "v1", pods: []*v1.Pod{v1Pod2CPU}}
 				vic2 := &testVictim{name: "v2", pods: []*v1.Pod{v2Pod2CPU}}
-				committed := make([]PreemptionVictim, 2, 4)
-				committed[0] = nil
-				committed[1] = vCommitted
+				committed := []PreemptionVictim{
+					nil, vCommitted,
+				}
 				return ScheduleWorkloadOptions{
 					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
 						CommittedVictims: committed,
@@ -2469,11 +2594,12 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					},
 				}, nil
 			},
-			wantStatusCode:  fwk.Error,
-			wantScheduled:   false,
-			wantVictimNames: nil,
+			wantStatusCode:           fwk.Error,
+			wantScheduled:            false,
+			wantWaitingForPreemption: false,
+			wantVictimNames:          nil,
 			expectSnapshotState: map[string]sets.Set[string]{
-				"node1": sets.New("v-committed", "v1-pod", "v2-pod", "v3-pod"),
+				"node1": sets.New("v1-pod", "v2-pod", "v3-pod"),
 			},
 			wantError: true,
 		},
@@ -2520,9 +2646,10 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					},
 				}, f
 			},
-			wantStatusCode:  fwk.Unschedulable,
-			wantScheduled:   true,
-			wantVictimNames: []string{"v0", "v1", "v2", "v4"},
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            true,
+			wantWaitingForPreemption: true,
+			wantVictimNames:          []string{"v0", "v1", "v2", "v4"},
 			expectSnapshotState: map[string]sets.Set[string]{
 				"node1": sets.New("v0-pod", "v1-1cpu-pod", "v2-1cpu-pod", "v3-1cpu-pod", "v4-2cpu-pod"),
 				"node2": sets.New("v5-pod", "v6-pod", "v7-pod"),
@@ -2555,6 +2682,10 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 				t.Fatalf("ScheduleWorkload() Status.Code() = %v, want %v (status: %v)", result.Status.Code(), tt.wantStatusCode, result.Status)
 			}
 
+			if result.WaitingForPreemption != tt.wantWaitingForPreemption {
+				t.Errorf("ScheduleWorkload() WaitingForPreemption = %v, want %v", result.WaitingForPreemption, tt.wantWaitingForPreemption)
+			}
+
 			gotVictims := victimNames(result.PreemptionVictims)
 			if diff := cmp.Diff(tt.wantVictimNames, gotVictims, cmpopts.SortSlices(func(a, b string) bool { return a < b })); diff != "" {
 				t.Errorf("PreemptionVictims mismatch (-want +got):\n%s", diff)
@@ -2580,8 +2711,9 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					}
 				}
 				if filter != nil {
-					if len(filter.activeVictims) != len(result.PreemptionVictims) {
-						t.Errorf("filter activeVictims count = %d, want %d", len(filter.activeVictims), len(result.PreemptionVictims))
+					wantActive := len(result.PreemptionVictims) + len(opts.CommittedVictims)
+					if len(filter.activeVictims) != wantActive {
+						t.Errorf("filter activeVictims count = %d, want %d", len(filter.activeVictims), wantActive)
 					}
 				}
 			} else if tt.wantError || tt.wantEmptyPodResults {
@@ -2609,6 +2741,216 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 			}
 
 			ft.VerifySnapshot(t, snap, tt.expectSnapshotState)
+		})
+	}
+}
+
+// fakePlacementGeneratePlugin scripts PlacementGenerate per ScheduleWorkload pass (Pass 1..3 at index 0..2)
+// and counts calls per pass; Success/nil passes parentPlacement through, else returns a clone of the status.
+type fakePlacementGeneratePlugin struct {
+	passStatuses [3]*fwk.Status
+	inPass3      bool
+	calls        [3]int
+}
+
+var _ fwk.PlacementGeneratePlugin = &fakePlacementGeneratePlugin{}
+
+func (p *fakePlacementGeneratePlugin) Name() string { return "FakePlacementGenerate" }
+
+func (p *fakePlacementGeneratePlugin) GeneratePlacements(_ context.Context, state fwk.PodGroupCycleState, _ fwk.PodGroupInfo, parentPlacement *fwk.Placement) (*fwk.GeneratePlacementsResult, *fwk.Status) {
+	// Pass 3 sets inPass3 based on PotentialVictims iterator state; before Pass 3, only Pass 1 sets CommittedVictims state in CycleState.
+	passIdx := 1
+	if p.inPass3 {
+		passIdx = 2
+	} else if preemption.HasCommittedVictimsInCycleStateForTest(state) {
+		passIdx = 0
+	}
+	p.calls[passIdx]++
+	// Fail loudly if a pass repeats.
+	if p.calls[passIdx] > 1 {
+		return nil, fwk.AsStatus(fmt.Errorf("unexpected repeated PlacementGenerate call in pass %d", passIdx+1))
+	}
+	scripted := p.passStatuses[passIdx]
+	if !scripted.IsSuccess() {
+		// Clone so the framework's WithPlugin mutation does not alter shared test table fixtures.
+		return nil, scripted.Clone()
+	}
+	return &fwk.GeneratePlacementsResult{Placements: []*fwk.Placement{parentPlacement}}, nil
+}
+
+func TestScheduleWorkload_PreservesPassFailureResults(t *testing.T) {
+	// node1 holds vPotentialPod (2 of 6 CPU), leaving 4 CPU free so the 2x2-CPU gang fits unless rejected.
+	node6CPU := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "6",
+		v1.ResourceMemory: "8Gi",
+		v1.ResourcePods:   "10",
+	}).Obj()
+	gangPG := testutils.MakeGangPodGroup("gang-pg", "", 2)
+	vPotentialPod := makeScheduledTestPod("v-potential", "node1", "", "2")
+	vPotential := &testVictim{name: "vPotential", pods: []*v1.Pod{vPotentialPod}}
+	// vCommitted targets node1 but is excluded from existing pods since callers preempt it beforehand.
+	vCommitted := &testVictim{name: "vCommitted", pods: []*v1.Pod{makeScheduledTestPod("v-committed", "node1", "", "2")}}
+
+	// Shared statuses carry pass-specific messages so assertions pinpoint which pass produced the result.
+	allowPlacement := fwk.NewStatus(fwk.Success)
+	pass1Err := fwk.AsStatus(errors.New("pass 1 placement error"))
+	pass1Unresolvable := fwk.NewStatus(fwk.UnschedulableAndUnresolvable, "pass 1 unresolvable rejection")
+	pass1Unschedulable := fwk.NewStatus(fwk.Unschedulable, "pass 1 unschedulable rejection")
+	pass2Err := fwk.AsStatus(errors.New("pass 2 placement error"))
+	pass2Unresolvable := fwk.NewStatus(fwk.UnschedulableAndUnresolvable, "pass 2 unresolvable rejection")
+	pass2Unschedulable := fwk.NewStatus(fwk.Unschedulable, "pass 2 unschedulable rejection")
+	pass3Unschedulable := fwk.NewStatus(fwk.Unschedulable, "pass 3 unschedulable rejection")
+
+	// Every case wires PotentialVictims so unexpected fallthrough into Pass 3 fails loudly instead of returning early.
+	tests := []struct {
+		name                         string
+		includeCommittedVictims      bool
+		skipPass1ViaPreemptionFilter bool
+		// passStatuses scripts Pass 1..3; nil asserts that pass never calls PlacementGenerate.
+		passStatuses [3]*fwk.Status
+		wantStatus   *fwk.Status
+	}{
+		{
+			name:                    "Pass 1 Error short-circuits before Pass 2 and Pass 3",
+			includeCommittedVictims: true,
+			passStatuses:            [3]*fwk.Status{pass1Err, nil, nil},
+			wantStatus:              pass1Err,
+		},
+		// Non-error terminal rejection in Pass 1 populates PodResults while still skipping Pass 2 and Pass 3.
+		{
+			name:                    "Pass 1 UnschedulableAndUnresolvable short-circuits before Pass 2 and Pass 3 and propagates Pass 1 PodResults",
+			includeCommittedVictims: true,
+			passStatuses:            [3]*fwk.Status{pass1Unresolvable, nil, nil},
+			wantStatus:              pass1Unresolvable,
+		},
+		{
+			name: "Pass 1 Unschedulable without CommittedVictims skips Pass 2 and propagates Pass 1 results when Pass 3 fails",
+			// Empty CommittedVictims skips Pass 2; Pass 3 failure falls back to Pass 1's status.
+			passStatuses: [3]*fwk.Status{pass1Unschedulable, nil, pass3Unschedulable},
+			wantStatus:   pass1Unschedulable,
+		},
+		{
+			name:                    "Pass 2 Error preserves status without masking as WaitingForPreemption and short-circuits before Pass 3",
+			includeCommittedVictims: true,
+			// allowPlacement lets Pass 1 reject on CommittedVictimPlugin so ScheduleWorkload enters Pass 2.
+			passStatuses: [3]*fwk.Status{allowPlacement, pass2Err, nil},
+			wantStatus:   pass2Err,
+		},
+		{
+			name:                    "Pass 2 UnschedulableAndUnresolvable overwrites Pass 1 result and short-circuits before Pass 3",
+			includeCommittedVictims: true,
+			passStatuses:            [3]*fwk.Status{allowPlacement, pass2Unresolvable, nil},
+			wantStatus:              pass2Unresolvable,
+		},
+		// Three distinct Unschedulable statuses prove Pass 2 overwrites Pass 1 and survives Pass 3 failure.
+		{
+			name:                    "Pass 2 Unschedulable overwrites Pass 1 result and propagates Pass 2 results when Pass 3 fails",
+			includeCommittedVictims: true,
+			passStatuses:            [3]*fwk.Status{allowPlacement, pass2Unschedulable, pass3Unschedulable},
+			wantStatus:              pass2Unschedulable,
+		},
+		{
+			name:                    "Pass 2 Unschedulable overwrites empty Pass 1 result when Pass 1 was skipped by PreemptionFilter",
+			includeCommittedVictims: true,
+			// PreemptionFilter skips Pass 1 (leaving empty PodResults) so Pass 2 must overwrite both fields.
+			skipPass1ViaPreemptionFilter: true,
+			passStatuses:                 [3]*fwk.Status{nil, pass2Unschedulable, pass3Unschedulable},
+			wantStatus:                   pass2Unschedulable,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			placementPlugin := &fakePlacementGeneratePlugin{passStatuses: tt.passStatuses}
+			var opts ScheduleWorkloadOptions
+			opts.PotentialVictims = func(yield func(PreemptionVictim) bool) {
+				placementPlugin.inPass3 = true
+				_ = yield(vPotential)
+			}
+			if tt.includeCommittedVictims {
+				opts.CommittedVictims = []PreemptionVictim{vCommitted}
+			}
+			// 2 free CPU < 4 required fails MayFit when Pass 1 unpreempts vCommitted, then passes in Pass 2 (2+2 >= 4).
+			if tt.skipPass1ViaPreemptionFilter {
+				f := newCPUPreemptionFilter(2, 4)
+				f.PreemptVictim(vCommitted)
+				opts.PreemptionFilter = f
+			}
+
+			// Wire FakePlacementGenerate into the default profile alongside the built-in plugins.
+			profileMap, snap, err := ft.SetupSnapshotTestWithPodGroups(
+				ctx, t, []*v1.Pod{vPotentialPod}, []*v1.Node{node6CPU}, []*schedulingv1beta1.PodGroup{gangPG}, nil,
+				ft.WithProfileModifier(func(prof *schedulerapi.KubeSchedulerProfile) {
+					prof.Plugins.PlacementGenerate.Enabled = append(prof.Plugins.PlacementGenerate.Enabled, schedulerapi.Plugin{Name: placementPlugin.Name()})
+				}),
+				ft.WithOutOfTreeRegistry(frameworkruntime.Registry{
+					placementPlugin.Name(): func(_ context.Context, _ runtime.Object, _ fwk.Handle) (fwk.Plugin, error) {
+						return placementPlugin, nil
+					},
+				}),
+			)
+			if err != nil {
+				t.Fatalf("SetupSnapshotTestWithPodGroups failed: %v", err)
+			}
+
+			// Allocate fresh 2x2-CPU gang pods per subtest so Spec.NodeName mutation checks stay isolated.
+			workloadPods := []*v1.Pod{
+				testutils.MakePod("w-pod1", "gang-pg", "2"),
+				testutils.MakePod("w-pod2", "gang-pg", "2"),
+			}
+			result := New(snap, profileMap).ScheduleWorkload(ctx, workloadPods, opts)
+
+			// Verify exact per-pass PlacementGenerate counts against the scripted test case.
+			var wantCalls [3]int
+			for i, s := range tt.passStatuses {
+				if s != nil {
+					wantCalls[i] = 1
+				}
+			}
+			if placementPlugin.calls != wantCalls {
+				t.Errorf("PlacementGenerate calls per pass = %v, want %v", placementPlugin.calls, wantCalls)
+			}
+
+			assertStatus := func(scope string, got *fwk.Status) {
+				t.Helper()
+				if got.Code() != tt.wantStatus.Code() || got.Message() != tt.wantStatus.Message() {
+					t.Errorf("%s = (%v, %q), want (%v, %q)", scope, got.Code(), got.Message(), tt.wantStatus.Code(), tt.wantStatus.Message())
+				}
+			}
+
+			// Failed workloads must propagate wantStatus and never report WaitingForPreemption or victims.
+			assertStatus("ScheduleWorkload() Status", result.Status)
+			if result.WaitingForPreemption || len(result.PreemptionVictims) != 0 {
+				t.Errorf("ScheduleWorkload() preemption = (waiting=%v, victims=%v), want (false, empty)", result.WaitingForPreemption, result.PreemptionVictims)
+			}
+
+			// Every PodResults entry must carry the failing pass's status and leave node bindings empty.
+			var gotPods []string
+			for _, pRes := range result.PodResults {
+				gotPods = append(gotPods, pRes.Pod.Name)
+				assertStatus(fmt.Sprintf("pod %s Status", pRes.Pod.Name), pRes.Status)
+				if pRes.SelectedNodeName != "" || pRes.Pod.Spec.NodeName != "" {
+					t.Errorf("pod %s nodes = (selected=%q, spec=%q), want both empty", pRes.Pod.Name, pRes.SelectedNodeName, pRes.Pod.Spec.NodeName)
+				}
+			}
+			// Error short-circuits before building PodResults; non-error rejections report every gang pod.
+			slices.Sort(gotPods)
+			var wantPods []string
+			if !tt.wantStatus.IsError() {
+				wantPods = []string{"w-pod1", "w-pod2"}
+			}
+			if diff := cmp.Diff(wantPods, gotPods); diff != "" {
+				t.Errorf("ScheduleWorkload() PodResults pods mismatch (-want +got):\n%s", diff)
+			}
+
+			// Verify caller input pods stay unbound and snapshot mutations from Pass 3 rolled back.
+			for _, pod := range workloadPods {
+				if pod.Spec.NodeName != "" {
+					t.Errorf("input pod %s Spec.NodeName = %q, want empty", pod.Name, pod.Spec.NodeName)
+				}
+			}
+			ft.VerifySnapshot(t, snap, map[string]sets.Set[string]{"node1": sets.New("v-potential")})
 		})
 	}
 }

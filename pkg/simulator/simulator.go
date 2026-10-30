@@ -68,10 +68,31 @@ type Simulator interface {
 	// If the pods do not belong to the same hierarchy, it returns an error status.
 	// The order of WorkloadSchedulingResult.PodResults is not guaranteed to match the order of input pods.
 	//
-	// When initial scheduling is skipped (because opts.PreemptionFilter.MayFit() is false) or
-	// fails with Unschedulable, and opts.CommittedVictims or opts.PotentialVictims
-	// is provided, ScheduleWorkload simulates preemption, rolls back all snapshot mutations, and returns
-	// Status: Unschedulable with the proposed PodResults and PreemptionVictims.
+	// ScheduleWorkload evaluates up to three passes depending on opts.CommittedVictims and opts.PotentialVictims:
+	//  1. Fit without preemption: attempts scheduling with nodes occupied by opts.CommittedVictims filtered out
+	//     and opts.CommittedVictims temporarily excluded from opts.PreemptionFilter (if set). On success, returns
+	//     Status: Success, WaitingForPreemption: false, and empty PreemptionVictims.
+	//  2. Fit waiting for CommittedVictims: if pass 1 returns Unschedulable and opts.CommittedVictims is non-empty,
+	//     retries scheduling across all nodes with opts.CommittedVictims active in opts.PreemptionFilter. On success,
+	//     returns Status: Unschedulable, WaitingForPreemption: true, empty PreemptionVictims, and the proposed PodResults.
+	//  3. Fit via new preemption: if still Unschedulable and opts.PotentialVictims is non-nil, evaluates preemption over
+	//     opts.PotentialVictims. On success, returns Status: Unschedulable, WaitingForPreemption: true, the newly required
+	//     victims in PreemptionVictims (excluding opts.CommittedVictims), and the proposed PodResults.
+	//
+	// Snapshot rollback asymmetry:
+	//   - Pass 1 (Status: Success) keeps the scheduled pods assumed in the snapshot and updates each scheduled pod's
+	//     Spec.NodeName unless opts.DryRun is true.
+	//   - Pass 2, Pass 3, and all failure outcomes return a non-Success Status and roll back every snapshot mutation made
+	//     during the call (leaving input pods' Spec.NodeName untouched).
+	//
+	// Incremental multi-workload simulation:
+	// When simulating workload w1 followed by workload w2 and committing w1's preemption (WaitingForPreemption: true),
+	// the caller must both (a) remove w1's PreemptionVictims from the snapshot via PreemptPods and append them to the
+	// CommittedVictims slice passed to w2 (also calling PreemptVictim on opts.PreemptionFilter if used), and
+	// (b) explicitly place w1's scheduled pods onto their selected nodes in the snapshot before scheduling w2
+	// (for example by calling SchedulePods with MakePlacement([]string{pRes.SelectedNodeName}) for each entry in
+	// w1's PodResults). Because w1's call rolled its pods back, omitting step (b) leaves w1's freed capacity idle and
+	// lets w2 double-book space reserved for w1.
 	//
 	// All PodGroup and CompositePodGroup objects in the hierarchy must exist in the snapshot before calling this method.
 	// Callers can register virtual groups (groups not present in the cluster) with AddPodGroup and AddCompositePodGroup.
@@ -175,13 +196,24 @@ func NewSchedulingSimulator(
 		opt(&simOpts)
 	}
 
+	cfg, err := framework.UpdateSimulatorConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("schedlib: updating simulator config: %w", err)
+	}
+
 	var frameworkOpts []upstreamsync.Option
-	if cfg != nil {
-		frameworkOpts = append(frameworkOpts, upstreamsync.WithProfiles(cfg.Profiles...))
+	frameworkOpts = append(frameworkOpts, upstreamsync.WithProfiles(cfg.Profiles...))
+
+	r, err := framework.SimulatorRegistry()
+	if err != nil {
+		return nil, fmt.Errorf("schedlib: building simulator registry: %w", err)
 	}
 	if len(simOpts.outOfTreeRegistry) > 0 {
-		frameworkOpts = append(frameworkOpts, upstreamsync.WithFrameworkOutOfTreeRegistry(simOpts.outOfTreeRegistry))
+		if err := r.Merge(simOpts.outOfTreeRegistry); err != nil {
+			return nil, fmt.Errorf("schedlib: merging out-of-tree plugin registry: %w", err)
+		}
 	}
+	frameworkOpts = append(frameworkOpts, upstreamsync.WithFrameworkOutOfTreeRegistry(r))
 	if client.config != nil {
 		frameworkOpts = append(frameworkOpts, upstreamsync.WithKubeConfig(client.config))
 	}
