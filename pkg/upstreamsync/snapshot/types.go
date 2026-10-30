@@ -138,14 +138,14 @@ type WorkloadSchedulingResult struct {
 	// Possible status codes:
 	//   - [fwk.Success]: the workload fits on the initial attempt without preemption (or the input pod slice is empty).
 	//   - [fwk.Unschedulable]: the workload does not fit without preemption (either on the initial
-	//     scheduling attempt or according to [PreemptionFilter.MayFit]). If preemption was successful,
-	//     status will be Unschedulable, [WorkloadSchedulingResult.PreemptionVictims] will be set, and
+	//     scheduling attempt, such as pod filtering or PlacementFeasible/PlacementGenerate checks,
+	//     or according to [PreemptionFilter.MayFit]). If preemption was successful, status will be
+	//     Unschedulable, [WorkloadSchedulingResult.PreemptionVictims] will be set, and
 	//     [WorkloadSchedulingResult.PodResults] will contain the proposed pod assignments.
 	//     If preemption was not configured or was unsuccessful, [WorkloadSchedulingResult.PreemptionVictims]
 	//     will be empty and [WorkloadSchedulingResult.PodResults] will contain per-pod failure statuses
 	//     from the initial scheduling attempt (or be empty if the initial attempt was skipped by [PreemptionFilter.MayFit]).
-	//   - [fwk.UnschedulableAndUnresolvable]: a root-level PlacementGenerate or Permit plugin rejected the workload
-	//     as unresolvable (preemption is skipped).
+	//   - [fwk.UnschedulableAndUnresolvable]: a PlacementGenerate plugin rejected the root group as unresolvable (preemption is skipped).
 	//   - [fwk.Error]: hierarchy validation, framework resolution, plugin execution, or preemption failed with an error.
 	Status *fwk.Status
 

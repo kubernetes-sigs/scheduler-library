@@ -251,10 +251,10 @@ func (ar *AlgorithmResult) GetStatus() *fwk.Status {
 	return ar.status
 }
 
-// SchedulePod runs a scheduling algorithm for individual pod from a pod group.
-// It returns the algorithm result and, if successful or the preemption is required, the permit status together with the revert function.
+// SchedulePod runs a scheduling algorithm for individual pod.
+// It returns the algorithm result with the revert function.
 //
-// UPSTREAM-DIFF: adapted from Scheduler.podGroupPodSchedulingAlgorithm. Differences:
+// UPSTREAM-DIFF: extracted from Scheduler.podGroupPodSchedulingAlgorithm to be usable both for workload and pod-by-pod scheduling. Differences:
 //   - no pod group: the caller supplies the CycleState in the PendingPod instead of it being
 //     derived from the pod group cycle state, and there is no podSchedulingContext.
 //   - schedulePod is called directly rather than through schedulingAlgorithm, so no PostFilter
