@@ -43,6 +43,7 @@ import (
 	"k8s.io/kubernetes/pkg/features"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
+	"k8s.io/kubernetes/pkg/scheduler/framework/parallelize"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
@@ -1051,5 +1052,51 @@ func TestOutOfTreePluginKubeConfigIsReadonly(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "mutations are not supported in scheduler library") {
 		t.Errorf("Expected a read-only transport error, got: %v", err)
+	}
+}
+
+func TestNewSchedulingSimulator_Parallelism(t *testing.T) {
+	tests := []struct {
+		name            string
+		parallelism     int32
+		wantParallelism int
+	}{
+		{
+			name:            "unset parallelism defaults to DefaultParallelism",
+			parallelism:     0,
+			wantParallelism: parallelize.DefaultParallelism,
+		},
+		{
+			name:            "positive parallelism 4 is forwarded to framework profiles",
+			parallelism:     4,
+			wantParallelism: 4,
+		},
+		{
+			name:            "positive parallelism 5 is forwarded to framework profiles",
+			parallelism:     5,
+			wantParallelism: 5,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			cfg := minimalConfig()
+			cfg.Parallelism = tc.parallelism
+			client := fake.NewClientset()
+			sim, err := NewSchedulingSimulator(ctx, cfg, ReadonlyClient{client: client}, informers.NewSharedInformerFactory(client, 0))
+			if err != nil {
+				t.Fatalf("NewSchedulingSimulator failed: %v", err)
+			}
+
+			profiles, err := sim.buildProfileMap(ctx, cache.NewEmptySnapshot())
+			if err != nil {
+				t.Fatalf("buildProfileMap failed: %v", err)
+			}
+
+			if got, want := profiles.Map["default-scheduler"].Parallelizer(), parallelize.NewParallelizer(tc.wantParallelism); got != want {
+				t.Errorf("Parallelizer() = %v, want %v", got, want)
+			}
+		})
 	}
 }

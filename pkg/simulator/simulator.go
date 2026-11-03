@@ -177,6 +177,9 @@ func NewSchedulingSimulator(
 	var frameworkOpts []upstreamsync.Option
 	if cfg != nil {
 		frameworkOpts = append(frameworkOpts, upstreamsync.WithProfiles(cfg.Profiles...))
+		if cfg.Parallelism > 0 {
+			frameworkOpts = append(frameworkOpts, upstreamsync.WithParallelism(cfg.Parallelism))
+		}
 	}
 	if len(simOpts.outOfTreeRegistry) > 0 {
 		frameworkOpts = append(frameworkOpts, upstreamsync.WithFrameworkOutOfTreeRegistry(simOpts.outOfTreeRegistry))
