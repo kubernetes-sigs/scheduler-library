@@ -27,9 +27,11 @@ import (
 	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	"k8s.io/apimachinery/pkg/util/sets"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/klog/v2"
 
 	fwk "k8s.io/kube-scheduler/framework"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"sigs.k8s.io/scheduler-library/pkg/preemption"
@@ -431,12 +433,17 @@ func (s *ClusterSnapshot) Unpreempt(u *Unpreemption) ([]*v1.Pod, error) {
 // All PodGroup and CompositePodGroup objects in the hierarchy must exist in the snapshot before calling this method.
 // Callers can register virtual groups (groups not present in the cluster) with AddPodGroup and AddCompositePodGroup.
 //
+// Callers must enable the GenericWorkload feature gate (plus TopologyAwareWorkloadScheduling and
+// CompositePodGroup when using topology-aware scheduling or composite hierarchies). Custom scheduler
+// profiles should keep the GangScheduling plugin enabled (via MultiPoint or Permit, which registers its
+// PlacementFeasible extension point) for gang and basic quorum enforcement.
+//
 // Note: Virtual pods (input pods not present in the snapshot beforehand) are assumed on nodes,
 // but not added to internal pod group sets (allPods/assumedPods). Consequently,
 // PodGroupState.ScheduledPods() does not include virtual pods from previous ScheduleWorkload calls.
 // This is safe when evaluating an entire virtual workload in a single call (such as Kueue admission).
 // However, when scheduling a hierarchy incrementally across multiple ScheduleWorkload calls, plugins
-// that query ScheduledPods() (such as TAS) do not observe virtual pods from earlier calls.
+// that query ScheduledPods() (such as TAS or gang scheduling) do not observe virtual pods from earlier calls.
 func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, opts ScheduleWorkloadOptions) (result WorkloadSchedulingResult) {
 	if len(pods) == 0 {
 		return WorkloadSchedulingResult{Status: fwk.NewStatus(fwk.Success)}
@@ -497,7 +504,7 @@ func (s *ClusterSnapshot) runInitialWorkloadScheduling(
 	}
 
 	algResultsMap, revertFn := sched.RunRootSchedulingAlgorithm(ctx, schedFramework, podGroupCycleState, podGroupInfo)
-	rootResult := algResultsMap[getEntityKey(podGroupInfo)]
+	rootResult := algResultsMap[upstreamsync.GetEntityKey(podGroupInfo)]
 	if rootResult.Status.IsError() {
 		return WorkloadSchedulingResult{Status: rootResult.Status}
 	}
@@ -514,12 +521,14 @@ func (s *ClusterSnapshot) runInitialWorkloadScheduling(
 	var podResults []SchedulingResult
 	for res := range upstreamsync.SuccessfulLeafResults(podGroupInfo, algResultsMap) {
 		for _, pRes := range res.PodResults {
-			podResults = append(podResults, SchedulingResult{
-				Pod:              pRes.GetPod(),
-				Status:           pRes.GetStatus(),
-				SelectedNodeName: pRes.GetNodeName(),
-				CycleState:       pRes.GetCycleState(),
-			})
+			if pRes.GetStatus().IsSuccess() {
+				podResults = append(podResults, SchedulingResult{
+					Pod:              pRes.GetPod(),
+					Status:           pRes.GetStatus(),
+					SelectedNodeName: pRes.GetNodeName(),
+					CycleState:       pRes.GetCycleState(),
+				})
+			}
 		}
 	}
 	return WorkloadSchedulingResult{
@@ -596,10 +605,10 @@ func buildFailedWorkloadPodResults(
 	podGroupCycleState *framework.CycleState,
 	algResultsMap map[fwk.EntityKey]*upstreamsync.PodGroupAlgorithmResult,
 ) []SchedulingResult {
-	if root.GetType() == fwk.CompositePodGroupKeyType {
+	if utilfeature.DefaultFeatureGate.Enabled(features.CompositePodGroup) && root.GetType() == fwk.CompositePodGroupKeyType {
 		upstreamsync.CompleteCompositePodGroupAlgorithmResult(root, podGroupCycleState, algResultsMap)
 	} else {
-		upstreamsync.CompletePodGroupAlgorithmResult(podGroupCycleState, algResultsMap[getEntityKey(root)])
+		upstreamsync.CompletePodGroupAlgorithmResult(podGroupCycleState, algResultsMap[upstreamsync.GetEntityKey(root)])
 	}
 	var results []SchedulingResult
 	var walk func(pgi *framework.PodGroupInfo)
@@ -610,7 +619,7 @@ func buildFailedWorkloadPodResults(
 		for _, child := range pgi.Children {
 			walk(child)
 		}
-		groupResult, ok := algResultsMap[getEntityKey(pgi)]
+		groupResult, ok := algResultsMap[upstreamsync.GetEntityKey(pgi)]
 		if !ok || groupResult == nil {
 			return
 		}

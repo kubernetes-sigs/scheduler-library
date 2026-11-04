@@ -21,11 +21,15 @@ import (
 
 type configOpt func(*schedulerapi.Plugins)
 
-// withTopologyPlacementGenerator enables the TopologyPlacementGenerator plugin in the
-// PlacementGenerate extension point for pod group scheduling.
+// withTopologyPlacementGenerator enables the TopologyPlacementGenerator and PodGroupPodsCount
+// plugins in PlacementGenerate and PlacementScore for pod group scheduling, matching upstream's
+// default topology-aware workload scheduling plugin configuration.
 func withTopologyPlacementGenerator(plugins *schedulerapi.Plugins) {
 	plugins.PlacementGenerate = schedulerapi.PluginSet{
 		Enabled: []schedulerapi.Plugin{{Name: "TopologyPlacementGenerator"}},
+	}
+	plugins.PlacementScore = schedulerapi.PluginSet{
+		Enabled: []schedulerapi.Plugin{{Name: "PodGroupPodsCount", Weight: 1}},
 	}
 }
 
@@ -38,6 +42,7 @@ func newKubeSchedulerConfig(opts ...configOpt) *schedulerapi.KubeSchedulerConfig
 			{
 				SchedulerName: v1.DefaultSchedulerName,
 				Plugins: &schedulerapi.Plugins{
+					MultiPoint:         schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "GangScheduling"}}},
 					QueueSort:          schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
 					PreFilter:          schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "NodeResourcesFit"}}},
 					Filter:             schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "NodeResourcesFit"}}},

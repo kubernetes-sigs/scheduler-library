@@ -81,7 +81,7 @@ type Simulator interface {
 	// PodGroupState.ScheduledPods() does not include virtual pods from previous ScheduleWorkload calls.
 	// This is safe when evaluating an entire virtual workload in a single call (such as Kueue admission).
 	// However, when scheduling a hierarchy incrementally across multiple ScheduleWorkload calls, plugins
-	// that query ScheduledPods() (such as TAS) do not observe virtual pods from earlier calls.
+	// that query ScheduledPods() (such as TAS or gang scheduling) do not observe virtual pods from earlier calls.
 	ScheduleWorkload(ctx context.Context, pods []*v1.Pod, opts snapshot.ScheduleWorkloadOptions) snapshot.WorkloadSchedulingResult
 
 	// PreemptPods removes the given running pods from the snapshot and returns the handle that puts

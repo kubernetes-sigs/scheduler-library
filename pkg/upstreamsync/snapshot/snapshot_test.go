@@ -1239,6 +1239,7 @@ func TestScheduleWorkload(t *testing.T) {
 
 	pod1 := testutils.MakePod("pod1", "gang-pg", "2")
 	pod2 := testutils.MakePod("pod2", "gang-pg", "2")
+	pod3 := testutils.MakePod("pod3", "gang-pg", "2")
 
 	heavyPod1 := testutils.MakePod("hp1", "gang-pg", "3")
 	heavyPod2 := testutils.MakePod("hp2", "gang-pg", "3")
@@ -1281,6 +1282,19 @@ func TestScheduleWorkload(t *testing.T) {
 			expectSnapshotState: map[string]sets.Set[string]{"node1": sets.New("pod1", "pod2")},
 		},
 		{
+			name:               "Success - schedule min count with some remaining unscheduled pods",
+			nodes:              []*v1.Node{node4CPU},
+			podGroups:          []*schedulingv1beta1.PodGroup{gangPG},
+			compositePodGroups: nil,
+			pods:               []*v1.Pod{pod1, pod2, pod3},
+			opts:               NewScheduleWorkloadOptions(false),
+			expectResults: []SchedulingResult{
+				{Pod: pod1, SelectedNodeName: "node1", Status: fwk.NewStatus(fwk.Success)},
+				{Pod: pod2, SelectedNodeName: "node1", Status: fwk.NewStatus(fwk.Success)},
+			},
+			expectSnapshotState: map[string]sets.Set[string]{"node1": sets.New("pod1", "pod2")},
+		},
+		{
 			name:               "Success - schedule composite pod group",
 			nodes:              []*v1.Node{node8CPU},
 			podGroups:          []*schedulingv1beta1.PodGroup{leafPG1, leafPG2},
@@ -1309,14 +1323,14 @@ func TestScheduleWorkload(t *testing.T) {
 		{
 			name:               "Failure - gang unschedulable rolls back snapshot reservations",
 			nodes:              []*v1.Node{node4CPU},
-			podGroups:          []*schedulingv1beta1.PodGroup{gangPG},
+			podGroups:          []*schedulingv1beta1.PodGroup{testutils.MakeGangPodGroup(gangPG.Name, "", 3)},
 			compositePodGroups: nil,
 			pods:               []*v1.Pod{heavyPod1, heavyPod2, heavyPod3},
 			opts:               NewScheduleWorkloadOptions(false),
 			expectResults: []SchedulingResult{
-				{Pod: heavyPod1, SelectedNodeName: "", Status: fwk.NewStatus(fwk.Unschedulable, "0/1 placements are available")},
+				{Pod: heavyPod1, SelectedNodeName: "", Status: fwk.NewStatus(fwk.Unschedulable, "0/1 placements are available, first placement status: minCount (3) cannot be satisfied: 1 scheduled, 1 remaining")},
 				{Pod: heavyPod2, SelectedNodeName: "", Status: fwk.NewStatus(fwk.Unschedulable, "0/1 nodes are available: 1 Insufficient cpu.")},
-				{Pod: heavyPod3, SelectedNodeName: "", Status: fwk.NewStatus(fwk.Unschedulable, "0/1 placements are available")},
+				{Pod: heavyPod3, SelectedNodeName: "", Status: fwk.NewStatus(fwk.Unschedulable, "0/1 placements are available, first placement status: minCount (3) cannot be satisfied: 1 scheduled, 1 remaining")},
 			},
 			expectSnapshotState: map[string]sets.Set[string]{"node1": nil},
 		},
@@ -1324,7 +1338,7 @@ func TestScheduleWorkload(t *testing.T) {
 			name:               "Failure - composite pod group unschedulable rolls back snapshot reservations",
 			nodes:              []*v1.Node{node4CPU},
 			podGroups:          []*schedulingv1beta1.PodGroup{leafPG1, leafPG2, leafPG3},
-			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{rootCPG},
+			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{testutils.MakeGangCompositePodGroup(rootCPG.Name, "", 3)},
 			pods:               []*v1.Pod{heavyLeafPod1, heavyLeafPod2, heavyLeafPod3},
 			opts:               NewScheduleWorkloadOptions(false),
 			expectResults: []SchedulingResult{
@@ -1415,22 +1429,34 @@ func TestScheduleWorkload(t *testing.T) {
 				if len(result.PodResults) != len(tt.expectResults) {
 					t.Fatalf("ScheduleWorkload() got %d results, want %d", len(result.PodResults), len(tt.expectResults))
 				}
-				for i := range result.PodResults {
-					if result.PodResults[i].SelectedNodeName != tt.expectResults[i].SelectedNodeName {
-						t.Errorf("result[%d] SelectedNodeName = %q, want %q", i, result.PodResults[i].SelectedNodeName, tt.expectResults[i].SelectedNodeName)
+				resultsByPod := make(map[string]SchedulingResult, len(result.PodResults))
+				for _, r := range result.PodResults {
+					if _, exists := resultsByPod[r.Pod.Name]; exists {
+						t.Fatalf("duplicate result for pod %q in PodResults", r.Pod.Name)
 					}
-					if result.PodResults[i].Status.Code() != tt.expectResults[i].Status.Code() {
-						t.Errorf("result[%d] Status.Code() = %v, want %v", i, result.PodResults[i].Status.Code(), tt.expectResults[i].Status.Code())
+					resultsByPod[r.Pod.Name] = r
+				}
+				for _, want := range tt.expectResults {
+					got, ok := resultsByPod[want.Pod.Name]
+					if !ok {
+						t.Errorf("missing result for pod %q", want.Pod.Name)
+						continue
 					}
-					if wantMsg := tt.expectResults[i].Status.Message(); wantMsg != "" && result.PodResults[i].Status.Message() != wantMsg {
-						t.Errorf("result[%d] Status.Message() = %q, want %q", i, result.PodResults[i].Status.Message(), wantMsg)
+					if got.SelectedNodeName != want.SelectedNodeName {
+						t.Errorf("pod %q SelectedNodeName = %q, want %q", want.Pod.Name, got.SelectedNodeName, want.SelectedNodeName)
 					}
-					wantSpecNodeName := tt.expectResults[i].SelectedNodeName
+					if got.Status.Code() != want.Status.Code() {
+						t.Errorf("pod %q Status.Code() = %v, want %v", want.Pod.Name, got.Status.Code(), want.Status.Code())
+					}
+					if wantMsg := want.Status.Message(); wantMsg != "" && got.Status.Message() != wantMsg {
+						t.Errorf("pod %q Status.Message() = %q, want %q", want.Pod.Name, got.Status.Message(), wantMsg)
+					}
+					wantSpecNodeName := want.SelectedNodeName
 					if tt.opts.DryRun {
 						wantSpecNodeName = ""
 					}
-					if result.PodResults[i].Pod.Spec.NodeName != wantSpecNodeName {
-						t.Errorf("result[%d] Pod.Spec.NodeName = %q, want %q", i, result.PodResults[i].Pod.Spec.NodeName, wantSpecNodeName)
+					if got.Pod.Spec.NodeName != wantSpecNodeName {
+						t.Errorf("pod %q Pod.Spec.NodeName = %q, want %q", want.Pod.Name, got.Pod.Spec.NodeName, wantSpecNodeName)
 					}
 				}
 			}
