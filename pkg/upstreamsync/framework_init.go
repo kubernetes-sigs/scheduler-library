@@ -23,6 +23,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
@@ -164,6 +165,19 @@ func newFrameworkComponents(ctx context.Context,
 			return nil, err
 		}
 		options.profiles = cfg.Profiles
+	}
+
+	// UPSTREAM-DIFF: kube-scheduler validates its whole configuration before building profiles. The
+	// library gets the profiles as Go structs, so it checks the range kube-scheduler's validation
+	// enforces for percentageOfNodesToScore, which the scheduling algorithm relies on.
+	var errs field.ErrorList
+	for i, prof := range options.profiles {
+		if p := prof.PercentageOfNodesToScore; p != nil && (*p < 0 || *p > 100) {
+			errs = append(errs, field.Invalid(field.NewPath("profiles").Index(i).Child("percentageOfNodesToScore"), *p, "not in valid range [0-100]"))
+		}
+	}
+	if err := errs.ToAggregate(); err != nil {
+		return nil, err
 	}
 
 	extenders, err := buildExtenders(logger, options.extenders, options.profiles)

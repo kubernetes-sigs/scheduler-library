@@ -38,6 +38,7 @@ import (
 	internalcache "k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/preemption"
 )
 
@@ -77,6 +78,54 @@ func TestNewFrameworkComponents(t *testing.T) {
 	}
 	if len(comps.options.profiles) == 0 {
 		t.Fatal("expected default profile to be configured")
+	}
+}
+
+func TestNewFrameworkComponentsValidatesPercentageOfNodesToScore(t *testing.T) {
+	tests := []struct {
+		name       string
+		profiles   []schedulerapi.KubeSchedulerProfile
+		wantErrMsg string
+	}{
+		{
+			name: "unset and boundary values are valid",
+			profiles: []schedulerapi.KubeSchedulerProfile{
+				{SchedulerName: "unset"},
+				{SchedulerName: "zero", PercentageOfNodesToScore: ptr.To[int32](0)},
+				{SchedulerName: "hundred", PercentageOfNodesToScore: ptr.To[int32](100)},
+			},
+		},
+		{
+			name:       "negative value",
+			profiles:   []schedulerapi.KubeSchedulerProfile{{SchedulerName: "negative", PercentageOfNodesToScore: ptr.To[int32](-1)}},
+			wantErrMsg: "profiles[0].percentageOfNodesToScore: Invalid value: -1: not in valid range [0-100]",
+		},
+		{
+			name:       "value above 100",
+			profiles:   []schedulerapi.KubeSchedulerProfile{{SchedulerName: "above", PercentageOfNodesToScore: ptr.To[int32](101)}},
+			wantErrMsg: "profiles[0].percentageOfNodesToScore: Invalid value: 101: not in valid range [0-100]",
+		},
+		{
+			name: "every invalid profile is reported",
+			profiles: []schedulerapi.KubeSchedulerProfile{
+				{SchedulerName: "negative", PercentageOfNodesToScore: ptr.To[int32](-1)},
+				{SchedulerName: "valid", PercentageOfNodesToScore: ptr.To[int32](50)},
+				{SchedulerName: "above", PercentageOfNodesToScore: ptr.To[int32](101)},
+			},
+			wantErrMsg: "[profiles[0].percentageOfNodesToScore: Invalid value: -1: not in valid range [0-100], " +
+				"profiles[2].percentageOfNodesToScore: Invalid value: 101: not in valid range [0-100]]",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := fake.NewClientset()
+			informerFactory := informers.NewSharedInformerFactory(client, 0)
+			_, err := NewFrameworkComponents(t.Context(), client, informerFactory, WithProfiles(tt.profiles...))
+			if err := verifyErr(tt.wantErrMsg, err); err != nil {
+				t.Error(err)
+			}
+		})
 	}
 }
 

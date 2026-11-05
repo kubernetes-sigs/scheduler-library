@@ -46,6 +46,8 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/framework/parallelize"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
+	"k8s.io/utils/ptr"
+	ft "sigs.k8s.io/scheduler-library/pkg/framework/testing"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
 	testutils "sigs.k8s.io/scheduler-library/pkg/upstreamsync/testutils"
 )
@@ -1100,4 +1102,295 @@ func TestNewSchedulingSimulator_Parallelism(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPercentageOfNodesToScore(t *testing.T) {
+	scoringConfig := func(globalPct, profilePct *int32, withScore bool) *schedulerapi.KubeSchedulerConfiguration {
+		plugins := &schedulerapi.Plugins{
+			QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+			PreFilter: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "NodeResourcesFit"}}},
+			Filter:    schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "NodeResourcesFit"}}},
+			Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+		}
+		if withScore {
+			plugins.PreScore = schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "NodeResourcesFit"}}}
+			plugins.Score = schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "NodeResourcesFit", Weight: 1}}}
+		}
+		return &schedulerapi.KubeSchedulerConfiguration{
+			PercentageOfNodesToScore: globalPct,
+			Profiles: []schedulerapi.KubeSchedulerProfile{
+				{
+					SchedulerName:            v1.DefaultSchedulerName,
+					PercentageOfNodesToScore: profilePct,
+					Plugins:                  plugins,
+					PluginConfig: []schedulerapi.PluginConfig{
+						{
+							Name: "NodeResourcesFit",
+							Args: &schedulerapi.NodeResourcesFitArgs{
+								ScoringStrategy: &schedulerapi.ScoringStrategy{
+									Type:      schedulerapi.LeastAllocated,
+									Resources: []schedulerapi.ResourceSpec{{Name: string(v1.ResourceCPU), Weight: 1}},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	makeClusterWithBestLastNode := func(numNodes int) ([]*v1.Node, []*v1.Pod, []string) {
+		nodes := make([]*v1.Node, numNodes)
+		nodeNames := make([]string, numNodes)
+		assignedPods := make([]*v1.Pod, 0, numNodes-1)
+		for i := range numNodes {
+			name := fmt.Sprintf("node-%03d", i)
+			nodeNames[i] = name
+			nodes[i] = st.MakeNode().Name(name).Capacity(map[v1.ResourceName]string{
+				v1.ResourceCPU:    "10",
+				v1.ResourceMemory: "10Gi",
+				v1.ResourcePods:   "110",
+			}).Obj()
+			if i < numNodes-1 {
+				assignedPods = append(assignedPods, st.MakePod().
+					Name(fmt.Sprintf("existing-pod-%03d", i)).
+					Namespace("default").
+					UID(fmt.Sprintf("uid-existing-%03d", i)).
+					Node(name).
+					Req(map[v1.ResourceName]string{v1.ResourceCPU: "8"}).
+					Obj())
+			}
+		}
+		return nodes, assignedPods, nodeNames
+	}
+
+	t.Run("CanSchedulePod always evaluates 100% of nodes regardless of PercentageOfNodesToScore or scoring", func(t *testing.T) {
+		ctx := t.Context()
+		nodes, _, nodeNames := makeClusterWithBestLastNode(200)
+
+		for _, tc := range []struct {
+			name string
+			cfg  *schedulerapi.KubeSchedulerConfiguration
+		}{
+			{
+				name: "low PercentageOfNodesToScore with scoring",
+				cfg:  scoringConfig(ptr.To[int32](10), ptr.To[int32](10), true),
+			},
+			{
+				name: "without scoring plugins",
+				cfg:  scoringConfig(ptr.To[int32](10), nil, false),
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				client := fake.NewClientset()
+				sim, err := NewSchedulingSimulator(ctx, tc.cfg, ReadonlyClient{client: client}, informers.NewSharedInformerFactory(client, 0))
+				if err != nil {
+					t.Fatalf("NewSchedulingSimulator failed: %v", err)
+				}
+				snap, err := sim.NewClusterSnapshot(ctx, nil, nodes, nil, nil)
+				if err != nil {
+					t.Fatalf("NewClusterSnapshot failed: %v", err)
+				}
+				placement, err := snap.MakePlacement(nodeNames)
+				if err != nil {
+					t.Fatalf("MakePlacement failed: %v", err)
+				}
+				pod := st.MakePod().Name("probe-pod").Namespace("default").UID("uid-probe").Req(map[v1.ResourceName]string{
+					v1.ResourceCPU: "1",
+				}).Obj()
+
+				feasible, _, err := snap.CanSchedulePod(ctx, pod, placement)
+				if err != nil {
+					t.Fatalf("CanSchedulePod failed: %v", err)
+				}
+				if len(feasible) != len(nodes) {
+					t.Errorf("CanSchedulePod returned %d feasible nodes, want %d (100%%)", len(feasible), len(nodes))
+				}
+			})
+		}
+	})
+
+	t.Run("ScheduleWorkload scores the configured percentage of nodes", func(t *testing.T) {
+		featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+			features.GenericWorkload:                 true,
+			features.TopologyAwareWorkloadScheduling: true,
+			features.CompositePodGroup:               true,
+		})
+
+		// Every node fits the pod, so the counting Score plugin sees exactly the number of
+		// feasible nodes Filter collected: 10% of 300 is raised to minFeasibleNodesToFind = 100,
+		// and the adaptive policy picks 48% of 300.
+		nodes300, pods300, _ := makeClusterWithBestLastNode(300)
+		pg := testutils.MakeGangPodGroup("gang-1", "", 1)
+
+		for _, tc := range []struct {
+			name         string
+			globalPct    *int32
+			profilePct   *int32
+			clusterState bool
+			wantScored   int32
+		}{
+			{
+				name:       "global 10%",
+				globalPct:  ptr.To[int32](10),
+				wantScored: 100,
+			},
+			{
+				name:         "global 10% through ClusterState",
+				globalPct:    ptr.To[int32](10),
+				clusterState: true,
+				wantScored:   100,
+			},
+			{
+				name:       "global 100%",
+				globalPct:  ptr.To[int32](100),
+				wantScored: 300,
+			},
+			{
+				name:         "global 100% through ClusterState",
+				globalPct:    ptr.To[int32](100),
+				clusterState: true,
+				wantScored:   300,
+			},
+			{
+				name:       "profile 10% overrides global 100%",
+				globalPct:  ptr.To[int32](100),
+				profilePct: ptr.To[int32](10),
+				wantScored: 100,
+			},
+			{
+				name:         "profile 10% overrides global 100% through ClusterState",
+				globalPct:    ptr.To[int32](100),
+				profilePct:   ptr.To[int32](10),
+				clusterState: true,
+				wantScored:   100,
+			},
+			{
+				name:       "profile 100% overrides global 10%",
+				globalPct:  ptr.To[int32](10),
+				profilePct: ptr.To[int32](100),
+				wantScored: 300,
+			},
+			{
+				name:       "unset global value selects the adaptive policy",
+				wantScored: 144,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ctx := t.Context()
+				counter := &ft.CountingScorePlugin{}
+				cfg := scoringConfig(tc.globalPct, tc.profilePct, true)
+				cfg.Profiles[0].Plugins.Score.Enabled = append(cfg.Profiles[0].Plugins.Score.Enabled,
+					schedulerapi.Plugin{Name: ft.CountingScorePluginName, Weight: 1})
+				client := fake.NewClientset()
+				sim, err := NewSchedulingSimulator(ctx, cfg, ReadonlyClient{client: client}, informers.NewSharedInformerFactory(client, 0),
+					WithOutOfTreeRegistry(counter.Registry()))
+				if err != nil {
+					t.Fatalf("NewSchedulingSimulator failed: %v", err)
+				}
+
+				var snap Simulator
+				if tc.clusterState {
+					cs, err := sim.NewClusterState(ctx)
+					if err != nil {
+						t.Fatalf("NewClusterState failed: %v", err)
+					}
+					logger := klog.FromContext(ctx)
+					cs.Cache.AddPodGroup(pg)
+					for _, n := range nodes300 {
+						cs.Cache.AddNode(logger, n)
+					}
+					for _, p := range pods300 {
+						if err := cs.Cache.AddPod(logger, p); err != nil {
+							t.Fatalf("Cache.AddPod failed: %v", err)
+						}
+					}
+					if err := cs.SyncSnapshot(logger); err != nil {
+						t.Fatalf("SyncSnapshot failed: %v", err)
+					}
+					snap = cs.GetAssociatedSnapshot()
+				} else {
+					snap, err = sim.NewClusterSnapshot(ctx, pods300, nodes300, []*schedulingv1beta1.PodGroup{pg}, nil)
+					if err != nil {
+						t.Fatalf("NewClusterSnapshot failed: %v", err)
+					}
+				}
+
+				result := snap.ScheduleWorkload(ctx, []*v1.Pod{testutils.MakePod("wl-pod-1", "gang-1", "1")}, snapshot.NewScheduleWorkloadOptions(false))
+				if !result.Status.IsSuccess() {
+					t.Fatalf("ScheduleWorkload failed: %v", result.Status)
+				}
+				if got := counter.Scored(); got != tc.wantScored {
+					t.Errorf("ScheduleWorkload scored %d nodes, want %d", got, tc.wantScored)
+				}
+			})
+		}
+	})
+
+	t.Run("validates PercentageOfNodesToScore and keeps the global value", func(t *testing.T) {
+		for _, tc := range []struct {
+			name           string
+			cfg            *schedulerapi.KubeSchedulerConfiguration
+			wantErr        string
+			wantPercentage int32
+		}{
+			{
+				name:    "negative global value",
+				cfg:     scoringConfig(ptr.To[int32](-1), nil, true),
+				wantErr: "percentageOfNodesToScore: Invalid value: -1",
+			},
+			{
+				name:    "global value above 100",
+				cfg:     scoringConfig(ptr.To[int32](101), nil, true),
+				wantErr: "percentageOfNodesToScore: Invalid value: 101",
+			},
+			{
+				name:    "negative profile value",
+				cfg:     scoringConfig(nil, ptr.To[int32](-1), true),
+				wantErr: "profiles[0].percentageOfNodesToScore: Invalid value: -1",
+			},
+			{
+				name:    "profile value above 100",
+				cfg:     scoringConfig(nil, ptr.To[int32](101), true),
+				wantErr: "profiles[0].percentageOfNodesToScore: Invalid value: 101",
+			},
+			{
+				name:           "explicit global 0 selects the adaptive policy",
+				cfg:            scoringConfig(ptr.To[int32](0), nil, true),
+				wantPercentage: 0,
+			},
+			{
+				name:           "unset global value selects the adaptive policy",
+				cfg:            scoringConfig(nil, nil, true),
+				wantPercentage: 0,
+			},
+			{
+				name:           "global value is kept",
+				cfg:            scoringConfig(ptr.To[int32](10), nil, true),
+				wantPercentage: 10,
+			},
+			{
+				name:           "bounds are valid",
+				cfg:            scoringConfig(ptr.To[int32](100), ptr.To[int32](0), true),
+				wantPercentage: 100,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				client := fake.NewClientset()
+				sim, err := NewSchedulingSimulator(t.Context(), tc.cfg, ReadonlyClient{client: client}, informers.NewSharedInformerFactory(client, 0))
+				if tc.wantErr != "" {
+					if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+						t.Fatalf("NewSchedulingSimulator error = %v, want it to contain %q", err, tc.wantErr)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("NewSchedulingSimulator failed: %v", err)
+				}
+				if sim.percentageOfNodesToScore != tc.wantPercentage {
+					t.Errorf("percentageOfNodesToScore = %d, want %d", sim.percentageOfNodesToScore, tc.wantPercentage)
+				}
+			})
+		}
+	})
 }

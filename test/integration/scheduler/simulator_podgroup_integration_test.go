@@ -15,6 +15,8 @@
 package scheduler
 
 import (
+	"context"
+	"fmt"
 	"slices"
 	"testing"
 
@@ -27,8 +29,10 @@ import (
 	"k8s.io/klog/v2"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/features"
+	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	testutils "k8s.io/kubernetes/test/integration/util"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/scheduler-library/pkg/simulator"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
 )
@@ -783,6 +787,200 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 			gotFits := len(feasibleNodes) == 1
 			if gotFits != tt.wantProbeFits {
 				t.Errorf("CanSchedulePod(probe %s CPU) fits = %v, want %v (feasibleNodes: %v)", tt.probePodCPU, gotFits, tt.wantProbeFits, feasibleNodes)
+			}
+		})
+	}
+}
+
+func TestSimulatorIntegration_PodGroupScoring(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.GenericWorkload:                 true,
+		features.TopologyAwareWorkloadScheduling: true,
+		features.CompositePodGroup:               true,
+	})
+
+	testCtx := testutils.InitTestAPIServer(t, "sim-pg-scoring-test", nil)
+	if testCtx == nil {
+		t.Fatal("Expected testCtx to be non-nil")
+	}
+	ctx := testCtx.Ctx
+	logger := klog.FromContext(ctx)
+	ns := testCtx.NS.Name
+
+	readonlyClient, err := simulator.NewReadonlyClient(testCtx.KubeConfig)
+	if err != nil {
+		t.Fatalf("NewReadonlyClient failed: %v", err)
+	}
+
+	const tierLabel = "node-tier"
+	affinity := &v1.NodeAffinity{
+		PreferredDuringSchedulingIgnoredDuringExecution: []v1.PreferredSchedulingTerm{
+			{
+				Weight: 100,
+				Preference: v1.NodeSelectorTerm{
+					MatchExpressions: []v1.NodeSelectorRequirement{
+						{Key: tierLabel, Operator: v1.NodeSelectorOpIn, Values: []string{"gold"}},
+					},
+				},
+			},
+			{
+				Weight: 50,
+				Preference: v1.NodeSelectorTerm{
+					MatchExpressions: []v1.NodeSelectorRequirement{
+						{Key: tierLabel, Operator: v1.NodeSelectorOpIn, Values: []string{"silver"}},
+					},
+				},
+			},
+			{
+				Weight: 10,
+				Preference: v1.NodeSelectorTerm{
+					MatchExpressions: []v1.NodeSelectorRequirement{
+						{Key: tierLabel, Operator: v1.NodeSelectorOpIn, Values: []string{"bronze"}},
+					},
+				},
+			},
+		},
+	}
+
+	// First 50 nodes (capped by numNodes-2) are "bronze", the last two are "gold",
+	// and any nodes in between are "silver". On 700 nodes at 15% (105 feasible nodes,
+	// above minFeasibleNodesToFind=100), every 105-node sample contains at least 55
+	// "silver" nodes (so scoring always beats "bronze") while parallel Filter chunks
+	// stop well before indices 698..699 (so early stopping never reaches "gold").
+	makeTieredNodes := func(numNodes int) ([]*v1.Node, map[string]string) {
+		nodes := make([]*v1.Node, numNodes)
+		nodeTier := make(map[string]string, numNodes)
+		for i := range numNodes {
+			name := fmt.Sprintf("node-%03d", i)
+			tier := "silver"
+			switch {
+			case i >= numNodes-2:
+				tier = "gold"
+			case i < 50:
+				tier = "bronze"
+			}
+			nodeTier[name] = tier
+			nodes[i] = st.MakeNode().Name(name).Label(tierLabel, tier).Capacity(map[v1.ResourceName]string{
+				v1.ResourceCPU:    "4",
+				v1.ResourceMemory: "4Gi",
+				v1.ResourcePods:   "10",
+			}).Obj()
+		}
+		return nodes, nodeTier
+	}
+
+	pg := makePodGroup(ns, "scoring-gang", "", 2, "")
+	makeAffinityPods := func() []*v1.Pod {
+		// Each pod requests 3 CPU on 4-CPU nodes so at most one fits per node.
+		return []*v1.Pod{
+			st.MakePod().Name("pod-1").Namespace(ns).UID("pod-1").PodGroupName(pg.Name).
+				Req(map[v1.ResourceName]string{v1.ResourceCPU: "3"}).NodeAffinity(affinity).Obj(),
+			st.MakePod().Name("pod-2").Namespace(ns).UID("pod-2").PodGroupName(pg.Name).
+				Req(map[v1.ResourceName]string{v1.ResourceCPU: "3"}).NodeAffinity(affinity).Obj(),
+		}
+	}
+
+	scoringCfg := func(globalPct, profilePct *int32) *schedulerapi.KubeSchedulerConfiguration {
+		c := newKubeSchedulerConfig(withTopologyPlacementGenerator, withNodeAffinity)
+		c.PercentageOfNodesToScore = globalPct
+		c.Profiles[0].PercentageOfNodesToScore = profilePct
+		return c
+	}
+
+	tests := []struct {
+		name         string
+		cfg          *schedulerapi.KubeSchedulerConfiguration
+		numNodes     int
+		clusterState bool
+		wantTier     string
+	}{
+		{
+			name:         "default configuration with ClusterState",
+			cfg:          nil,
+			numNodes:     20,
+			clusterState: true,
+			wantTier:     "gold",
+		},
+		{
+			name:         "default configuration with ClusterSnapshot",
+			cfg:          nil,
+			numNodes:     20,
+			clusterState: false,
+			wantTier:     "gold",
+		},
+		{
+			name:         "explicit configuration with PercentageOfNodesToScore=15",
+			cfg:          scoringCfg(ptr.To[int32](15), nil),
+			numNodes:     700,
+			clusterState: true,
+			wantTier:     "silver",
+		},
+		{
+			name:         "profile PercentageOfNodesToScore=15 overrides global 100",
+			cfg:          scoringCfg(ptr.To[int32](100), ptr.To[int32](15)),
+			numNodes:     700,
+			clusterState: true,
+			wantTier:     "silver",
+		},
+		{
+			name:         "explicit configuration with PercentageOfNodesToScore=100",
+			cfg:          scoringCfg(ptr.To[int32](100), nil),
+			numNodes:     700,
+			clusterState: true,
+			wantTier:     "gold",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			simCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			nodes, nodeTier := makeTieredNodes(tt.numNodes)
+			sim, err := simulator.NewSchedulingSimulator(simCtx, tt.cfg, readonlyClient, nil)
+			if err != nil {
+				t.Fatalf("NewSchedulingSimulator failed: %v", err)
+			}
+
+			var snap simulator.Simulator
+			if tt.clusterState {
+				cs, err := sim.NewClusterState(simCtx)
+				if err != nil {
+					t.Fatalf("NewClusterState failed: %v", err)
+				}
+				for _, n := range nodes {
+					cs.Cache.AddNode(logger, n)
+				}
+				cs.Cache.AddPodGroup(pg)
+				if err := cs.SyncSnapshot(logger); err != nil {
+					t.Fatalf("SyncSnapshot failed: %v", err)
+				}
+				snap = cs.GetAssociatedSnapshot()
+			} else {
+				snap, err = sim.NewClusterSnapshot(simCtx, nil, nodes, []*schedulingv1beta1.PodGroup{pg}, nil)
+				if err != nil {
+					t.Fatalf("NewClusterSnapshot failed: %v", err)
+				}
+			}
+
+			res := snap.ScheduleWorkload(simCtx, makeAffinityPods(), snapshot.NewScheduleWorkloadOptions(false))
+			if !res.Status.IsSuccess() {
+				t.Fatalf("ScheduleWorkload failed: %v", res.Status)
+			}
+			if len(res.PodResults) != 2 {
+				t.Fatalf("len(PodResults) = %d, want 2", len(res.PodResults))
+			}
+
+			for _, r := range res.PodResults {
+				if !r.Status.IsSuccess() {
+					t.Fatalf("pod %s Status = %v, want success", r.Pod.Name, r.Status)
+				}
+				if got := nodeTier[r.SelectedNodeName]; got != tt.wantTier {
+					t.Errorf("pod %s scheduled on %s (tier %q), want tier %q", r.Pod.Name, r.SelectedNodeName, got, tt.wantTier)
+				}
+			}
+			if res.PodResults[0].SelectedNodeName == res.PodResults[1].SelectedNodeName {
+				t.Errorf("both pods scheduled onto the same node %q", res.PodResults[0].SelectedNodeName)
 			}
 		})
 	}

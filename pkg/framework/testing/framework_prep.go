@@ -16,19 +16,23 @@ package testing
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
 	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/features"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
+	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	"sigs.k8s.io/scheduler-library/pkg/framework"
 	"sigs.k8s.io/scheduler-library/pkg/preemption"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
@@ -114,6 +118,7 @@ func SetupSnapshotTest(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (*
 
 // SetupSnapshotTestWithPodGroups populates the snapshot with nodes, pods, podgroups, and composite podgroups,
 // enables the feature gates for workload scheduling, and returns scheduler profile and snapshot.
+// opts are applied after the default profile, so passing upstreamsync.WithProfiles replaces it.
 func SetupSnapshotTestWithPodGroups(
 	ctx context.Context,
 	t testing.TB,
@@ -121,6 +126,7 @@ func SetupSnapshotTestWithPodGroups(
 	nodes []*v1.Node,
 	podGroups []*schedulingv1beta1.PodGroup,
 	compositePodGroups []*schedulingv1alpha3.CompositePodGroup,
+	opts ...upstreamsync.Option,
 ) (*upstreamsync.ProfileMap, *cache.Snapshot, error) {
 	framework.InitMetricsOnce()
 	client := fake.NewClientset()
@@ -178,7 +184,7 @@ func SetupSnapshotTestWithPodGroups(
 
 	snap := cache.NewTestSnapshotWithCompositePodGroups(pods, nodes, podGroups, compositePodGroups)
 	informerFactory := informers.NewSharedInformerFactory(client, 0)
-	comps, err := upstreamsync.NewFrameworkComponents(ctx, client, informerFactory, upstreamsync.WithProfiles(prof.Profiles...))
+	comps, err := upstreamsync.NewFrameworkComponents(ctx, client, informerFactory, append([]upstreamsync.Option{upstreamsync.WithProfiles(prof.Profiles...)}, opts...)...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -198,4 +204,41 @@ func SetupSnapshotTestWithPodGroups(
 	informerFactory.WaitForCacheSyncWithContext(ctx)
 
 	return profileMap, snap, nil
+}
+
+// CountingScorePluginName is the name CountingScorePlugin registers under.
+const CountingScorePluginName = "CountingScore"
+
+// CountingScorePlugin is a Score plugin that counts the nodes it is asked to score, so that tests
+// can check how many nodes a scheduling attempt evaluated without depending on which node wins.
+// Enable it in a profile's Score plugin set and register it through Registry.
+type CountingScorePlugin struct {
+	scored atomic.Int32
+}
+
+var _ fwk.ScorePlugin = &CountingScorePlugin{}
+
+// Name returns CountingScorePluginName.
+func (pl *CountingScorePlugin) Name() string { return CountingScorePluginName }
+
+// Score counts the node and gives it a zero score.
+func (pl *CountingScorePlugin) Score(context.Context, fwk.CycleState, *v1.Pod, fwk.NodeInfo) (int64, *fwk.Status) {
+	pl.scored.Add(1)
+	return 0, nil
+}
+
+// ScoreExtensions returns nil, as the scores need no normalization.
+func (pl *CountingScorePlugin) ScoreExtensions() fwk.ScoreExtensions { return nil }
+
+// Scored returns how many nodes the plugin has scored so far.
+func (pl *CountingScorePlugin) Scored() int32 { return pl.scored.Load() }
+
+// Registry returns an out-of-tree registry whose factory hands out pl itself, so that every
+// framework built from it counts into pl.
+func (pl *CountingScorePlugin) Registry() frameworkruntime.Registry {
+	return frameworkruntime.Registry{
+		CountingScorePluginName: func(context.Context, runtime.Object, fwk.Handle) (fwk.Plugin, error) {
+			return pl, nil
+		},
+	}
 }
