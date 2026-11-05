@@ -315,7 +315,7 @@ func TestEvaluateWorkloadPreemption(t *testing.T) {
 				schedFramework = upstreampreemption.NewPreemptionFramework(schedFramework.Framework, nil)
 			}
 
-			sched := upstreamsync.NewScheduler(snap, 0, 0, 1, nil)
+			sched := upstreamsync.NewScheduler(snap, 0, 0, nil)
 			baseSchedFn := sched.BuildPodGroupSchedulingFunc(schedFramework, podGroupInfo)
 
 			var opts preemption.WorkloadPreemptionOptions
@@ -387,7 +387,7 @@ func TestEvaluateWorkloadPreemptionRepeated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FrameworkForPodGroup failed: %v", err)
 	}
-	baseSchedFn := upstreamsync.NewScheduler(snap, 0, 0, 1, nil).BuildPodGroupSchedulingFunc(schedFramework, podGroupInfo)
+	baseSchedFn := upstreamsync.NewScheduler(snap, 0, 0, nil).BuildPodGroupSchedulingFunc(schedFramework, podGroupInfo)
 
 	calls := []struct {
 		opts        preemption.WorkloadPreemptionOptions

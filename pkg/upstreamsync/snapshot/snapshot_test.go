@@ -21,6 +21,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -28,6 +29,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -39,6 +41,7 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
+	"k8s.io/utils/ptr"
 	ft "sigs.k8s.io/scheduler-library/pkg/framework/testing"
 	testutils "sigs.k8s.io/scheduler-library/pkg/upstreamsync/testutils"
 )
@@ -1410,7 +1413,7 @@ func TestScheduleWorkload(t *testing.T) {
 			if err != nil {
 				t.Fatalf("SetupSnapshotTestWithPodGroups failed: %v", err)
 			}
-			cs := New(snap, profileMap)
+			cs := New(snap, profileMap, 0)
 
 			var pods []*v1.Pod
 			if tt.pods != nil {
@@ -1581,7 +1584,7 @@ func TestSnapshot_ActionSequences_ScheduleWorkload(t *testing.T) {
 			if err != nil {
 				t.Fatalf("SetupSnapshotTestWithPodGroups failed: %v", err)
 			}
-			cs := New(snap, profileMap)
+			cs := New(snap, profileMap, 0)
 			sc := &stepContext{
 				ctx:     ctx,
 				cs:      cs,
@@ -1809,7 +1812,7 @@ func TestSnapshot_AddPodGroups(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			snap := cache.NewTestSnapshotWithCompositePodGroups(tc.initPods, nil, tc.initPodGroups, tc.initCompositePodGroups)
-			cs := New(snap, nil)
+			cs := New(snap, nil, 0)
 
 			err := cs.Transaction(t.Context(), func() (TransactionResult, error) {
 				for _, cpg := range tc.addCompositePodGroups {
@@ -1982,7 +1985,7 @@ func TestSnapshot_RemovePodGroups(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			snap := cache.NewTestSnapshotWithCompositePodGroups(tc.initPods, nil, tc.initPodGroups, tc.initCompositePodGroups)
-			cs := New(snap, nil)
+			cs := New(snap, nil, 0)
 
 			err := cs.Transaction(t.Context(), func() (TransactionResult, error) {
 				for _, pg := range tc.removePodGroups {
@@ -2689,7 +2692,7 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 			if err != nil {
 				t.Fatalf("SetupSnapshotTestWithPodGroups failed: %v", err)
 			}
-			cs := New(snap, profileMap)
+			cs := New(snap, profileMap, 0)
 
 			opts, filter := tt.buildOpts()
 			result := cs.ScheduleWorkload(ctx, tt.workloadPods, opts)
@@ -2928,7 +2931,7 @@ func TestScheduleWorkload_PreservesPassFailureResults(t *testing.T) {
 				testutils.MakePod("w-pod1", "gang-pg", "2"),
 				testutils.MakePod("w-pod2", "gang-pg", "2"),
 			}
-			result := New(snap, profileMap).ScheduleWorkload(ctx, workloadPods, opts)
+			result := New(snap, profileMap, 0).ScheduleWorkload(ctx, workloadPods, opts)
 
 			// Verify exact per-pass PlacementGenerate counts against the scripted test case.
 			var wantCalls [3]int
@@ -2980,6 +2983,178 @@ func TestScheduleWorkload_PreservesPassFailureResults(t *testing.T) {
 				}
 			}
 			ft.VerifySnapshot(t, snap, map[string]sets.Set[string]{"node1": sets.New("v-potential")})
+		})
+	}
+}
+
+const countingScorePluginName = "CountingScore"
+
+// countingScorePlugin is a Score plugin that counts the nodes it is asked to score, so that
+// TestNodesScored can check how many nodes a scheduling attempt evaluated without depending on
+// which node wins.
+type countingScorePlugin struct {
+	scored atomic.Int32
+}
+
+var _ fwk.ScorePlugin = &countingScorePlugin{}
+
+func (pl *countingScorePlugin) Name() string { return countingScorePluginName }
+
+func (pl *countingScorePlugin) Score(context.Context, fwk.CycleState, *v1.Pod, fwk.NodeInfo) (int64, *fwk.Status) {
+	pl.scored.Add(1)
+	return 0, nil
+}
+
+func (pl *countingScorePlugin) ScoreExtensions() fwk.ScoreExtensions { return nil }
+
+func (pl *countingScorePlugin) registry() frameworkruntime.Registry {
+	return frameworkruntime.Registry{
+		countingScorePluginName: func(context.Context, runtime.Object, fwk.Handle) (fwk.Plugin, error) {
+			return pl, nil
+		},
+	}
+}
+
+// TestNodesScored checks which methods follow PercentageOfNodesToScore by counting the nodes a
+// Score plugin sees. Unlike the selected node, the count depends neither on the node order nor on
+// the parallel Filter.
+func TestNodesScored(t *testing.T) {
+	const numNodes = 300
+	nodes := make([]*v1.Node, numNodes)
+	nodeNames := make([]string, numNodes)
+	for i := range numNodes {
+		nodeNames[i] = fmt.Sprintf("node-%03d", i)
+		nodes[i] = st.MakeNode().Name(nodeNames[i]).Capacity(map[v1.ResourceName]string{
+			v1.ResourceCPU:    "10",
+			v1.ResourceMemory: "10Gi",
+			v1.ResourcePods:   "110",
+		}).Obj()
+	}
+	podGroup := testutils.MakeGangPodGroup("gang-1", "", 1)
+	template := &v1.PodTemplateSpec{Spec: v1.PodSpec{Containers: []v1.Container{{
+		Name:      "container",
+		Resources: v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("1")}},
+	}}}}
+	schedulePods := func(ctx context.Context, cs *ClusterSnapshot, placement *fwk.Placement) ([]SchedulingResult, error) {
+		pod := st.MakePod().Name("pod-1").Namespace("default").UID("uid-pod-1").Req(map[v1.ResourceName]string{
+			v1.ResourceCPU: "1",
+		}).Obj()
+		return cs.SchedulePods(ctx, []*v1.Pod{pod}, placement, SchedulePodsOptions{})
+	}
+	scheduleWorkload := func(ctx context.Context, cs *ClusterSnapshot, _ *fwk.Placement) ([]SchedulingResult, error) {
+		result := cs.ScheduleWorkload(ctx, []*v1.Pod{testutils.MakePod("wl-pod-1", "gang-1", "1")}, NewScheduleWorkloadOptions(false))
+		if !result.Status.IsSuccess() {
+			return nil, result.Status.AsError()
+		}
+		return result.PodResults, nil
+	}
+
+	tests := []struct {
+		name                     string
+		percentageOfNodesToScore int32
+		profilePercentage        *int32
+		schedule                 func(ctx context.Context, cs *ClusterSnapshot, placement *fwk.Placement) ([]SchedulingResult, error)
+		wantResults              int
+		wantScored               int32
+	}{
+		{
+			name:                     "SchedulePods is first fit",
+			percentageOfNodesToScore: 100,
+			schedule:                 schedulePods,
+			wantResults:              1,
+			wantScored:               0,
+		},
+		{
+			name:                     "SchedulePods is first fit with a profile percentage",
+			percentageOfNodesToScore: 100,
+			profilePercentage:        ptr.To[int32](100),
+			schedule:                 schedulePods,
+			wantResults:              1,
+			wantScored:               0,
+		},
+		{
+			name:                     "SchedulePodsByTemplate is first fit",
+			percentageOfNodesToScore: 100,
+			schedule: func(ctx context.Context, cs *ClusterSnapshot, placement *fwk.Placement) ([]SchedulingResult, error) {
+				return cs.SchedulePodsByTemplate(ctx, template, placement, 3, SchedulePodsByTemplateOptions{})
+			},
+			wantResults: 3,
+			wantScored:  0,
+		},
+		{
+			name:                     "ScheduleWorkload scores the configured percentage of nodes",
+			percentageOfNodesToScore: 10,
+			schedule:                 scheduleWorkload,
+			wantResults:              1,
+			wantScored:               100, // 10% of 300 is below minFeasibleNodesToFind.
+		},
+		{
+			name:                     "ScheduleWorkload scores every node at 100%",
+			percentageOfNodesToScore: 100,
+			schedule:                 scheduleWorkload,
+			wantResults:              1,
+			wantScored:               numNodes,
+		},
+		{
+			name:                     "ScheduleWorkload uses the adaptive percentage for 0",
+			percentageOfNodesToScore: 0,
+			schedule:                 scheduleWorkload,
+			wantResults:              1,
+			wantScored:               144, // 48% of 300.
+		},
+		{
+			name:                     "ScheduleWorkload uses a lower profile percentage over the global one",
+			percentageOfNodesToScore: 100,
+			profilePercentage:        ptr.To[int32](10),
+			schedule:                 scheduleWorkload,
+			wantResults:              1,
+			wantScored:               100,
+		},
+		{
+			name:                     "ScheduleWorkload uses a higher profile percentage over the global one",
+			percentageOfNodesToScore: 10,
+			profilePercentage:        ptr.To[int32](100),
+			schedule:                 scheduleWorkload,
+			wantResults:              1,
+			wantScored:               numNodes,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			counter := &countingScorePlugin{}
+			profiles, snap, err := ft.SetupSnapshotTestWithPodGroups(ctx, t, nil, nodes, []*schedulingv1beta1.PodGroup{podGroup}, nil,
+				ft.WithProfileModifier(func(prof *schedulerapi.KubeSchedulerProfile) {
+					prof.PercentageOfNodesToScore = tt.profilePercentage
+					prof.Plugins.Score.Enabled = []schedulerapi.Plugin{{Name: countingScorePluginName, Weight: 1}}
+				}),
+				ft.WithOutOfTreeRegistry(counter.registry()),
+			)
+			if err != nil {
+				t.Fatalf("SetupSnapshotTestWithPodGroups failed: %v", err)
+			}
+			cs := New(snap, profiles, tt.percentageOfNodesToScore)
+			placement, err := cs.MakePlacement(nodeNames)
+			if err != nil {
+				t.Fatalf("MakePlacement failed: %v", err)
+			}
+
+			results, err := tt.schedule(ctx, cs, placement)
+			if err != nil {
+				t.Fatalf("scheduling failed: %v", err)
+			}
+			if len(results) != tt.wantResults {
+				t.Fatalf("got %d results, want %d", len(results), tt.wantResults)
+			}
+			for _, res := range results {
+				if !res.Status.IsSuccess() {
+					t.Fatalf("pod %s was not scheduled: %v", res.Pod.Name, res.Status)
+				}
+			}
+			if got := counter.scored.Load(); got != tt.wantScored {
+				t.Errorf("Score plugin saw %d nodes, want %d", got, tt.wantScored)
+			}
 		})
 	}
 }

@@ -15,11 +15,9 @@
 package snapshot
 
 import (
-	"math"
+	"context"
 	"slices"
 	"testing"
-
-	"context"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -357,7 +355,7 @@ func TestScheduleOnePod(t *testing.T) {
 			}
 			defer snap.ForgetPlacement()
 
-			algRes, revertFn, err := scheduleOnePod(ctx, cs.profiles, upstreamsync.NewScheduler(snap, 0, 0, math.MaxInt32, nil), tc.pod)
+			algRes, revertFn, err := scheduleOnePod(ctx, cs.profiles, upstreamsync.NewScheduler(snap, 0, 0, nil), tc.pod)
 			if (err != nil) != tc.expectErr {
 				t.Fatalf("unexpected error state: %v, expectErr: %v", err, tc.expectErr)
 			}
@@ -406,5 +404,5 @@ func setupSnapshotTest(ctx context.Context, t *testing.T, nodes []*v1.Node, pods
 	if err != nil {
 		t.Fatalf("Failed to set up snapshot: %v", err)
 	}
-	return New(snap, profiles), snap, profiles
+	return New(snap, profiles, 0), snap, profiles
 }
