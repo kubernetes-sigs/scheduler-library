@@ -41,10 +41,12 @@ type ClusterState struct {
 
 // New creates a new ClusterState with an internal Kubernetes scheduler cache, frameworks,
 // and the snapshot instance shared with all frameworks via WithSnapshotSharedLister.
-func New(c cache.Cache, profiles *upstreamsync.ProfileMap, snap *cache.Snapshot) *ClusterState {
+// percentageOfNodesToScore is the global percentage of nodes to score the snapshot schedules
+// workloads with (see snapshot.New).
+func New(c cache.Cache, profiles *upstreamsync.ProfileMap, snap *cache.Snapshot, percentageOfNodesToScore int32) *ClusterState {
 	return &ClusterState{
 		Cache:                 c,
-		snapshot:              snapshot.New(snap, profiles),
+		snapshot:              snapshot.New(snap, profiles, percentageOfNodesToScore),
 		snapshotData:          snap,
 		assumedPodCycleStates: sync.Map{},
 		profiles:              profiles,
@@ -96,7 +98,7 @@ func (s *ClusterState) AssumeAndReserve(ctx context.Context, pod *v1.Pod, cycleS
 		return fmt.Errorf("failed to get framework for pod: %w", err)
 	}
 
-	sched := upstreamsync.NewScheduler(s.snapshotData, 0, 0, 0, s.Cache)
+	sched := upstreamsync.NewScheduler(s.snapshotData, 0, 0, s.Cache)
 
 	podInfo, err := framework.NewPodInfo(pod)
 	if err != nil {
@@ -150,7 +152,7 @@ func (s *ClusterState) UnreserveAndForget(ctx context.Context, pod *v1.Pod) erro
 	if !ok {
 		return fmt.Errorf("invalid cycle state type for pod: %q", pod.Name)
 	}
-	sched := upstreamsync.NewScheduler(s.snapshotData, 0, 0, 0, s.Cache)
+	sched := upstreamsync.NewScheduler(s.snapshotData, 0, 0, s.Cache)
 	err = sched.UnreserveAndForgetFromCache(ctx, cycleState, schedFramework, podInfo, nodeName)
 	if err != nil {
 		return err

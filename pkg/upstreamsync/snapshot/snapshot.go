@@ -19,7 +19,6 @@ import (
 	"errors"
 	"fmt"
 	"iter"
-	"math"
 	"reflect"
 	"slices"
 
@@ -52,6 +51,10 @@ type ClusterSnapshot struct {
 	profiles *upstreamsync.ProfileMap
 	// schedulerSnapshot is the upstream snapshot holding the actual node and pod data.
 	schedulerSnapshot *cache.Snapshot
+	// percentageOfNodesToScore is the global KubeSchedulerConfiguration.PercentageOfNodesToScore
+	// used when scheduling; per-profile values override it. SchedulePods and SchedulePodsByTemplate
+	// use first-fit scheduling, so it only affects them when filter extenders are configured.
+	percentageOfNodesToScore int32
 	// undoLog records how to undo every mutation applied to schedulerSnapshot, so that a dry run
 	// or a reverted transaction can restore the state it started from.
 	undoLog undoLog
@@ -104,15 +107,18 @@ func (ul *undoLog) undo() {
 }
 
 // New creates a new ClusterSnapshot stub wrapping the provided scheduler snapshot and frameworks.
+// percentageOfNodesToScore is the global percentage of nodes to score, in [0, 100]; 0 selects the
+// adaptive policy.
 //
 // Consumers should obtain a ClusterSnapshot from simulator.SchedulingSimulator instead, either via
 // NewClusterSnapshot or via NewClusterState followed by state.ClusterState.GetAssociatedSnapshot: those build
 // the full plugin chain out of the KubeSchedulerConfiguration and initialize the scheduler metrics,
 // which this constructor expects to have been done already.
-func New(s *cache.Snapshot, profiles *upstreamsync.ProfileMap) *ClusterSnapshot {
+func New(s *cache.Snapshot, profiles *upstreamsync.ProfileMap, percentageOfNodesToScore int32) *ClusterSnapshot {
 	return &ClusterSnapshot{
-		profiles:          profiles,
-		schedulerSnapshot: s,
+		profiles:                 profiles,
+		schedulerSnapshot:        s,
+		percentageOfNodesToScore: percentageOfNodesToScore,
 	}
 }
 
@@ -185,22 +191,22 @@ func (s *ClusterSnapshot) CanSchedulePod(ctx context.Context, pod *v1.Pod, place
 		CycleState: state,
 	}
 
-	sched := upstreamsync.NewScheduler(s.schedulerSnapshot, 0, 0, math.MaxInt32, nil)
+	sched := upstreamsync.NewScheduler(s.schedulerSnapshot, 0, 0, nil)
 	err = s.schedulerSnapshot.AssumePlacement(placement)
 	if err != nil {
 		return FeasibilityResult{}, fmt.Errorf("failed to assume placement: %w", err)
 	}
 	defer s.schedulerSnapshot.ForgetPlacement()
-	nodes, diag, _, err := sched.FindAllNodesThatFitPod(ctx, schedFramework, pendingPod)
+	nodes, diagnosis, err := sched.FindAllNodesThatFitPod(ctx, schedFramework, pendingPod)
 	if err != nil {
-		return FeasibilityResult{Diagnosis: &diag}, fmt.Errorf("failed to find nodes that fit pod: %w", err)
+		return FeasibilityResult{Diagnosis: diagnosis}, fmt.Errorf("failed to find nodes that fit pod: %w", err)
 	}
 	feasibleNodes := make([]string, 0, len(nodes))
 	for _, node := range nodes {
 		feasibleNodes = append(feasibleNodes, node.Node().Name)
 	}
 
-	return FeasibilityResult{FeasibleNodeNames: feasibleNodes, CycleState: state, Diagnosis: &diag}, nil
+	return FeasibilityResult{FeasibleNodeNames: feasibleNodes, CycleState: state, Diagnosis: diagnosis}, nil
 }
 
 func schedulingResult(algRes *upstreamsync.AlgorithmResult) SchedulingResult {
@@ -213,6 +219,8 @@ func schedulingResult(algRes *upstreamsync.AlgorithmResult) SchedulingResult {
 }
 
 // SchedulePods schedules the given pods onto the specified placement using PreFilter and Filter plugins.
+// Score plugins are not used: each pod goes to the first feasible node found. PercentageOfNodesToScore
+// only matters when filter extenders are configured (see upstreamsync.WithFirstFit).
 // StopOnFailure controls whether the first unschedulable pod stops the loop. Note that
 // All unexpected execution errors always propagate immediately regardless of StopOnFailure, as they
 // indicate a programming error rather than a scheduling failure.
@@ -241,6 +249,8 @@ func ownedCopies(pods []*v1.Pod) iter.Seq[*v1.Pod] {
 
 // SchedulePodsByTemplate attempts to schedule as many pods matching the template as possible.
 // It assumes nodes in the placement are feasible and moves to the next node only if the pod is unschedulable on the current node.
+// As in SchedulePods, Score plugins are not used and PercentageOfNodesToScore only matters when filter
+// extenders are configured.
 func (s *ClusterSnapshot) SchedulePodsByTemplate(ctx context.Context, template *v1.PodTemplateSpec, placement *fwk.Placement, maxPods int, opts SchedulePodsByTemplateOptions) ([]SchedulingResult, error) {
 	if maxPods <= 0 {
 		return nil, nil
@@ -289,7 +299,14 @@ func (s *ClusterSnapshot) schedulePods(ctx context.Context, pods iter.Seq[*v1.Po
 	}
 	defer s.schedulerSnapshot.ForgetPlacement()
 	for pod := range pods {
-		sched := upstreamsync.NewScheduler(s.schedulerSnapshot, currentCycle, 0, 1, nil)
+		sched := upstreamsync.NewScheduler(
+			s.schedulerSnapshot,
+			currentCycle,
+			0,
+			nil,
+			upstreamsync.WithFirstFit(),
+			upstreamsync.WithAlgorithmPercentageOfNodesToScore(s.percentageOfNodesToScore),
+		)
 
 		res, revertFn, err := scheduleOnePod(ctx, s.profiles, sched, pod)
 
@@ -424,6 +441,10 @@ func (s *ClusterSnapshot) Unpreempt(u *Unpreemption) ([]*v1.Pod, error) {
 // If the pods do not belong to the same hierarchy, it returns an error status.
 // The order of WorkloadSchedulingResult.PodResults is not guaranteed to match the order of input pods.
 //
+// Unlike SchedulePods, it scores nodes like kube-scheduler: each pod's search stops once enough
+// feasible nodes are found for the profile's PercentageOfNodesToScore (or else the global one),
+// and the pod goes to the best-scoring of them.
+//
 // ScheduleWorkload evaluates up to three passes depending on opts.CommittedVictims and opts.PotentialVictims:
 //  1. Fit without preemption: attempts scheduling with nodes occupied by opts.CommittedVictims filtered out
 //     and opts.CommittedVictims temporarily excluded from opts.PreemptionFilter (if set). On success, returns
@@ -503,7 +524,7 @@ func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, 
 
 	// First, try scheduling without preemption with the nodes occupied by committed victims filtered out.
 	// Fit here means the workload doesn't need to wait for preemption.
-	sched := upstreamsync.NewScheduler(s.schedulerSnapshot, 0, 0, 1, nil)
+	sched := upstreamsync.NewScheduler(s.schedulerSnapshot, 0, 0, nil, upstreamsync.WithAlgorithmPercentageOfNodesToScore(s.percentageOfNodesToScore))
 	rootCycleState := framework.NewCycleState()
 	err = preemption.SetCommittedVictimsInCycleState(rootCycleState, opts.CommittedVictims)
 	if err != nil {
