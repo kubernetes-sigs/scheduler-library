@@ -65,6 +65,31 @@ func TestCommittedVictimPlugin_Filter(t *testing.T) {
 			},
 		},
 		{
+			name: "zero-pod committed victims allow all nodes to pass",
+			cycleState: func() fwk.CycleState {
+				c := framework.NewCycleState()
+				pgc := framework.NewCycleState()
+				if err := preemption.SetCommittedVictimsInCycleState(pgc, []preemption.PreemptionVictim{
+					&testVictim{name: "nil-pods", pods: nil},
+					&testVictim{name: "empty-pods", pods: []*v1.Pod{}},
+				}); err != nil {
+					t.Fatalf("SetCommittedVictimsInCycleState failed: %v", err)
+				}
+				c.SetPodGroupSchedulingCycle(pgc)
+				return c
+			}(),
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node1").Obj(),
+				st.MakeNode().Name("node2").Obj(),
+				st.MakeNode().Name("node3").Obj(),
+			},
+			wantResults: map[string]fwk.Code{
+				"node1": fwk.Success,
+				"node2": fwk.Success,
+				"node3": fwk.Success,
+			},
+		},
+		{
 			name: "empty nodes with victims allows all nodes to pass",
 			cycleState: func() fwk.CycleState {
 				c := framework.NewCycleState()
