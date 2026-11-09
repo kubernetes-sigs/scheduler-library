@@ -57,7 +57,11 @@ func WithProfileModifier(fn func(*schedulerapi.KubeSchedulerProfile)) SnapshotTe
 	}
 }
 
-// SetupSnapshotTest initializes a fake clientset, snapshot, and default profile map for unit tests.
+// NoFilterPluginsSchedulerName names the profile that SetupSnapshotTest adds with no PreFilter or Filter plugins.
+const NoFilterPluginsSchedulerName = "no-filter-plugins"
+
+// SetupSnapshotTest initializes a fake clientset, snapshot, and profile map for unit tests. The map
+// holds the default profile and the NoFilterPluginsSchedulerName profile.
 func SetupSnapshotTest(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (*upstreamsync.ProfileMap, *cache.Snapshot, error) {
 	framework.InitMetricsOnce()
 	client := fake.NewClientset()
@@ -104,6 +108,20 @@ func SetupSnapshotTest(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (*
 							ScoringStrategy: &schedulerapi.ScoringStrategy{
 								Type: schedulerapi.LeastAllocated,
 							},
+						},
+					},
+				},
+			},
+			{SchedulerName: NoFilterPluginsSchedulerName,
+				Plugins: &schedulerapi.Plugins{
+					QueueSort: schedulerapi.PluginSet{
+						Enabled: []schedulerapi.Plugin{
+							{Name: "PrioritySort"},
+						},
+					},
+					Bind: schedulerapi.PluginSet{
+						Enabled: []schedulerapi.Plugin{
+							{Name: "DefaultBinder"},
 						},
 					},
 				},
