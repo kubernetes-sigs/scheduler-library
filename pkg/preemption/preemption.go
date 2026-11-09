@@ -163,16 +163,31 @@ type simPreemptionVictim struct {
 
 var _ upstreampreemption.PreemptionVictim = (*simPreemptionVictim)(nil)
 
+func validateVictim(v PreemptionVictim) error {
+	if v == nil {
+		return fmt.Errorf("preemption victim cannot be nil")
+	}
+	if len(v.Pods()) == 0 {
+		return fmt.Errorf("preemption victim cannot be empty")
+	}
+	for _, p := range v.Pods() {
+		if p == nil {
+			return fmt.Errorf("preemption victim pod cannot be nil")
+		}
+		if p.Spec.NodeName == "" {
+			return fmt.Errorf("preemption victim pod cannot be unscheduled")
+		}
+	}
+	return nil
+}
+
 func newSimPreemptionVictim(v PreemptionVictim) (*simPreemptionVictim, error) {
-	if v == nil || len(v.Pods()) == 0 {
-		return nil, fmt.Errorf("preemption victim cannot be nil nor empty")
+	if err := validateVictim(v); err != nil {
+		return nil, err
 	}
 	rawPods := v.Pods()
 	podInfos := make([]fwk.PodInfo, 0, len(rawPods))
 	for _, p := range rawPods {
-		if p == nil {
-			return nil, fmt.Errorf("preemption victim pod cannot be nil")
-		}
 		pi, err := framework.NewPodInfo(p)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create PodInfo for victim pod: %w", err)

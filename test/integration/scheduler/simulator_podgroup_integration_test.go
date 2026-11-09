@@ -506,16 +506,17 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 	vCommittedPod := makeScheduledPod(ns, "v-committed", "node1", "", "2")
 
 	tests := []struct {
-		name            string
-		nodes           []*v1.Node
-		existingPods    []*v1.Pod
-		workloadPods    []*v1.Pod
-		opts            snapshot.ScheduleWorkloadOptions
-		wantStatusCode  fwk.Code
-		wantScheduled   bool
-		wantVictimNames []string
-		probePodCPU     string
-		wantProbeFits   bool
+		name                     string
+		nodes                    []*v1.Node
+		existingPods             []*v1.Pod
+		workloadPods             []*v1.Pod
+		opts                     snapshot.ScheduleWorkloadOptions
+		wantStatusCode           fwk.Code
+		wantScheduled            bool
+		wantWaitingForPreemption bool
+		wantVictimNames          []string
+		probePodCPU              string
+		wantProbeFits            bool
 	}{
 		{
 			name:         "fits without preemption",
@@ -534,11 +535,12 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 					PreemptionFilter: &integrationCPUPreemptionFilter{availableCPU: 4, requiredCPU: 4},
 				},
 			},
-			wantStatusCode:  fwk.Success,
-			wantScheduled:   true,
-			wantVictimNames: nil,
-			probePodCPU:     "1",
-			wantProbeFits:   false,
+			wantStatusCode:           fwk.Success,
+			wantScheduled:            true,
+			wantWaitingForPreemption: false,
+			wantVictimNames:          nil,
+			probePodCPU:              "1",
+			wantProbeFits:            false,
 		},
 		{
 			name:         "preemption triggered by PreemptionFilter when node has free capacity",
@@ -558,11 +560,12 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 					PreemptionFilter: &integrationCPUPreemptionFilter{requiredCPU: 3},
 				},
 			},
-			wantStatusCode:  fwk.Unschedulable,
-			wantScheduled:   true,
-			wantVictimNames: []string{"vMed"},
-			probePodCPU:     "3",
-			wantProbeFits:   true,
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            true,
+			wantWaitingForPreemption: true,
+			wantVictimNames:          []string{"vMed"},
+			probePodCPU:              "3",
+			wantProbeFits:            true,
 		},
 		{
 			name:         "fits after preempting subset of PotentialVictims with reprieve",
@@ -582,11 +585,12 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 					PreemptionFilter: &integrationCPUPreemptionFilter{requiredCPU: 3},
 				},
 			},
-			wantStatusCode:  fwk.Unschedulable,
-			wantScheduled:   true,
-			wantVictimNames: []string{"vMed"},
-			probePodCPU:     "1",
-			wantProbeFits:   true,
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            true,
+			wantWaitingForPreemption: true,
+			wantVictimNames:          []string{"vMed"},
+			probePodCPU:              "1",
+			wantProbeFits:            true,
 		},
 		{
 			name:         "fits after initial node-fit failure without PreemptionFilter",
@@ -605,11 +609,12 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 					}),
 				},
 			},
-			wantStatusCode:  fwk.Unschedulable,
-			wantScheduled:   true,
-			wantVictimNames: []string{"vMed"},
-			probePodCPU:     "1",
-			wantProbeFits:   true,
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            true,
+			wantWaitingForPreemption: true,
+			wantVictimNames:          []string{"vMed"},
+			probePodCPU:              "1",
+			wantProbeFits:            true,
 		},
 		{
 			name:         "multi-pod PreemptionVictim preempted and restored atomically",
@@ -628,16 +633,17 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 					PreemptionFilter: &integrationCPUPreemptionFilter{requiredCPU: 4},
 				},
 			},
-			wantStatusCode:  fwk.Unschedulable,
-			wantScheduled:   true,
-			wantVictimNames: []string{"vSingle"},
-			probePodCPU:     "1",
-			wantProbeFits:   false,
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            true,
+			wantWaitingForPreemption: true,
+			wantVictimNames:          []string{"vSingle"},
+			probePodCPU:              "1",
+			wantProbeFits:            false,
 		},
 		{
-			name:         "CommittedVictims removed upfront and included in PreemptionVictims",
+			name:         "CommittedVictims removed upfront and only new victims included in PreemptionVictims",
 			nodes:        []*v1.Node{node8CPU},
-			existingPods: []*v1.Pod{vCommittedPod, v1Pod, v2Pod},
+			existingPods: []*v1.Pod{v1Pod, v2Pod},
 			workloadPods: []*v1.Pod{
 				makePod(ns, "w-d1", "preempt-gang", "3"),
 				makePod(ns, "w-d2", "preempt-gang", "3"),
@@ -654,11 +660,12 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 					PreemptionFilter: &integrationCPUPreemptionFilter{availableCPU: 4, requiredCPU: 6},
 				},
 			},
-			wantStatusCode:  fwk.Unschedulable,
-			wantScheduled:   true,
-			wantVictimNames: []string{"vCommitted", "v1"},
-			probePodCPU:     "2",
-			wantProbeFits:   true,
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            true,
+			wantWaitingForPreemption: true,
+			wantVictimNames:          []string{"v1"},
+			probePodCPU:              "2",
+			wantProbeFits:            true,
 		},
 		{
 			name:         "fails when all PotentialVictims are insufficient and reverts snapshot",
@@ -677,11 +684,12 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 					PreemptionFilter: &integrationCPUPreemptionFilter{requiredCPU: 2},
 				},
 			},
-			wantStatusCode:  fwk.Unschedulable,
-			wantScheduled:   false,
-			wantVictimNames: nil,
-			probePodCPU:     "2",
-			wantProbeFits:   true,
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            false,
+			wantWaitingForPreemption: false,
+			wantVictimNames:          nil,
+			probePodCPU:              "2",
+			wantProbeFits:            true,
 		},
 		{
 			name:         "DryRun with preemption returns victims and reverts snapshot",
@@ -702,11 +710,12 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 					PreemptionFilter: &integrationCPUPreemptionFilter{requiredCPU: 3},
 				},
 			},
-			wantStatusCode:  fwk.Unschedulable,
-			wantScheduled:   true,
-			wantVictimNames: []string{"vMed"},
-			probePodCPU:     "2",
-			wantProbeFits:   false,
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            true,
+			wantWaitingForPreemption: true,
+			wantVictimNames:          []string{"vMed"},
+			probePodCPU:              "2",
+			wantProbeFits:            false,
 		},
 	}
 
@@ -744,6 +753,9 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 			}
 			if res.Status.Code() != tt.wantStatusCode {
 				t.Fatalf("Status.Code() = %v, want %v (status: %v)", res.Status.Code(), tt.wantStatusCode, res.Status)
+			}
+			if res.WaitingForPreemption != tt.wantWaitingForPreemption {
+				t.Errorf("WaitingForPreemption = %v, want %v", res.WaitingForPreemption, tt.wantWaitingForPreemption)
 			}
 			if tt.wantScheduled {
 				if len(res.PodResults) != len(tt.workloadPods) {
@@ -783,6 +795,283 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 			gotFits := len(feasibleNodes) == 1
 			if gotFits != tt.wantProbeFits {
 				t.Errorf("CanSchedulePod(probe %s CPU) fits = %v, want %v (feasibleNodes: %v)", tt.probePodCPU, gotFits, tt.wantProbeFits, feasibleNodes)
+			}
+		})
+	}
+}
+
+func TestSimulatorIntegration_IncrementalPreemption(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.GenericWorkload:                 true,
+		features.TopologyAwareWorkloadScheduling: true,
+		features.CompositePodGroup:               true,
+	})
+
+	testCtx := testutils.InitTestAPIServer(t, "sim-inc-preempt-test", nil)
+	if testCtx == nil {
+		t.Fatal("Expected testCtx to be non-nil")
+	}
+	ctx := testCtx.Ctx
+	logger := klog.FromContext(ctx)
+	client := testCtx.ClientSet
+	ns := testCtx.NS.Name
+
+	cfg := newKubeSchedulerConfig(withTopologyPlacementGenerator)
+
+	readonlyClient, err := simulator.NewReadonlyClient(testCtx.KubeConfig)
+	if err != nil {
+		t.Fatalf("NewReadonlyClient failed: %v", err)
+	}
+
+	node1Capacity10CPU := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "10",
+		v1.ResourceMemory: "8Gi",
+		v1.ResourcePods:   "10",
+	}).Obj()
+	node2Capacity2CPU := st.MakeNode().Name("node2").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "2",
+		v1.ResourceMemory: "8Gi",
+		v1.ResourcePods:   "10",
+	}).Obj()
+	node2Capacity6CPU := st.MakeNode().Name("node2").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "6",
+		v1.ResourceMemory: "8Gi",
+		v1.ResourcePods:   "10",
+	}).Obj()
+
+	pg1 := makePodGroup(ns, "workload-1", "", 2, "")
+	pg2Single := makePodGroup(ns, "workload-2-single", "", 1, "")
+	pg2Gang := makePodGroup(ns, "workload-2-gang", "", 2, "")
+
+	v1Node1Pod8CPU := makeScheduledPod(ns, "v1-node1-8cpu", "node1", "", "8")
+	v2Node1Pod2CPU := makeScheduledPod(ns, "v2-node1-2cpu", "node1", "", "2")
+	v3Node2Pod4CPU := makeScheduledPod(ns, "v3-node2-4cpu", "node2", "", "4")
+	stayNode1Pod2CPU := makeScheduledPod(ns, "stay-node1-2cpu", "node1", "", "2")
+	stayNode2Pod2CPU := makeScheduledPod(ns, "stay-node2-2cpu", "node2", "", "2")
+
+	tests := []struct {
+		name                       string
+		nodes                      []*v1.Node
+		existingPods               []*v1.Pod
+		podGroups                  []*schedulingv1beta1.PodGroup
+		w1Pods                     []*v1.Pod
+		w1PotentialVictims         []snapshot.PreemptionVictim
+		w2Pods                     []*v1.Pod
+		w2PotentialVictims         []snapshot.PreemptionVictim
+		wantW1Victims              []string
+		wantW2StatusCode           fwk.Code
+		wantW2WaitingForPreemption bool
+		wantW2Victims              []string
+		wantW2SelectedNodes        []string
+	}{
+		{
+			name:         "workload 1 requires preemption, workload 2 does not and avoids workload 1 victim node",
+			nodes:        []*v1.Node{node1Capacity10CPU, node2Capacity2CPU},
+			existingPods: []*v1.Pod{v1Node1Pod8CPU, stayNode1Pod2CPU},
+			podGroups:    []*schedulingv1beta1.PodGroup{pg1, pg2Single},
+			w1Pods: []*v1.Pod{
+				makePod(ns, "w1-pod-1", "workload-1", "3"),
+				makePod(ns, "w1-pod-2", "workload-1", "3"),
+			},
+			w1PotentialVictims: []snapshot.PreemptionVictim{
+				&integrationVictim{name: "v1", pods: []*v1.Pod{v1Node1Pod8CPU}},
+			},
+			// Once v1 is removed and w1 (6 CPU) is scheduled on node1, node1 is listed first and still
+			// has 2 CPU free, and node2 also has 2 CPU free without touching any CommittedVictims.
+			w2Pods: []*v1.Pod{
+				makePod(ns, "w2-pod-1", "workload-2-single", "2"),
+			},
+			w2PotentialVictims:         nil,
+			wantW1Victims:              []string{"v1"},
+			wantW2StatusCode:           fwk.Success,
+			wantW2WaitingForPreemption: false,
+			wantW2Victims:              nil,
+			wantW2SelectedNodes:        []string{"node2"},
+		},
+		{
+			name:         "workload 1 requires preemption, workload 2 needs to wait for workload 1 victims to schedule",
+			nodes:        []*v1.Node{node1Capacity10CPU, node2Capacity2CPU},
+			existingPods: []*v1.Pod{v1Node1Pod8CPU, stayNode1Pod2CPU, stayNode2Pod2CPU},
+			podGroups:    []*schedulingv1beta1.PodGroup{pg1, pg2Gang},
+			w1Pods: []*v1.Pod{
+				makePod(ns, "w1-pod-1", "workload-1", "2"),
+				makePod(ns, "w1-pod-2", "workload-1", "2"),
+			},
+			w1PotentialVictims: []snapshot.PreemptionVictim{
+				&integrationVictim{name: "v1", pods: []*v1.Pod{v1Node1Pod8CPU}},
+			},
+			// node2 is full (2/2 CPU used by stayNode2Pod2CPU), so w2 (4 CPU) must use the remaining
+			// space freed by v1 on node1 after w1 (4 CPU) is scheduled there.
+			w2Pods: []*v1.Pod{
+				makePod(ns, "w2-pod-1", "workload-2-gang", "2"),
+				makePod(ns, "w2-pod-2", "workload-2-gang", "2"),
+			},
+			w2PotentialVictims:         nil,
+			wantW1Victims:              []string{"v1"},
+			wantW2StatusCode:           fwk.Unschedulable,
+			wantW2WaitingForPreemption: true,
+			wantW2Victims:              nil,
+			wantW2SelectedNodes:        []string{"node1", "node1"},
+		},
+		{
+			name:         "workload 1 requires preemption, workload 2 requires additional preemption and returns new victims",
+			nodes:        []*v1.Node{node1Capacity10CPU, node2Capacity6CPU},
+			existingPods: []*v1.Pod{v1Node1Pod8CPU, v2Node1Pod2CPU, v3Node2Pod4CPU, stayNode2Pod2CPU},
+			podGroups:    []*schedulingv1beta1.PodGroup{pg1, pg2Gang},
+			w1Pods: []*v1.Pod{
+				makePod(ns, "w1-pod-1", "workload-1", "2"),
+				makePod(ns, "w1-pod-2", "workload-1", "2"),
+			},
+			w1PotentialVictims: []snapshot.PreemptionVictim{
+				&integrationVictim{name: "v1", pods: []*v1.Pod{v1Node1Pod8CPU}},
+				&integrationVictim{name: "v2", pods: []*v1.Pod{v2Node1Pod2CPU}},
+				&integrationVictim{name: "v3", pods: []*v1.Pod{v3Node2Pod4CPU}},
+			},
+			// After v1 (8 CPU on node1) is removed and w1 (4 CPU) is scheduled on node1,
+			// node1 has 4 CPU free and node2 has 0 CPU free.
+			// w2 needs two 4-CPU pods (one on node1 and one on node2), so it must also preempt v3 on node2.
+			w2Pods: []*v1.Pod{
+				makePod(ns, "w2-pod-1", "workload-2-gang", "4"),
+				makePod(ns, "w2-pod-2", "workload-2-gang", "4"),
+			},
+			w2PotentialVictims: []snapshot.PreemptionVictim{
+				&integrationVictim{name: "v2", pods: []*v1.Pod{v2Node1Pod2CPU}},
+				&integrationVictim{name: "v3", pods: []*v1.Pod{v3Node2Pod4CPU}},
+			},
+			wantW1Victims:              []string{"v1"},
+			wantW2StatusCode:           fwk.Unschedulable,
+			wantW2WaitingForPreemption: true,
+			wantW2Victims:              []string{"v3"},
+			wantW2SelectedNodes:        []string{"node1", "node2"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			informerFactory := informers.NewSharedInformerFactory(client, 0)
+			sim, err := simulator.NewSchedulingSimulator(ctx, cfg, readonlyClient, informerFactory)
+			if err != nil {
+				t.Fatalf("NewSchedulingSimulator failed: %v", err)
+			}
+
+			cs, err := sim.NewClusterState(ctx)
+			if err != nil {
+				t.Fatalf("NewClusterState failed: %v", err)
+			}
+
+			for _, n := range tt.nodes {
+				cs.Cache.AddNode(logger, n)
+			}
+			for _, p := range tt.existingPods {
+				if err := cs.Cache.AddPod(logger, p.DeepCopy()); err != nil {
+					t.Fatalf("AddPod(%s) failed: %v", p.Name, err)
+				}
+			}
+			for _, pg := range tt.podGroups {
+				cs.Cache.AddPodGroup(pg)
+			}
+
+			snap := cs.GetAssociatedSnapshot()
+			if err := cs.SyncSnapshot(logger); err != nil {
+				t.Fatalf("SyncSnapshot failed: %v", err)
+			}
+
+			// Schedule Workload 1.
+			w1Opts := snapshot.ScheduleWorkloadOptions{
+				WorkloadPreemptionOptions: snapshot.WorkloadPreemptionOptions{
+					PotentialVictims: slices.Values(tt.w1PotentialVictims),
+				},
+			}
+			w1Res := snap.ScheduleWorkload(ctx, tt.w1Pods, w1Opts)
+			if w1Res.Status.IsError() {
+				t.Fatalf("Workload 1 ScheduleWorkload failed: %v", w1Res.Status.AsError())
+			}
+			if w1Res.Status.Code() != fwk.Unschedulable {
+				t.Fatalf("Workload 1 Status.Code() = %v, want Unschedulable (status: %v)", w1Res.Status.Code(), w1Res.Status)
+			}
+			if !w1Res.WaitingForPreemption {
+				t.Errorf("Workload 1 WaitingForPreemption = false, want true")
+			}
+			var gotW1Victims []string
+			for _, v := range w1Res.PreemptionVictims {
+				gotW1Victims = append(gotW1Victims, v.(*integrationVictim).name)
+			}
+			if !slices.Equal(gotW1Victims, tt.wantW1Victims) {
+				t.Fatalf("Workload 1 PreemptionVictims = %v, want %v", gotW1Victims, tt.wantW1Victims)
+			}
+			if len(w1Res.PodResults) != len(tt.w1Pods) {
+				t.Fatalf("Workload 1 len(PodResults) = %d, want %d", len(w1Res.PodResults), len(tt.w1Pods))
+			}
+
+			// Incrementally remove Workload 1's PreemptionVictims from the snapshot,
+			// place Workload 1's pods onto their selected nodes in the snapshot,
+			// and pass the victims as CommittedVictims for Workload 2.
+			var committedVictimPods []*v1.Pod
+			for _, v := range w1Res.PreemptionVictims {
+				committedVictimPods = append(committedVictimPods, v.Pods()...)
+			}
+			if _, err := snap.PreemptPods(ctx, committedVictimPods); err != nil {
+				t.Fatalf("PreemptPods(committedVictimPods) failed: %v", err)
+			}
+			for _, pRes := range w1Res.PodResults {
+				if !pRes.Status.IsSuccess() {
+					t.Fatalf("Workload 1 pod %s expected success, got %v", pRes.Pod.Name, pRes.Status)
+				}
+				placement, err := snap.MakePlacement([]string{pRes.SelectedNodeName})
+				if err != nil {
+					t.Fatalf("MakePlacement(%s) for Workload 1 pod %s failed: %v", pRes.SelectedNodeName, pRes.Pod.Name, err)
+				}
+				schedRes, err := snap.SchedulePods(ctx, []*v1.Pod{pRes.Pod}, placement, snapshot.SchedulePodsOptions{})
+				if err != nil {
+					t.Fatalf("SchedulePods(%s) on %s failed: %v", pRes.Pod.Name, pRes.SelectedNodeName, err)
+				}
+				if len(schedRes) != 1 || !schedRes[0].Status.IsSuccess() {
+					t.Fatalf("SchedulePods(%s) on %s did not succeed: %v", pRes.Pod.Name, pRes.SelectedNodeName, schedRes)
+				}
+			}
+
+			w2Opts := snapshot.ScheduleWorkloadOptions{
+				WorkloadPreemptionOptions: snapshot.WorkloadPreemptionOptions{
+					CommittedVictims: w1Res.PreemptionVictims,
+				},
+			}
+			if tt.w2PotentialVictims != nil {
+				w2Opts.PotentialVictims = slices.Values(tt.w2PotentialVictims)
+			}
+
+			// Schedule Workload 2.
+			w2Res := snap.ScheduleWorkload(ctx, tt.w2Pods, w2Opts)
+			if w2Res.Status.IsError() {
+				t.Fatalf("Workload 2 ScheduleWorkload failed: %v", w2Res.Status.AsError())
+			}
+			if w2Res.Status.Code() != tt.wantW2StatusCode {
+				t.Fatalf("Workload 2 Status.Code() = %v, want %v (status: %v)", w2Res.Status.Code(), tt.wantW2StatusCode, w2Res.Status)
+			}
+			if w2Res.WaitingForPreemption != tt.wantW2WaitingForPreemption {
+				t.Errorf("Workload 2 WaitingForPreemption = %v, want %v", w2Res.WaitingForPreemption, tt.wantW2WaitingForPreemption)
+			}
+
+			var gotW2Victims []string
+			for _, v := range w2Res.PreemptionVictims {
+				gotW2Victims = append(gotW2Victims, v.(*integrationVictim).name)
+			}
+			if !slices.Equal(gotW2Victims, tt.wantW2Victims) {
+				t.Fatalf("Workload 2 PreemptionVictims = %v, want %v", gotW2Victims, tt.wantW2Victims)
+			}
+
+			if len(w2Res.PodResults) != len(tt.w2Pods) {
+				t.Fatalf("Workload 2 len(PodResults) = %d, want %d", len(w2Res.PodResults), len(tt.w2Pods))
+			}
+			var gotW2SelectedNodes []string
+			for _, pRes := range w2Res.PodResults {
+				if !pRes.Status.IsSuccess() {
+					t.Errorf("Workload 2 pod %s expected success, got %v", pRes.Pod.Name, pRes.Status)
+				}
+				gotW2SelectedNodes = append(gotW2SelectedNodes, pRes.SelectedNodeName)
+			}
+			slices.Sort(gotW2SelectedNodes)
+			if !slices.Equal(gotW2SelectedNodes, tt.wantW2SelectedNodes) {
+				t.Errorf("Workload 2 selected nodes = %v, want %v", gotW2SelectedNodes, tt.wantW2SelectedNodes)
 			}
 		})
 	}

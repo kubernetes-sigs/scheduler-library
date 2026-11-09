@@ -68,20 +68,7 @@ type Simulator interface {
 	// If the pods do not belong to the same hierarchy, it returns an error status.
 	// The order of WorkloadSchedulingResult.PodResults is not guaranteed to match the order of input pods.
 	//
-	// When initial scheduling is skipped (because opts.PreemptionFilter.MayFit() is false) or
-	// fails with Unschedulable, and opts.CommittedVictims or opts.PotentialVictims
-	// is provided, ScheduleWorkload simulates preemption, rolls back all snapshot mutations, and returns
-	// Status: Unschedulable with the proposed PodResults and PreemptionVictims.
-	//
-	// All PodGroup and CompositePodGroup objects in the hierarchy must exist in the snapshot before calling this method.
-	// Callers can register virtual groups (groups not present in the cluster) with AddPodGroup and AddCompositePodGroup.
-	//
-	// Note: Virtual pods (input pods not present in the snapshot beforehand) are assumed on nodes,
-	// but not added to internal pod group sets (allPods/assumedPods). Consequently,
-	// PodGroupState.ScheduledPods() does not include virtual pods from previous ScheduleWorkload calls.
-	// This is safe when evaluating an entire virtual workload in a single call (such as Kueue admission).
-	// However, when scheduling a hierarchy incrementally across multiple ScheduleWorkload calls, plugins
-	// that query ScheduledPods() (such as TAS or gang scheduling) do not observe virtual pods from earlier calls.
+	// See [snapshot.ClusterSnapshot.ScheduleWorkload] for more details.
 	ScheduleWorkload(ctx context.Context, pods []*v1.Pod, opts snapshot.ScheduleWorkloadOptions) snapshot.WorkloadSchedulingResult
 
 	// PreemptPods removes the given running pods from the snapshot and returns the handle that puts
@@ -175,16 +162,27 @@ func NewSchedulingSimulator(
 		opt(&simOpts)
 	}
 
+	cfg, err := framework.UpdateSimulatorConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("schedlib: updating simulator config: %w", err)
+	}
+
 	var frameworkOpts []upstreamsync.Option
-	if cfg != nil {
-		frameworkOpts = append(frameworkOpts, upstreamsync.WithProfiles(cfg.Profiles...))
-		if cfg.Parallelism > 0 {
-			frameworkOpts = append(frameworkOpts, upstreamsync.WithParallelism(cfg.Parallelism))
-		}
+	frameworkOpts = append(frameworkOpts, upstreamsync.WithProfiles(cfg.Profiles...))
+	if cfg.Parallelism > 0 {
+		frameworkOpts = append(frameworkOpts, upstreamsync.WithParallelism(cfg.Parallelism))
+	}
+
+	r, err := framework.SimulatorRegistry()
+	if err != nil {
+		return nil, fmt.Errorf("schedlib: building simulator registry: %w", err)
 	}
 	if len(simOpts.outOfTreeRegistry) > 0 {
-		frameworkOpts = append(frameworkOpts, upstreamsync.WithFrameworkOutOfTreeRegistry(simOpts.outOfTreeRegistry))
+		if err := r.Merge(simOpts.outOfTreeRegistry); err != nil {
+			return nil, fmt.Errorf("schedlib: merging out-of-tree plugin registry: %w", err)
+		}
 	}
+	frameworkOpts = append(frameworkOpts, upstreamsync.WithFrameworkOutOfTreeRegistry(r))
 	if client.config != nil {
 		frameworkOpts = append(frameworkOpts, upstreamsync.WithKubeConfig(client.config))
 	}
