@@ -15,7 +15,6 @@
 package snapshot
 
 import (
-	"math"
 	"slices"
 	"testing"
 
@@ -24,6 +23,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/kube-scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	ft "sigs.k8s.io/scheduler-library/pkg/framework/testing"
@@ -357,18 +357,19 @@ func TestScheduleOnePod(t *testing.T) {
 			}
 			defer snap.ForgetPlacement()
 
-			algRes, revertFn, err := scheduleOnePod(ctx, cs.profiles, upstreamsync.NewScheduler(snap, 0, 0, math.MaxInt32, nil), tc.pod)
+			alg, err := scheduler.NewSchedulingAlgorithm(snap, noopCacheWrapper{})
+			if err != nil {
+				t.Fatalf("NewSchedulingAlgorithm failed: %v", err)
+			}
+			algRes, revertFn, err := scheduleOnePod(ctx, cs.profiles, alg, tc.pod)
 			if (err != nil) != tc.expectErr {
 				t.Fatalf("unexpected error state: %v, expectErr: %v", err, tc.expectErr)
 			}
 			if tc.expectErr {
 				return
 			}
-			if algRes == nil {
-				t.Fatal("expected algRes to be non-nil")
-			}
-			if algRes.GetStatus().IsSuccess() != tc.expectSuccess {
-				t.Fatalf("expected scheduling success %v, got %v", tc.expectSuccess, algRes.GetStatus().IsSuccess())
+			if algRes.Status.IsSuccess() != tc.expectSuccess {
+				t.Fatalf("expected scheduling success %v, got %v", tc.expectSuccess, algRes.Status.IsSuccess())
 			}
 
 			// scheduleOnePod leaves the pod untouched; reflecting the result on it is up to the caller.
@@ -377,8 +378,8 @@ func TestScheduleOnePod(t *testing.T) {
 			}
 
 			if tc.expectSuccess {
-				if algRes.GetNodeName() != tc.candidate {
-					t.Errorf("expected SuggestedHost to be %q, got %q", tc.candidate, algRes.GetNodeName())
+				if algRes.SelectedNodeName != tc.candidate {
+					t.Errorf("expected SuggestedHost to be %q, got %q", tc.candidate, algRes.SelectedNodeName)
 				}
 				if revertFn == nil {
 					t.Fatal("expected revertFn to be non-nil")

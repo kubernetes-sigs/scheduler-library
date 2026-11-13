@@ -22,6 +22,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 	fwk "k8s.io/kube-scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
@@ -96,14 +97,23 @@ func (s *ClusterState) AssumeAndReserve(ctx context.Context, pod *v1.Pod, cycleS
 		return fmt.Errorf("failed to get framework for pod: %w", err)
 	}
 
-	sched := upstreamsync.NewScheduler(s.snapshotData, 0, 0, 0, s.Cache)
+	alg, err := scheduler.NewSchedulingAlgorithm(s.snapshotData, s.Cache)
+	if err != nil {
+		return fmt.Errorf("failed to create scheduling algorithm: %w", err)
+	}
 
 	podInfo, err := framework.NewPodInfo(pod)
 	if err != nil {
 		return fmt.Errorf("failed to create pod info: %w", err)
 	}
 
-	_, status := sched.AssumeAndReserveInCache(ctx, cycleState, schedFramework, podInfo, nodeName)
+	_, status := alg.AssumeAndReserveInCache(
+		ctx,
+		cycleState,
+		schedFramework,
+		&framework.QueuedPodInfo{PodInfo: podInfo},
+		scheduler.ScheduleResult{SuggestedHost: nodeName},
+	)
 	if !status.IsSuccess() {
 		return status.AsError()
 	}
@@ -150,8 +160,11 @@ func (s *ClusterState) UnreserveAndForget(ctx context.Context, pod *v1.Pod) erro
 	if !ok {
 		return fmt.Errorf("invalid cycle state type for pod: %q", pod.Name)
 	}
-	sched := upstreamsync.NewScheduler(s.snapshotData, 0, 0, 0, s.Cache)
-	err = sched.UnreserveAndForgetFromCache(ctx, cycleState, schedFramework, podInfo, nodeName)
+	alg, err := scheduler.NewSchedulingAlgorithm(s.snapshotData, s.Cache)
+	if err != nil {
+		return fmt.Errorf("failed to create scheduling algorithm: %w", err)
+	}
+	err = alg.UnreserveAndForgetFromCache(ctx, cycleState, schedFramework, &framework.QueuedPodInfo{PodInfo: podInfo}, nodeName)
 	if err != nil {
 		return err
 	}

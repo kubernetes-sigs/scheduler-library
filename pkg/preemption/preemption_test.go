@@ -22,15 +22,20 @@ import (
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	fwk "k8s.io/kube-scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler"
+	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	ft "sigs.k8s.io/scheduler-library/pkg/framework/testing"
 	"sigs.k8s.io/scheduler-library/pkg/preemption"
-	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
 	upstreampreemption "sigs.k8s.io/scheduler-library/pkg/upstreamsync/preemption"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
 	testutils "sigs.k8s.io/scheduler-library/pkg/upstreamsync/testutils"
 )
+
+type noopCacheWrapper struct {
+	cache.Cache
+}
 
 type testVictim struct {
 	name string
@@ -303,10 +308,11 @@ func TestEvaluateWorkloadPreemption(t *testing.T) {
 			}
 
 			workloadPod := testutils.MakePod("w-pod", "gang-pg", tt.workloadCPU)
-			podGroupInfo, err := snapshot.BuildGroupHierarchyForTest(snap, []*v1.Pod{workloadPod})
+			queuedPodGroupInfo, err := snapshot.BuildGroupHierarchyForTest(snap, []*v1.Pod{workloadPod})
 			if err != nil {
 				t.Fatalf("BuildGroupHierarchyForTest failed: %v", err)
 			}
+			podGroupInfo := queuedPodGroupInfo.PodGroupInfo
 			schedFramework, err := profileMap.FrameworkForPodGroup(podGroupInfo)
 			if err != nil {
 				t.Fatalf("FrameworkForPodGroup failed: %v", err)
@@ -315,8 +321,13 @@ func TestEvaluateWorkloadPreemption(t *testing.T) {
 				schedFramework = upstreampreemption.NewPreemptionFramework(schedFramework.Framework, nil)
 			}
 
-			sched := upstreamsync.NewScheduler(snap, 0, 0, 1, nil)
-			baseSchedFn := sched.BuildPodGroupSchedulingFunc(schedFramework, podGroupInfo)
+			podAlg, err := scheduler.NewSchedulingAlgorithm(snap, noopCacheWrapper{})
+			if err != nil {
+				t.Fatalf("NewSchedulingAlgorithm failed: %v", err)
+			}
+			pgAlg := scheduler.NewPodGroupAlgorithm(snap, podAlg)
+			cycleState := framework.NewCycleState()
+			baseSchedFn := pgAlg.BuildPodGroupSchedulingFunc(schedFramework, cycleState, queuedPodGroupInfo)
 
 			var opts preemption.WorkloadPreemptionOptions
 			if tt.filter != nil {
@@ -327,7 +338,7 @@ func TestEvaluateWorkloadPreemption(t *testing.T) {
 			}
 
 			gotAssignments, gotVictims, gotStatus := preemption.EvaluateWorkloadPreemption(
-				ctx, schedFramework, framework.NewCycleState(), podGroupInfo, baseSchedFn, opts,
+				ctx, schedFramework, cycleState, podGroupInfo, baseSchedFn, opts,
 			)
 			if gotStatus.Code() != tt.wantStatusCode {
 				t.Fatalf("EvaluateWorkloadPreemption() Status.Code() = %v, want %v (status: %v)", gotStatus.Code(), tt.wantStatusCode, gotStatus)
@@ -379,15 +390,20 @@ func TestEvaluateWorkloadPreemptionRepeated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SetupSnapshotTestWithPodGroups failed: %v", err)
 	}
-	podGroupInfo, err := snapshot.BuildGroupHierarchyForTest(snap, []*v1.Pod{testutils.MakePod("w-pod", "gang-pg", "4")})
+	queuedPodGroupInfo, err := snapshot.BuildGroupHierarchyForTest(snap, []*v1.Pod{testutils.MakePod("w-pod", "gang-pg", "4")})
 	if err != nil {
 		t.Fatalf("BuildGroupHierarchyForTest failed: %v", err)
 	}
+	podGroupInfo := queuedPodGroupInfo.PodGroupInfo
 	schedFramework, err := profileMap.FrameworkForPodGroup(podGroupInfo)
 	if err != nil {
 		t.Fatalf("FrameworkForPodGroup failed: %v", err)
 	}
-	baseSchedFn := upstreamsync.NewScheduler(snap, 0, 0, 1, nil).BuildPodGroupSchedulingFunc(schedFramework, podGroupInfo)
+	podAlg, err := scheduler.NewSchedulingAlgorithm(snap, noopCacheWrapper{})
+	if err != nil {
+		t.Fatalf("NewSchedulingAlgorithm failed: %v", err)
+	}
+	pgAlg := scheduler.NewPodGroupAlgorithm(snap, podAlg)
 
 	calls := []struct {
 		opts        preemption.WorkloadPreemptionOptions
@@ -409,8 +425,10 @@ func TestEvaluateWorkloadPreemptionRepeated(t *testing.T) {
 	}
 
 	for i, call := range calls {
+		cycleState := framework.NewCycleState()
+		baseSchedFn := pgAlg.BuildPodGroupSchedulingFunc(schedFramework, cycleState, queuedPodGroupInfo)
 		_, gotVictims, gotStatus := preemption.EvaluateWorkloadPreemption(
-			ctx, schedFramework, framework.NewCycleState(), podGroupInfo, baseSchedFn, call.opts,
+			ctx, schedFramework, cycleState, podGroupInfo, baseSchedFn, call.opts,
 		)
 		if !gotStatus.IsSuccess() {
 			t.Fatalf("call %d: EvaluateWorkloadPreemption() status = %v, want success", i+1, gotStatus)

@@ -488,6 +488,7 @@ func TestClusterState_SyncSnapshot_RevertsMutations(t *testing.T) {
 			"default-scheduler": fwk,
 		},
 	}
+	slframework.ApplySimulationNeutralizers(profiles)
 
 	state := New(cache.New(ctx, nil, false, false), profiles, sharedSnap)
 
@@ -604,11 +605,13 @@ func newTestProfileMap(ctx context.Context, sharedSnap *cache.Snapshot, registry
 	if err != nil {
 		return nil, err
 	}
-	return &upstreamsync.ProfileMap{
+	profiles := &upstreamsync.ProfileMap{
 		Map: profile.Map{
 			prof.SchedulerName: fwk,
 		},
-	}, nil
+	}
+	slframework.ApplySimulationNeutralizers(profiles)
+	return profiles, nil
 }
 
 func TestClusterState_AssumeAndReserve(t *testing.T) {

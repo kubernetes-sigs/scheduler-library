@@ -16,6 +16,7 @@ package snapshot
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	v1 "k8s.io/api/core/v1"
@@ -34,15 +35,15 @@ import (
 func BuildGroupHierarchyForTest(
 	snapshot *cache.Snapshot,
 	pods []*v1.Pod,
-) (*framework.PodGroupInfo, error) {
+) (*framework.QueuedPodGroupInfo, error) {
 	return buildPodGroupHierarchy(snapshot, pods)
 }
 
-// buildPodGroupHierarchy validates pods and constructs the PodGroupInfo hierarchy tree.
+// buildPodGroupHierarchy validates pods and constructs the QueuedPodGroupInfo hierarchy tree.
 func buildPodGroupHierarchy(
 	snapshot *cache.Snapshot,
 	pods []*v1.Pod,
-) (*framework.PodGroupInfo, error) {
+) (*framework.QueuedPodGroupInfo, error) {
 	if len(pods) == 0 {
 		return nil, fmt.Errorf("pods list is empty")
 	}
@@ -57,7 +58,26 @@ func buildPodGroupHierarchy(
 	if err != nil {
 		return nil, err
 	}
-	return buildHierarchy(snapshot, namespace, podGroupInfosMap)
+	root, err := buildHierarchy(snapshot, namespace, podGroupInfosMap)
+	if err != nil {
+		return nil, err
+	}
+	queuedPGI := &framework.QueuedPodGroupInfo{
+		PodGroupInfo: root,
+	}
+	for i, pod := range pods {
+		podInfo, err := framework.NewPodInfo(pod)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create pod info for pod %q: %w", pod.Name, err)
+		}
+		queuedPGI.AddPod(&framework.QueuedPodInfo{
+			PodInfo: podInfo,
+			QueueingParams: framework.QueueingParams{
+				Timestamp: time.Unix(0, int64(i)),
+			},
+		})
+	}
+	return queuedPGI, nil
 }
 
 // validatePods checks whether each pod belongs to a pod group and all pods belong to the same namespace.
@@ -117,7 +137,7 @@ func buildPodGroupInfosMap(
 ) (map[fwk.EntityKey]*framework.PodGroupInfo, error) {
 	podGroupInfosMap := make(map[fwk.EntityKey]*framework.PodGroupInfo, len(podsByPodGroup))
 
-	for pgName, pgPods := range podsByPodGroup {
+	for pgName := range podsByPodGroup {
 		pg, err := getPodGroup(snapshot, pgName, namespace)
 		if err != nil {
 			return nil, err
@@ -125,7 +145,6 @@ func buildPodGroupInfosMap(
 		key := fwk.PodGroupKey(namespace, pgName)
 
 		pgi := framework.NewPodGroupInfo(fwk.NewGenericPodGroup(pg))
-		pgi.UnscheduledPods = pgPods
 		podGroupInfosMap[key] = pgi
 	}
 	return podGroupInfosMap, nil
