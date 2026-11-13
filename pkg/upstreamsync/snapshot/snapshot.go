@@ -35,7 +35,6 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"sigs.k8s.io/scheduler-library/pkg/preemption"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
-	upstreampreemption "sigs.k8s.io/scheduler-library/pkg/upstreamsync/preemption"
 )
 
 // noopCacheWrapper satisfies cache.Cache for SchedulingAlgorithm instances that only
@@ -559,7 +558,7 @@ func (s *ClusterSnapshot) scheduleWorkloadWithoutPreemption(
 	ctx context.Context,
 	podAlg *scheduler.SchedulingAlgorithm,
 	pgAlg *scheduler.PodGroupSchedulingAlgorithm,
-	schedFramework *upstreampreemption.PreemptionFramework,
+	schedFramework framework.Framework,
 	podGroupCycleState *framework.CycleState,
 	queuedPodGroupInfo *framework.QueuedPodGroupInfo,
 	opts ScheduleWorkloadOptions,
@@ -622,7 +621,7 @@ func (s *ClusterSnapshot) scheduleWorkloadWithoutPreemption(
 func (s *ClusterSnapshot) workloadPreemption(
 	ctx context.Context,
 	pgAlg *scheduler.PodGroupSchedulingAlgorithm,
-	schedFramework *upstreampreemption.PreemptionFramework,
+	schedFramework framework.Framework,
 	podGroupCycleState *framework.CycleState,
 	queuedPodGroupInfo *framework.QueuedPodGroupInfo,
 	initialResult WorkloadSchedulingResult,

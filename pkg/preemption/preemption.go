@@ -18,6 +18,7 @@
 package preemption
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 
@@ -25,7 +26,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
-	upstreampreemption "sigs.k8s.io/scheduler-library/pkg/upstreamsync/preemption"
 )
 
 // EvaluateWorkloadPreemption finds the minimal prefix of victims from opts.PotentialVictims
@@ -41,17 +41,17 @@ import (
 // It returns the last successful PodGroupAssignments along with the victims that were not reprieved.
 func EvaluateWorkloadPreemption(
 	ctx context.Context,
-	schedFramework *upstreampreemption.PreemptionFramework,
+	schedFramework framework.Framework,
 	podGroupCycleState *framework.CycleState,
 	podGroupInfo fwk.PodGroupInfo,
 	baseSchedulingFunc fwk.PodGroupSchedulingFunc,
 	opts WorkloadPreemptionOptions,
 ) (*fwk.PodGroupAssignments, []PreemptionVictim, *fwk.Status) {
-	pm, ok := schedFramework.SimPreemptionManager().(*prefixPreemptionManager)
+	pm, ok := schedFramework.PreemptionManager().(*prefixPreemptionManager)
 	if !ok {
 		return nil, nil, fwk.AsStatus(fmt.Errorf(
 			"unexpected PreemptionManager type %T, want one from NewPrefixPreemptionManager",
-			schedFramework.SimPreemptionManager()))
+			schedFramework.PreemptionManager()))
 	}
 	if opts.PotentialVictims == nil {
 		return nil, nil, fwk.NewStatus(fwk.Unschedulable)
@@ -83,7 +83,7 @@ func EvaluateWorkloadPreemption(
 	found := false
 
 	for v := range opts.PotentialVictims {
-		sv, err := newSimPreemptionVictim(v)
+		sv, err := newSimPreemptionVictim(v, len(pm.victims))
 		if err != nil {
 			return nil, nil, fwk.AsStatus(err)
 		}
@@ -158,10 +158,11 @@ func EvaluateWorkloadPreemption(
 type simPreemptionVictim struct {
 	victim    PreemptionVictim
 	pods      []fwk.PodInfo
+	index     int
 	reprieved bool
 }
 
-var _ upstreampreemption.PreemptionVictim = (*simPreemptionVictim)(nil)
+var _ fwk.PreemptionVictim = (*simPreemptionVictim)(nil)
 
 func validateVictim(v PreemptionVictim) error {
 	if v == nil {
@@ -181,7 +182,7 @@ func validateVictim(v PreemptionVictim) error {
 	return nil
 }
 
-func newSimPreemptionVictim(v PreemptionVictim) (*simPreemptionVictim, error) {
+func newSimPreemptionVictim(v PreemptionVictim, index int) (*simPreemptionVictim, error) {
 	if err := validateVictim(v); err != nil {
 		return nil, err
 	}
@@ -197,6 +198,7 @@ func newSimPreemptionVictim(v PreemptionVictim) (*simPreemptionVictim, error) {
 	return &simPreemptionVictim{
 		victim: v,
 		pods:   podInfos,
+		index:  index,
 	}, nil
 }
 
@@ -210,6 +212,12 @@ func (v *simPreemptionVictim) NumPDBViolations() int {
 	return 0
 }
 
+// Type returns a value which is only used for metrics by the upstream.
+// Since metrics are not registered in scheduler-library, the returned value is not relevant.
+func (v *simPreemptionVictim) Type() fwk.EntityKeyType {
+	return fwk.PodGroupKeyType
+}
+
 // prefixPreemptionManager provides candidate victims and creates a ReprieveFilter
 // for prefix-search and reprieval preemption simulations.
 type prefixPreemptionManager struct {
@@ -219,12 +227,12 @@ type prefixPreemptionManager struct {
 	allowReprieve    bool
 }
 
-var _ upstreampreemption.PreemptionManager = (*prefixPreemptionManager)(nil)
+var _ fwk.PreemptionManager = (*prefixPreemptionManager)(nil)
 
 // NewPrefixPreemptionManager is the PreemptionManagerFactory that EvaluateWorkloadPreemption requires
-// the PreemptionFramework to be built with. Between EvaluateWorkloadPreemption calls the
+// the Framework to be built with. Between EvaluateWorkloadPreemption calls the
 // PreemptionManager it creates holds no victims and allows no reprieval.
-func NewPrefixPreemptionManager(_ upstreampreemption.Handle) upstreampreemption.PreemptionManager {
+func NewPrefixPreemptionManager(_ fwk.Handle) fwk.PreemptionManager {
 	return &prefixPreemptionManager{}
 }
 
@@ -257,18 +265,35 @@ func (pm *prefixPreemptionManager) moveCursor(target int) {
 func (pm *prefixPreemptionManager) GenerateVictims(
 	_ context.Context,
 	_ fwk.PodGroupInfo,
-) ([]upstreampreemption.PreemptionVictim, *fwk.Status) {
-	res := make([]upstreampreemption.PreemptionVictim, pm.cursor)
+) ([]fwk.PreemptionVictim, *fwk.Status) {
+	res := make([]fwk.PreemptionVictim, pm.cursor)
 	for i := range pm.cursor {
 		res[i] = pm.victims[i]
 	}
 	return res, nil
 }
 
+func (pm *prefixPreemptionManager) CompareVictimSets(
+	_ context.Context,
+	set1, set2 []fwk.PreemptionVictim,
+) int {
+	// Both sets are ordered from least preferred to most preferred for preemption
+	// (the reverse of GenerateVictims). Compare lexicographically by victim index,
+	// where a smaller index in pm.victims is more preferred to preempt.
+	for i := range min(len(set1), len(set2)) {
+		v1 := set1[i].(*simPreemptionVictim)
+		v2 := set2[i].(*simPreemptionVictim)
+		if c := cmp.Compare(v1.index, v2.index); c != 0 {
+			return c
+		}
+	}
+	return cmp.Compare(len(set1), len(set2))
+}
+
 func (pm *prefixPreemptionManager) NewReprieveFilter(
 	_ context.Context,
-	_ []upstreampreemption.PreemptionVictim,
-) upstreampreemption.ReprieveFilter {
+	_ []fwk.PreemptionVictim,
+) fwk.ReprieveFilter {
 	return &workloadReprieveFilter{
 		allowReprieve: pm.allowReprieve,
 		filter:        pm.preemptionFilter,
@@ -277,7 +302,7 @@ func (pm *prefixPreemptionManager) NewReprieveFilter(
 
 // Executor returns a PreemptionExecutor that actuates nothing, because simulations only report
 // the victims to the caller.
-func (pm *prefixPreemptionManager) Executor() upstreampreemption.PreemptionExecutor {
+func (pm *prefixPreemptionManager) Executor() fwk.PreemptionExecutor {
 	return &noopExecutor{}
 }
 
@@ -298,11 +323,11 @@ type workloadReprieveFilter struct {
 	filter        PreemptionFilter
 }
 
-var _ upstreampreemption.ReprieveFilter = (*workloadReprieveFilter)(nil)
+var _ fwk.ReprieveFilter = (*workloadReprieveFilter)(nil)
 
 func (rf *workloadReprieveFilter) ShouldAttemptReprieval(
 	_ context.Context,
-	victim upstreampreemption.PreemptionVictim,
+	victim fwk.PreemptionVictim,
 ) (bool, error) {
 	if !rf.allowReprieve {
 		return false, nil
@@ -322,7 +347,7 @@ func (rf *workloadReprieveFilter) ShouldAttemptReprieval(
 
 func (rf *workloadReprieveFilter) OnVictimReprieved(
 	_ context.Context,
-	victim upstreampreemption.PreemptionVictim,
+	victim fwk.PreemptionVictim,
 ) error {
 	sv, ok := victim.(*simPreemptionVictim)
 	if !ok {
@@ -339,7 +364,7 @@ func (rf *workloadReprieveFilter) OnVictimReprieved(
 // prefixPreemptionManager.Executor.
 type noopExecutor struct{}
 
-var _ upstreampreemption.PreemptionExecutor = &noopExecutor{}
+var _ fwk.PreemptionExecutor = &noopExecutor{}
 
 // IsPodRunningPreemption is a no-op implementation of IsPodRunningPreemption from PreemptionExecutor interface.
 func (s *noopExecutor) IsPodRunningPreemption(_ types.UID) bool {
@@ -357,11 +382,11 @@ func (s *noopExecutor) IsPodGroupWaitingForVictims(_ fwk.PodGroupInfo) bool {
 }
 
 // ActuatePodPreemption is a no-op implementation of ActuatePodPreemption from PreemptionExecutor interface.
-func (s *noopExecutor) ActuatePodPreemption(_ context.Context, _ upstreampreemption.PreemptionCandidate, _ *v1.Pod, _ string) *fwk.Status {
+func (s *noopExecutor) ActuatePodPreemption(_ context.Context, _ fwk.PreemptionCandidate, _ *v1.Pod, _ string) *fwk.Status {
 	return nil
 }
 
 // ActuatePodGroupPreemption is a no-op implementation of ActuatePodGroupPreemption from PreemptionExecutor interface.
-func (s *noopExecutor) ActuatePodGroupPreemption(_ context.Context, _ upstreampreemption.PreemptionCandidate, _ fwk.PodGroupInfo, _ string) *fwk.Status {
+func (s *noopExecutor) ActuatePodGroupPreemption(_ context.Context, _ fwk.PreemptionCandidate, _ fwk.PodGroupInfo, _ string) *fwk.Status {
 	return nil
 }

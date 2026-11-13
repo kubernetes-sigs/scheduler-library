@@ -15,6 +15,7 @@
 package preemption_test
 
 import (
+	"fmt"
 	"slices"
 	"testing"
 
@@ -28,13 +29,20 @@ import (
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	ft "sigs.k8s.io/scheduler-library/pkg/framework/testing"
 	"sigs.k8s.io/scheduler-library/pkg/preemption"
-	upstreampreemption "sigs.k8s.io/scheduler-library/pkg/upstreamsync/preemption"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
 	testutils "sigs.k8s.io/scheduler-library/pkg/upstreamsync/testutils"
 )
 
+type nilPreemptionManagerFramework struct {
+	framework.Framework
+}
+
 type noopCacheWrapper struct {
 	cache.Cache
+}
+
+func (nilPreemptionManagerFramework) PreemptionManager() fwk.PreemptionManager {
+	return nil
 }
 
 type testVictim struct {
@@ -105,13 +113,12 @@ func (f *fakeFilter) MayFit() bool {
 func TestEvaluateWorkloadPreemption(t *testing.T) {
 	ctx := t.Context()
 
-	gangPG := testutils.MakeGangPodGroup("gang-pg", "", 1)
-
 	// Victims for 6-CPU node1 scenarios:
 	v2CPUa := makeVictimOnNode("v2CPUa", "node1", "2")
 	v2CPUb := makeVictimOnNode("v2CPUb", "node1", "2")
 	v2CPUc := makeVictimOnNode("v2CPUc", "node1", "2")
 	v4CPU := makeVictimOnNode("v4CPU", "node1", "4")
+	vNode3 := makeVictimOnNode("vNode3", "node3", "4")
 
 	// Victims for binary-search scenario (workload requests 6 CPU):
 	// b0..b5 (1 CPU each) and b8..b9 (2 CPU each) occupy 10 CPU on node1 (10 CPU capacity).
@@ -132,6 +139,7 @@ func TestEvaluateWorkloadPreemption(t *testing.T) {
 		name                 string
 		nodes                []*v1.Node
 		workloadCPU          string
+		workloadCPUs         []string
 		potentialVictims     []preemption.PreemptionVictim
 		filter               *fakeFilter
 		nilPreemptionManager bool
@@ -227,6 +235,25 @@ func TestEvaluateWorkloadPreemption(t *testing.T) {
 			wantVictims: []preemption.PreemptionVictim{b6, b7, v4CPU},
 		},
 		{
+			name: "CompareVictimSets ranks node with more-preferred preemption victim ahead of earlier-listed node",
+			nodes: []*v1.Node{
+				makeNode("node1", "2"),
+				makeNode("node2", "2"),
+				makeNode("node3", "4"),
+			},
+			workloadCPUs: []string{"4", "2"},
+			potentialVictims: []preemption.PreemptionVictim{
+				b7,     // index 0: 2 CPU on node2
+				v2CPUa, // index 1: 2 CPU on node1
+				vNode3, // index 2: 4 CPU on node3
+			},
+			wantStatusCode: fwk.Success,
+			// At prefix size 3, all 3 nodes are free. The 4-CPU pod schedules on node3,
+			// and CompareVictimSets ranks node2 (victim index 0) ahead of node1 (victim index 1)
+			// for the 2-CPU pod, so v2CPUa on node1 is reprieved.
+			wantVictims: []preemption.PreemptionVictim{b7, vNode3},
+		},
+		{
 			name:             "PreemptionFilter MayFit never satisfied returns Unschedulable",
 			nodes:            []*v1.Node{makeNode("node1", "6")},
 			workloadCPU:      "4",
@@ -295,20 +322,29 @@ func TestEvaluateWorkloadPreemption(t *testing.T) {
 				}
 			}
 
+			cpus := tt.workloadCPUs
+			if len(cpus) == 0 {
+				cpus = []string{tt.workloadCPU}
+			}
+			workloadPods := make([]*v1.Pod, len(cpus))
+			for i, cpu := range cpus {
+				workloadPods[i] = testutils.MakePod(fmt.Sprintf("w-pod-%d", i), "gang-pg", cpu)
+			}
+			pg := testutils.MakeGangPodGroup("gang-pg", "", int32(len(workloadPods)))
+
 			profileMap, snap, err := ft.SetupSnapshotTestWithPodGroups(
 				ctx,
 				t,
 				existingPods,
 				tt.nodes,
-				[]*schedulingv1beta1.PodGroup{gangPG},
+				[]*schedulingv1beta1.PodGroup{pg},
 				nil,
 			)
 			if err != nil {
 				t.Fatalf("SetupSnapshotTestWithPodGroups failed: %v", err)
 			}
 
-			workloadPod := testutils.MakePod("w-pod", "gang-pg", tt.workloadCPU)
-			queuedPodGroupInfo, err := snapshot.BuildGroupHierarchyForTest(snap, []*v1.Pod{workloadPod})
+			queuedPodGroupInfo, err := snapshot.BuildGroupHierarchyForTest(snap, workloadPods)
 			if err != nil {
 				t.Fatalf("BuildGroupHierarchyForTest failed: %v", err)
 			}
@@ -318,7 +354,7 @@ func TestEvaluateWorkloadPreemption(t *testing.T) {
 				t.Fatalf("FrameworkForPodGroup failed: %v", err)
 			}
 			if tt.nilPreemptionManager {
-				schedFramework = upstreampreemption.NewPreemptionFramework(schedFramework.Framework, nil)
+				schedFramework = nilPreemptionManagerFramework{Framework: schedFramework}
 			}
 
 			podAlg, err := scheduler.NewSchedulingAlgorithm(snap, noopCacheWrapper{})
@@ -346,7 +382,7 @@ func TestEvaluateWorkloadPreemption(t *testing.T) {
 			if !slices.Equal(gotVictims, tt.wantVictims) {
 				t.Errorf("EvaluateWorkloadPreemption() victims = %v, want %v", gotVictims, tt.wantVictims)
 			}
-			if pm := schedFramework.SimPreemptionManager(); pm != nil {
+			if pm := schedFramework.PreemptionManager(); pm != nil {
 				if victims, _ := pm.GenerateVictims(ctx, podGroupInfo); len(victims) != 0 {
 					t.Errorf("GenerateVictims() after EvaluateWorkloadPreemption returned %d victims, want 0", len(victims))
 				}
@@ -363,8 +399,8 @@ func TestEvaluateWorkloadPreemption(t *testing.T) {
 			if tt.filter != nil && !tt.filter.activeVictimSet.Equal(sets.New(tt.wantVictims...)) {
 				t.Errorf("filter.activeVictimSet = %v, want %v", tt.filter.activeVictimSet.UnsortedList(), tt.wantVictims)
 			}
-			if gotAssignments == nil || len(gotAssignments.ProposedAssignments) != 1 {
-				t.Errorf("EvaluateWorkloadPreemption() assignments = %v, want 1 proposed assignment", gotAssignments)
+			if gotAssignments == nil || len(gotAssignments.ProposedAssignments) != len(workloadPods) {
+				t.Errorf("EvaluateWorkloadPreemption() assignments = %v, want %d proposed assignments", gotAssignments, len(workloadPods))
 			}
 		})
 	}
