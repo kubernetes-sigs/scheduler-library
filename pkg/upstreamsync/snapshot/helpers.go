@@ -28,7 +28,7 @@ import (
 )
 
 // addPodToNode adds a new pod to the specific node and returns the corresponding revert function
-func addPodToNode(ctx context.Context, schedulerSnapshot *upstreamsync.MutatingSnapshot, pod *v1.Pod, nodeName string) (func(), error) {
+func addPodToNode(ctx context.Context, schedulerSnapshot *upstreamsync.MutatingSnapshot, pod *v1.Pod, nodeName string) (func() error, error) {
 	logger := klog.FromContext(ctx)
 	clonedPod := pod.DeepCopy()
 	clonedPod.Spec.NodeName = nodeName
@@ -41,17 +41,16 @@ func addPodToNode(ctx context.Context, schedulerSnapshot *upstreamsync.MutatingS
 		return nil, fmt.Errorf("failed to add pod to snapshot: %w", err)
 	}
 
-	revertFn := func() {
-		if _, err := removePodFromNode(ctx, schedulerSnapshot, podInfo.Pod); err != nil {
-			logger.Error(err, "revert addPodToNode failed")
-		}
+	revertFn := func() error {
+		_, err := removePodFromNode(ctx, schedulerSnapshot, podInfo.Pod)
+		return err
 	}
 
 	return revertFn, nil
 }
 
 // removePodFromNode removes a pod from a specific node and returns the corresponding revert function.
-func removePodFromNode(ctx context.Context, schedulerSnapshot *upstreamsync.MutatingSnapshot, pod *v1.Pod) (func(), error) {
+func removePodFromNode(ctx context.Context, schedulerSnapshot *upstreamsync.MutatingSnapshot, pod *v1.Pod) (func() error, error) {
 	logger := klog.FromContext(ctx)
 	podInfo, err := framework.NewPodInfo(pod.DeepCopy())
 	if err != nil {
@@ -62,10 +61,11 @@ func removePodFromNode(ctx context.Context, schedulerSnapshot *upstreamsync.Muta
 		return nil, fmt.Errorf("failed to remove pod from snapshot: %w", err)
 	}
 
-	revertFn := func() {
-		if _, err := addPodToNode(ctx, schedulerSnapshot, pod, pod.Spec.NodeName); err != nil {
-			logger.Error(err, "revert removePodFromNode failed")
-		}
+	// Restore from the copy taken at removal time, not the caller's pod, which the
+	// caller may mutate before the revert runs.
+	revertFn := func() error {
+		_, err := addPodToNode(ctx, schedulerSnapshot, podInfo.Pod, podInfo.Pod.Spec.NodeName)
+		return err
 	}
 
 	return revertFn, nil
