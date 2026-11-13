@@ -172,6 +172,7 @@ func SetupSnapshotTestWithPodGroups(
 					QueueSort:          schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
 					PreFilter:          schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "NodeResourcesFit"}}},
 					Filter:             schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "NodeResourcesFit"}}},
+					Reserve:            schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultPreemption"}}},
 					PlacementGenerate:  schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "TopologyPlacementGenerator"}}},
 					PlacementScore:     schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PodGroupPodsCount", Weight: 1}}},
 					PodGroupPostFilter: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultPreemption"}}},
