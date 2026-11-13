@@ -18,6 +18,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	v1 "k8s.io/api/core/v1"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -66,6 +67,7 @@ type fakeFilter struct {
 	fit             bool
 	minVictims      int
 	activeVictimSet sets.Set[preemption.PreemptionVictim]
+	mayFitCalls     []sets.Set[preemption.PreemptionVictim]
 }
 
 func newFakeFilter(fit bool) *fakeFilter {
@@ -91,6 +93,7 @@ func (f *fakeFilter) UnpreemptVictim(v preemption.PreemptionVictim) {
 }
 
 func (f *fakeFilter) MayFit() bool {
+	f.mayFitCalls = append(f.mayFitCalls, f.activeVictimSet.Clone())
 	if f.minVictims > 0 {
 		return f.activeVictimSet.Len() >= f.minVictims
 	}
@@ -123,6 +126,11 @@ func TestEvaluateWorkloadPreemption(t *testing.T) {
 	b9 := makeVictimOnNode("b9", "node1", "2")
 	tenSearchVictims := []preemption.PreemptionVictim{b0, b1, b2, b3, b4, b5, b6, b7, b8, b9}
 
+	// Zero-pod victims (nil and empty pod slices):
+	vNilPods := &testVictim{name: "vNilPods", pods: nil}
+	vEmptyPodsA := &testVictim{name: "vEmptyPodsA", pods: []*v1.Pod{}}
+	vEmptyPodsB := &testVictim{name: "vEmptyPodsB", pods: []*v1.Pod{}}
+
 	tests := []struct {
 		name                 string
 		nodes                []*v1.Node
@@ -132,6 +140,7 @@ func TestEvaluateWorkloadPreemption(t *testing.T) {
 		nilPreemptionManager bool
 		wantStatusCode       fwk.Code
 		wantVictims          []preemption.PreemptionVictim
+		wantMayFitCalls      []sets.Set[preemption.PreemptionVictim]
 	}{
 		{
 			name:           "nil PotentialVictims returns Unschedulable",
@@ -140,16 +149,12 @@ func TestEvaluateWorkloadPreemption(t *testing.T) {
 			wantStatusCode: fwk.Unschedulable,
 		},
 		{
-			name:        "nil and empty-pod victims return Error status",
-			nodes:       []*v1.Node{makeNode("node1", "6")},
-			workloadCPU: "4",
-			potentialVictims: []preemption.PreemptionVictim{
-				nil,
-				&testVictim{name: "nil-pods", pods: nil},
-				&testVictim{name: "empty-pods", pods: []*v1.Pod{}},
-			},
-			filter:         newFakeFilter(true),
-			wantStatusCode: fwk.Error,
+			name:             "nil victim returns Error status",
+			nodes:            []*v1.Node{makeNode("node1", "6")},
+			workloadCPU:      "4",
+			potentialVictims: []preemption.PreemptionVictim{nil},
+			filter:           newFakeFilter(true),
+			wantStatusCode:   fwk.Error,
 		},
 		{
 			name:        "victim with nil pod returns Error status",
@@ -270,6 +275,87 @@ func TestEvaluateWorkloadPreemption(t *testing.T) {
 			nilPreemptionManager: true,
 			wantStatusCode:       fwk.Error,
 		},
+		{
+			name:             "zero-pod victims satisfy PreemptionFilter when node has capacity",
+			nodes:            []*v1.Node{makeNode("node1", "6")},
+			workloadCPU:      "4",
+			potentialVictims: []preemption.PreemptionVictim{vNilPods, vEmptyPodsA, vEmptyPodsB},
+			filter:           newMinVictimsFilter(2),
+			wantStatusCode:   fwk.Success,
+			wantVictims:      []preemption.PreemptionVictim{vNilPods, vEmptyPodsA},
+			wantMayFitCalls: []sets.Set[preemption.PreemptionVictim]{
+				sets.New[preemption.PreemptionVictim](vNilPods),
+				sets.New[preemption.PreemptionVictim](vNilPods, vEmptyPodsA),
+				sets.New[preemption.PreemptionVictim](vNilPods, vEmptyPodsA),
+				sets.New[preemption.PreemptionVictim](vNilPods),
+				sets.New[preemption.PreemptionVictim](vEmptyPodsA),
+			},
+		},
+		{
+			name:             "zero-pod victims combined with pod-bearing victim reprieves unneeded zero-pod victim and keeps needed one",
+			nodes:            []*v1.Node{makeNode("node1", "6")},
+			workloadCPU:      "4",
+			potentialVictims: []preemption.PreemptionVictim{vNilPods, vEmptyPodsA, v4CPU},
+			filter:           newMinVictimsFilter(2),
+			wantStatusCode:   fwk.Success,
+			wantVictims:      []preemption.PreemptionVictim{vNilPods, v4CPU},
+			wantMayFitCalls: []sets.Set[preemption.PreemptionVictim]{
+				sets.New[preemption.PreemptionVictim](vNilPods),
+				sets.New[preemption.PreemptionVictim](vNilPods, vEmptyPodsA),
+				sets.New[preemption.PreemptionVictim](vNilPods, vEmptyPodsA, v4CPU),
+				sets.New[preemption.PreemptionVictim](vNilPods, vEmptyPodsA, v4CPU),
+				sets.New[preemption.PreemptionVictim](vNilPods, vEmptyPodsA),
+				sets.New[preemption.PreemptionVictim](vNilPods, v4CPU),
+				sets.New[preemption.PreemptionVictim](v4CPU),
+			},
+		},
+		{
+			name:             "binary search narrows prefix across zero-pod and pod-bearing victims",
+			nodes:            []*v1.Node{makeNode("node1", "6")},
+			workloadCPU:      "4",
+			potentialVictims: []preemption.PreemptionVictim{vNilPods, vEmptyPodsA, vEmptyPodsB, v2CPUa},
+			filter:           newMinVictimsFilter(3),
+			wantStatusCode:   fwk.Success,
+			wantVictims:      []preemption.PreemptionVictim{vNilPods, vEmptyPodsA, vEmptyPodsB},
+			wantMayFitCalls: []sets.Set[preemption.PreemptionVictim]{
+				sets.New[preemption.PreemptionVictim](vNilPods),
+				sets.New[preemption.PreemptionVictim](vNilPods, vEmptyPodsA),
+				sets.New[preemption.PreemptionVictim](vNilPods, vEmptyPodsA, vEmptyPodsB, v2CPUa),
+				sets.New[preemption.PreemptionVictim](vNilPods, vEmptyPodsA, vEmptyPodsB),
+				sets.New[preemption.PreemptionVictim](vNilPods, vEmptyPodsA, vEmptyPodsB),
+				sets.New[preemption.PreemptionVictim](vNilPods, vEmptyPodsA),
+				sets.New[preemption.PreemptionVictim](vNilPods, vEmptyPodsB),
+				sets.New[preemption.PreemptionVictim](vEmptyPodsA, vEmptyPodsB),
+			},
+		},
+		{
+			name:             "zero-pod victims without PreemptionFilter are reprieved when node has capacity",
+			nodes:            []*v1.Node{makeNode("node1", "6")},
+			workloadCPU:      "4",
+			potentialVictims: []preemption.PreemptionVictim{vNilPods, vEmptyPodsA},
+			wantStatusCode:   fwk.Success,
+			wantVictims:      nil,
+		},
+		{
+			name:             "zero-pod victims before pod-bearing victim without PreemptionFilter are reprieved",
+			nodes:            []*v1.Node{makeNode("node1", "6")},
+			workloadCPU:      "4",
+			potentialVictims: []preemption.PreemptionVictim{vNilPods, vEmptyPodsA, v4CPU},
+			wantStatusCode:   fwk.Success,
+			wantVictims:      []preemption.PreemptionVictim{v4CPU},
+		},
+		{
+			name:             "zero-pod victims insufficient when node lacks capacity returns Unschedulable",
+			nodes:            []*v1.Node{makeNode("node1", "2")},
+			workloadCPU:      "4",
+			potentialVictims: []preemption.PreemptionVictim{vNilPods, vEmptyPodsA},
+			filter:           newFakeFilter(true),
+			wantStatusCode:   fwk.Unschedulable,
+			wantMayFitCalls: []sets.Set[preemption.PreemptionVictim]{
+				sets.New[preemption.PreemptionVictim](vNilPods),
+				sets.New[preemption.PreemptionVictim](vNilPods, vEmptyPodsA),
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -341,6 +427,20 @@ func TestEvaluateWorkloadPreemption(t *testing.T) {
 				}
 				if reprieve, err := pm.NewReprieveFilter(ctx, nil).ShouldAttemptReprieval(ctx, nil); err != nil || reprieve {
 					t.Errorf("ShouldAttemptReprieval() after EvaluateWorkloadPreemption = %v, %v, want false, nil", reprieve, err)
+				}
+			}
+			if tt.filter != nil {
+				if tt.wantStatusCode != fwk.Error && len(tt.potentialVictims) > 0 {
+					if len(tt.filter.mayFitCalls) == 0 {
+						t.Errorf("expected PreemptionFilter.MayFit to be called, got 0 calls")
+					} else if tt.filter.mayFitCalls[0].Len() == 0 {
+						t.Errorf("expected PreemptionFilter.PreemptVictim to be called before MayFit, got empty active set")
+					}
+				}
+				if tt.wantMayFitCalls != nil {
+					if diff := cmp.Diff(tt.wantMayFitCalls, tt.filter.mayFitCalls); diff != "" {
+						t.Errorf("filter.mayFitCalls mismatch (-want +got):\n%s", diff)
+					}
 				}
 			}
 			if !gotStatus.IsSuccess() {

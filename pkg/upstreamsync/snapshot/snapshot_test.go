@@ -2017,12 +2017,27 @@ func TestSnapshot_RemovePodGroups(t *testing.T) {
 }
 
 type testVictim struct {
-	name string
-	pods []*v1.Pod
+	name     string
+	pods     []*v1.Pod
+	quotaCPU int64
 }
 
 func (v *testVictim) Pods() []*v1.Pod {
 	return v.pods
+}
+
+func victimCPU(v PreemptionVictim) int64 {
+	var total int64
+	if tv, ok := v.(*testVictim); ok {
+		total += tv.quotaCPU
+	}
+	for _, p := range v.Pods() {
+		for _, c := range p.Spec.Containers {
+			cpu := c.Resources.Requests[v1.ResourceCPU]
+			total += cpu.Value()
+		}
+	}
+	return total
 }
 
 type cpuPreemptionFilter struct {
@@ -2045,23 +2060,13 @@ func newCPUPreemptionFilter(availableCPU, requiredCPU int64) *cpuPreemptionFilte
 func (f *cpuPreemptionFilter) PreemptVictim(v PreemptionVictim) {
 	f.preemptCalls++
 	f.activeVictims[v] = true
-	for _, p := range v.Pods() {
-		for _, c := range p.Spec.Containers {
-			cpu := c.Resources.Requests[v1.ResourceCPU]
-			f.availableCPU += cpu.Value()
-		}
-	}
+	f.availableCPU += victimCPU(v)
 }
 
 func (f *cpuPreemptionFilter) UnpreemptVictim(v PreemptionVictim) {
 	f.unpreemptCalls++
 	delete(f.activeVictims, v)
-	for _, p := range v.Pods() {
-		for _, c := range p.Spec.Containers {
-			cpu := c.Resources.Requests[v1.ResourceCPU]
-			f.availableCPU -= cpu.Value()
-		}
-	}
+	f.availableCPU -= victimCPU(v)
 }
 
 func (f *cpuPreemptionFilter) MayFit() bool {
@@ -2674,6 +2679,208 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 				"node2": sets.New("v5-pod", "v6-pod", "v7-pod"),
 			},
 		},
+		{
+			name:         "Zero-pod PotentialVictims satisfy PreemptionFilter and unneeded zero-pod victims are reprieved",
+			nodes:        []*v1.Node{node6CPU},
+			existingPods: nil,
+			workloadPods: []*v1.Pod{
+				testutils.MakePod("w-pod1", "gang-pg", "2"),
+				testutils.MakePod("w-pod2", "gang-pg", "2"),
+			},
+			buildOpts: func() (ScheduleWorkloadOptions, *cpuPreemptionFilter) {
+				vNilSmall := &testVictim{name: "vNilSmall", pods: nil, quotaCPU: 1}
+				vEmptyMed := &testVictim{name: "vEmptyMed", pods: []*v1.Pod{}, quotaCPU: 3}
+				vEmptyHigh := &testVictim{name: "vEmptyHigh", pods: []*v1.Pod{}, quotaCPU: 2}
+				f := newCPUPreemptionFilter(1, 4)
+				return ScheduleWorkloadOptions{
+					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
+						PotentialVictims: slices.Values([]PreemptionVictim{vNilSmall, vEmptyMed, vEmptyHigh}),
+						PreemptionFilter: f,
+					},
+				}, f
+			},
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            true,
+			wantWaitingForPreemption: true,
+			wantVictimNames:          []string{"vEmptyMed"},
+			expectSnapshotState: map[string]sets.Set[string]{
+				"node1": nil,
+			},
+		},
+		{
+			name:         "Mixed pod-bearing and zero-pod PotentialVictims preempt both to satisfy node capacity and PreemptionFilter while sparing unneeded victims",
+			nodes:        []*v1.Node{node6CPU},
+			existingPods: []*v1.Pod{v1Pod2CPU, v2Pod2CPU},
+			workloadPods: []*v1.Pod{
+				testutils.MakePod("w-pod1", "gang-pg", "2"),
+				testutils.MakePod("w-pod2", "gang-pg", "2"),
+			},
+			buildOpts: func() (ScheduleWorkloadOptions, *cpuPreemptionFilter) {
+				vSmallPodless := &testVictim{name: "vSmallPodless", pods: nil, quotaCPU: 2}
+				vic1 := &testVictim{name: "v1", pods: []*v1.Pod{v1Pod2CPU}}
+				vMedPodless := &testVictim{name: "vMedPodless", pods: []*v1.Pod{}, quotaCPU: 3}
+				vic2 := &testVictim{name: "v2", pods: []*v1.Pod{v2Pod2CPU}}
+				f := newCPUPreemptionFilter(0, 5)
+				return ScheduleWorkloadOptions{
+					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
+						PotentialVictims: slices.Values([]PreemptionVictim{vSmallPodless, vic1, vMedPodless, vic2}),
+						PreemptionFilter: f,
+					},
+				}, f
+			},
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            true,
+			wantWaitingForPreemption: true,
+			wantVictimNames:          []string{"v1", "vMedPodless"},
+			expectSnapshotState: map[string]sets.Set[string]{
+				"node1": sets.New("v1-pod", "v2-pod"),
+			},
+		},
+		{
+			name:         "Zero-pod PotentialVictims with nil PreemptionFilter are reprieved while pod-bearing victim is kept",
+			nodes:        []*v1.Node{node6CPU},
+			existingPods: []*v1.Pod{vSmallPod, vMedPod},
+			workloadPods: []*v1.Pod{
+				testutils.MakePod("w-pod1", "gang-pg", "2"),
+				testutils.MakePod("w-pod2", "gang-pg", "2"),
+			},
+			buildOpts: func() (ScheduleWorkloadOptions, *cpuPreemptionFilter) {
+				vNilPods := &testVictim{name: "vNilPods", pods: nil, quotaCPU: 2}
+				vMed := &testVictim{name: "vMed", pods: []*v1.Pod{vMedPod}}
+				vEmptyPods := &testVictim{name: "vEmptyPods", pods: []*v1.Pod{}, quotaCPU: 2}
+				return ScheduleWorkloadOptions{
+					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
+						PotentialVictims: slices.Values([]PreemptionVictim{vNilPods, vMed, vEmptyPods}),
+						PreemptionFilter: nil,
+					},
+				}, nil
+			},
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            true,
+			wantWaitingForPreemption: true,
+			wantVictimNames:          []string{"vMed"},
+			expectSnapshotState: map[string]sets.Set[string]{
+				"node1": sets.New("v-small-pod", "v-med-pod"),
+			},
+		},
+		{
+			name:         "Zero-pod CommittedVictims suffice in Pass 2 without touching PotentialVictims when PreemptionFilter requires their quota",
+			nodes:        []*v1.Node{node6CPU},
+			existingPods: []*v1.Pod{v1Pod2CPU},
+			workloadPods: []*v1.Pod{
+				testutils.MakePod("w-pod1", "gang-pg", "2"),
+				testutils.MakePod("w-pod2", "gang-pg", "2"),
+			},
+			buildOpts: func() (ScheduleWorkloadOptions, *cpuPreemptionFilter) {
+				vCommittedNil := &testVictim{name: "vCommittedNil", pods: nil, quotaCPU: 1}
+				vCommittedEmpty := &testVictim{name: "vCommittedEmpty", pods: []*v1.Pod{}, quotaCPU: 2}
+				f := newCPUPreemptionFilter(1, 4)
+				f.PreemptVictim(vCommittedNil)
+				f.PreemptVictim(vCommittedEmpty)
+				return ScheduleWorkloadOptions{
+					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
+						CommittedVictims: []PreemptionVictim{vCommittedNil, vCommittedEmpty},
+						PotentialVictims: func(yield func(PreemptionVictim) bool) {
+							panic("PotentialVictims should not be pulled when CommittedVictims suffice")
+						},
+						PreemptionFilter: f,
+					},
+				}, f
+			},
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            true,
+			wantWaitingForPreemption: true,
+			wantVictimNames:          nil,
+			expectSnapshotState: map[string]sets.Set[string]{
+				"node1": sets.New("v1-pod"),
+			},
+		},
+		{
+			name:         "Zero-pod CommittedVictims allow Pass 1 Success on single node when PreemptionFilter passes without them",
+			nodes:        []*v1.Node{node6CPU},
+			existingPods: nil,
+			workloadPods: []*v1.Pod{
+				testutils.MakePod("w-pod1", "gang-pg", "2"),
+				testutils.MakePod("w-pod2", "gang-pg", "2"),
+			},
+			buildOpts: func() (ScheduleWorkloadOptions, *cpuPreemptionFilter) {
+				vCommittedPodless := &testVictim{name: "vCommittedPodless", pods: nil, quotaCPU: 2}
+				f := newCPUPreemptionFilter(4, 4)
+				f.PreemptVictim(vCommittedPodless)
+				return ScheduleWorkloadOptions{
+					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
+						CommittedVictims: []PreemptionVictim{vCommittedPodless},
+						PreemptionFilter: f,
+					},
+				}, f
+			},
+			wantStatusCode:           fwk.Success,
+			wantScheduled:            true,
+			wantWaitingForPreemption: false,
+			wantVictimNames:          nil,
+			expectSnapshotState: map[string]sets.Set[string]{
+				"node1": sets.New("w-pod1", "w-pod2"),
+			},
+		},
+		{
+			name:         "Zero-pod CommittedVictims combined with PotentialVictims returns only newly preempted victims in PreemptionVictims",
+			nodes:        []*v1.Node{node6CPU},
+			existingPods: []*v1.Pod{v1Pod2CPU, v2Pod2CPU},
+			workloadPods: []*v1.Pod{
+				testutils.MakePod("w-pod1", "gang-pg", "2"),
+				testutils.MakePod("w-pod2", "gang-pg", "2"),
+			},
+			buildOpts: func() (ScheduleWorkloadOptions, *cpuPreemptionFilter) {
+				vCommittedPodless := &testVictim{name: "vCommittedPodless", pods: []*v1.Pod{}, quotaCPU: 2}
+				vic1 := &testVictim{name: "v1", pods: []*v1.Pod{v1Pod2CPU}}
+				vic2 := &testVictim{name: "v2", pods: []*v1.Pod{v2Pod2CPU}}
+				f := newCPUPreemptionFilter(0, 4)
+				f.PreemptVictim(vCommittedPodless)
+				return ScheduleWorkloadOptions{
+					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
+						CommittedVictims: []PreemptionVictim{vCommittedPodless},
+						PotentialVictims: slices.Values([]PreemptionVictim{vic1, vic2}),
+						PreemptionFilter: f,
+					},
+				}, f
+			},
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            true,
+			wantWaitingForPreemption: true,
+			wantVictimNames:          []string{"v1"},
+			expectSnapshotState: map[string]sets.Set[string]{
+				"node1": sets.New("v1-pod", "v2-pod"),
+			},
+		},
+		{
+			name:         "Zero-pod CommittedVictims and zero-pod PotentialVictims fail when node lacks capacity and propagate Pass 2 failure results",
+			nodes:        []*v1.Node{node6CPU},
+			existingPods: []*v1.Pod{v1Pod2CPU, v2Pod2CPU},
+			workloadPods: []*v1.Pod{
+				testutils.MakePod("w-pod1", "gang-pg", "2"),
+				testutils.MakePod("w-pod2", "gang-pg", "2"),
+			},
+			buildOpts: func() (ScheduleWorkloadOptions, *cpuPreemptionFilter) {
+				vCommittedPodless := &testVictim{name: "vCommittedPodless", pods: nil, quotaCPU: 2}
+				vPotentialPodless := &testVictim{name: "vPotentialPodless", pods: []*v1.Pod{}, quotaCPU: 2}
+				f := newCPUPreemptionFilter(2, 4)
+				f.PreemptVictim(vCommittedPodless)
+				return ScheduleWorkloadOptions{
+					WorkloadPreemptionOptions: WorkloadPreemptionOptions{
+						CommittedVictims: []PreemptionVictim{vCommittedPodless},
+						PotentialVictims: slices.Values([]PreemptionVictim{vPotentialPodless}),
+						PreemptionFilter: f,
+					},
+				}, f
+			},
+			wantStatusCode:           fwk.Unschedulable,
+			wantScheduled:            false,
+			wantWaitingForPreemption: false,
+			wantVictimNames:          nil,
+			expectSnapshotState: map[string]sets.Set[string]{
+				"node1": sets.New("v1-pod", "v2-pod"),
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -2733,6 +2940,16 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 					wantActive := len(result.PreemptionVictims) + len(opts.CommittedVictims)
 					if len(filter.activeVictims) != wantActive {
 						t.Errorf("filter activeVictims count = %d, want %d", len(filter.activeVictims), wantActive)
+					}
+					for _, v := range opts.CommittedVictims {
+						if !filter.activeVictims[v] {
+							t.Errorf("expected committed victim %v to remain active in PreemptionFilter", victimNames([]PreemptionVictim{v}))
+						}
+					}
+					for _, v := range result.PreemptionVictims {
+						if !filter.activeVictims[v] {
+							t.Errorf("expected preempted victim %v to be active in PreemptionFilter", victimNames([]PreemptionVictim{v}))
+						}
 					}
 				}
 			} else if tt.wantError || tt.wantEmptyPodResults {
