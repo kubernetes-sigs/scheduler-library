@@ -18,7 +18,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -1595,17 +1594,7 @@ func TestSnapshot_ActionSequences_ScheduleWorkload(t *testing.T) {
 	}
 }
 
-// UPSTREAM-DIFF: Upstream kubernetes PR #142177 (https://github.com/kubernetes/kubernetes/pull/142177)
-// provides TestSnapshot_AddGenericPodGroup and TestSnapshot_RemoveGenericPodGroup in k8s.io/kubernetes.
-//
-// Test Migration Plan:
-// When go.mod updates k8s.io/kubernetes to include PR #142177:
-// 1. Delete verifySnapshotPodGroups below. Upstream tests already verify the internal map state of cache.Snapshot.
-// 2. Simplify TestSnapshot_AddPodGroups and TestSnapshot_RemovePodGroups. Upstream tests already cover tree permutations.
-// 3. Keep tests focused on ClusterSnapshot responsibilities: transaction rollback (undoLog) and preemption version bumps.
-
-// verifySnapshotPodGroups verifies the internal pod group and composite pod group state of cache.Snapshot.
-// It uses reflection to inspect unexported snapshot maps until upstream cache.Snapshot exposes inspection methods.
+// verifySnapshotPodGroups verifies the pod group and composite pod group state of cache.Snapshot.
 func verifySnapshotPodGroups(
 	t *testing.T,
 	snap *cache.Snapshot,
@@ -1613,10 +1602,6 @@ func verifySnapshotPodGroups(
 	wantCompositePodGroups []*schedulingv1beta1.CompositePodGroup,
 ) {
 	t.Helper()
-
-	rv := reflect.ValueOf(snap).Elem()
-	podGroupStates := writableField(rv, "podGroupStates")
-	compositePodGroupStates := writableField(rv, "compositePodGroupStates")
 
 	wantPGMap := make(map[fwk.EntityKey]*schedulingv1beta1.PodGroup, len(wantPodGroups))
 	wantChildren := make(map[fwk.EntityKey]sets.Set[fwk.EntityKey])
@@ -1637,21 +1622,13 @@ func verifySnapshotPodGroups(
 			wantChildren[parentKey].Insert(key)
 		}
 	}
-
-	gotPGMap := make(map[fwk.EntityKey]*schedulingv1beta1.PodGroup)
-	pgIter := podGroupStates.MapRange()
-	for pgIter.Next() {
-		key := pgIter.Key().Interface().(fwk.EntityKey)
-		pgs := pgIter.Value()
-		if podGroupEmpty(pgs) {
-			t.Errorf("empty podGroupStateSnapshot left in snapshot for key %s", key)
+	for _, name := range []string{"pg1", "pg2", "leaf-pg1", "leaf-pg2", "gang-pg1", "gang-pg2", "gang-pg3"} {
+		key := fwk.PodGroupKey("default", name)
+		if _, ok := wantPGMap[key]; !ok {
+			if _, err := snap.PodGroups().Get("default", name); err == nil {
+				t.Errorf("snap.PodGroups().Get(default, %s) succeeded, want not found error", name)
+			}
 		}
-		if pgField := writableField(pgs.Elem(), "podGroup"); !pgField.IsNil() {
-			gotPGMap[key] = pgField.Interface().(*schedulingv1beta1.PodGroup)
-		}
-	}
-	if diff := cmp.Diff(wantPGMap, gotPGMap, cmpopts.EquateEmpty()); diff != "" {
-		t.Errorf("snapshot podGroups mismatch (-want +got):\n%s", diff)
 	}
 
 	wantCPGMap := make(map[fwk.EntityKey]*schedulingv1beta1.CompositePodGroup, len(wantCompositePodGroups))
@@ -1676,27 +1653,25 @@ func verifySnapshotPodGroups(
 		}
 	}
 
-	gotCPGMap := make(map[fwk.EntityKey]*schedulingv1beta1.CompositePodGroup)
 	gotChildren := make(map[fwk.EntityKey]sets.Set[fwk.EntityKey])
-	cpgIter := compositePodGroupStates.MapRange()
-	for cpgIter.Next() {
-		key := cpgIter.Key().Interface().(fwk.EntityKey)
-		cpgs := cpgIter.Value()
-		if compositePodGroupEmpty(cpgs) {
-			t.Errorf("empty compositePodGroupStateSnapshot left in snapshot for key %s", key)
+	for _, name := range []string{"root-cpg", "cpg1", "cpg2"} {
+		key := fwk.CompositePodGroupKey("default", name)
+		_, wantCPG := wantCPGMap[key]
+		if !wantCPG {
+			if _, err := snap.CompositePodGroups().Get("default", name); err == nil {
+				t.Errorf("snap.CompositePodGroups().Get(default, %s) succeeded, want not found error", name)
+			}
 		}
-		if cpgField := writableField(cpgs.Elem(), "compositePodGroup"); !cpgField.IsNil() {
-			gotCPGMap[key] = cpgField.Interface().(*schedulingv1beta1.CompositePodGroup)
+		if wantCPG || len(wantChildren[key]) > 0 {
+			state, err := snap.CompositePodGroupStates().Get("default", name)
+			if err != nil {
+				t.Errorf("snap.CompositePodGroupStates().Get(default, %s) unexpected error: %v", name, err)
+			} else {
+				gotChildren[key] = sets.New(state.GetChildren()...)
+			}
+		} else if _, err := snap.CompositePodGroupStates().Get("default", name); err == nil {
+			t.Errorf("snap.CompositePodGroupStates().Get(default, %s) succeeded, want not found error", name)
 		}
-		state, err := snap.CompositePodGroupStates().Get(key.Namespace, key.Name)
-		if err != nil {
-			t.Errorf("snap.CompositePodGroupStates().Get(%s, %s) unexpected error: %v", key.Namespace, key.Name, err)
-		} else {
-			gotChildren[key] = sets.New(state.GetChildren()...)
-		}
-	}
-	if diff := cmp.Diff(wantCPGMap, gotCPGMap, cmpopts.EquateEmpty()); diff != "" {
-		t.Errorf("snapshot compositePodGroups mismatch (-want +got):\n%s", diff)
 	}
 	if diff := cmp.Diff(wantChildren, gotChildren, cmpopts.EquateEmpty()); diff != "" {
 		t.Errorf("snapshot compositePodGroup children mismatch (-want +got):\n%s", diff)
@@ -1704,8 +1679,6 @@ func verifySnapshotPodGroups(
 }
 
 // TestSnapshot_AddPodGroups tests adding PodGroups and CompositePodGroups to ClusterSnapshot.
-// When k8s.io/kubernetes includes PR #142177, this test will verify the calls delegated
-// to cache.Snapshot.AddGenericPodGroup.
 func TestSnapshot_AddPodGroups(t *testing.T) {
 	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
 		features.TopologyAwareWorkloadScheduling: true,
@@ -1843,8 +1816,6 @@ func TestSnapshot_AddPodGroups(t *testing.T) {
 }
 
 // TestSnapshot_RemovePodGroups tests removing PodGroups and CompositePodGroups from ClusterSnapshot.
-// When k8s.io/kubernetes includes PR #142177, this test will verify the calls delegated
-// to cache.Snapshot.RemoveGenericPodGroup.
 func TestSnapshot_RemovePodGroups(t *testing.T) {
 	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
 		features.TopologyAwareWorkloadScheduling: true,
