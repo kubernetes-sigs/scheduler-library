@@ -30,6 +30,7 @@ import (
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
@@ -2980,6 +2981,143 @@ func TestScheduleWorkload_PreservesPassFailureResults(t *testing.T) {
 				}
 			}
 			ft.VerifySnapshot(t, snap, map[string]sets.Set[string]{"node1": sets.New("v-potential")})
+		})
+	}
+}
+
+type fakePodGroupPostFilterPlugin struct {
+	result *fwk.PodGroupPostFilterResult
+}
+
+var _ fwk.PodGroupPostFilterPlugin = (*fakePodGroupPostFilterPlugin)(nil)
+
+func (p *fakePodGroupPostFilterPlugin) Name() string {
+	return "FakePodGroupPostFilter"
+}
+
+func (p *fakePodGroupPostFilterPlugin) PodGroupPostFilter(
+	_ context.Context,
+	_ fwk.PodGroupCycleState,
+	_ fwk.PodGroupInfo,
+	_ fwk.PodGroupSchedulingFunc,
+) (*fwk.PodGroupPostFilterResult, *fwk.Status) {
+	return p.result, fwk.NewStatus(fwk.Success)
+}
+
+func TestScheduleWorkload_UsesPodGroupPostFilterResult(t *testing.T) {
+	ctx := t.Context()
+
+	node1 := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "4",
+		v1.ResourceMemory: "8Gi",
+		v1.ResourcePods:   "10",
+	}).Obj()
+
+	v1Pod := makeScheduledTestPod("v1-pod", "node1", "", "4")
+	v1Victim := &testVictim{name: "v1", pods: []*v1.Pod{v1Pod}}
+	gangPG := testutils.MakeGangPodGroup("gang-pg", "", 1)
+
+	plugin := &fakePodGroupPostFilterPlugin{}
+	profileMap, snap, err := ft.SetupSnapshotTestWithPodGroups(
+		ctx,
+		t,
+		[]*v1.Pod{v1Pod},
+		[]*v1.Node{node1},
+		[]*schedulingv1beta1.PodGroup{gangPG},
+		nil,
+		ft.WithProfileModifier(func(prof *schedulerapi.KubeSchedulerProfile) {
+			prof.Plugins.PodGroupPostFilter.Enabled = []schedulerapi.Plugin{{Name: plugin.Name()}}
+		}),
+		ft.WithOutOfTreeRegistry(frameworkruntime.Registry{
+			plugin.Name(): func(_ context.Context, _ runtime.Object, _ fwk.Handle) (fwk.Plugin, error) {
+				return plugin, nil
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("SetupSnapshotTestWithPodGroups failed: %v", err)
+	}
+
+	cs := New(snap, profileMap)
+	opts := ScheduleWorkloadOptions{
+		WorkloadPreemptionOptions: WorkloadPreemptionOptions{
+			PotentialVictims: slices.Values([]PreemptionVictim{v1Victim}),
+		},
+	}
+
+	tests := []struct {
+		name                  string
+		existingNominatedNode string
+		nominatingInfo        *fwk.NominatingInfo
+		wantSelectedNode      string
+	}{
+		{
+			name:             "ModeOverride sets SelectedNodeName from NominatingInfo",
+			nominatingInfo:   &fwk.NominatingInfo{NominatedNodeName: "node1", NominatingMode: fwk.ModeOverride},
+			wantSelectedNode: "node1",
+		},
+		{
+			name:                  "ModeOverride overrides existing pod NominatedNodeName",
+			existingNominatedNode: "old-node",
+			nominatingInfo:        &fwk.NominatingInfo{NominatedNodeName: "node1", NominatingMode: fwk.ModeOverride},
+			wantSelectedNode:      "node1",
+		},
+		{
+			name:                  "ModeNoop preserves existing pod NominatedNodeName",
+			existingNominatedNode: "existing-node",
+			nominatingInfo:        &fwk.NominatingInfo{NominatingMode: fwk.ModeNoop},
+			wantSelectedNode:      "existing-node",
+		},
+		{
+			name:                  "ModeOverride with empty NominatedNodeName excludes pod from PodResults",
+			existingNominatedNode: "old-node",
+			nominatingInfo:        &fwk.NominatingInfo{NominatedNodeName: "", NominatingMode: fwk.ModeOverride},
+			wantSelectedNode:      "",
+		},
+		{
+			name:             "ModeNoop with empty existing NominatedNodeName excludes pod from PodResults",
+			nominatingInfo:   &fwk.NominatingInfo{NominatingMode: fwk.ModeNoop},
+			wantSelectedNode: "",
+		},
+		{
+			name:             "Pod omitted from NominatingInfos is excluded from PodResults",
+			nominatingInfo:   nil,
+			wantSelectedNode: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := testutils.MakePod("w-pod", "gang-pg", "4")
+			pod.Status.NominatedNodeName = tt.existingNominatedNode
+
+			nominatingInfos := map[types.NamespacedName]*fwk.NominatingInfo{}
+			if tt.nominatingInfo != nil {
+				nominatingInfos[types.NamespacedName{Namespace: metav1.NamespaceDefault, Name: pod.Name}] = tt.nominatingInfo
+			}
+			plugin.result = &fwk.PodGroupPostFilterResult{NominatingInfos: nominatingInfos}
+
+			result := cs.ScheduleWorkload(ctx, []*v1.Pod{pod}, opts)
+			if result.Status.Code() != fwk.Unschedulable {
+				t.Fatalf("ScheduleWorkload() Status.Code() = %v, want Unschedulable (status: %v)", result.Status.Code(), result.Status)
+			}
+			if !result.WaitingForPreemption {
+				t.Fatalf("ScheduleWorkload() WaitingForPreemption = false, want true")
+			}
+
+			if tt.wantSelectedNode == "" {
+				if len(result.PodResults) != 0 {
+					t.Fatalf("ScheduleWorkload() PodResults = %+v, want empty", result.PodResults)
+				}
+				return
+			}
+			if len(result.PodResults) != 1 {
+				t.Fatalf("ScheduleWorkload() len(PodResults) = %d, want 1", len(result.PodResults))
+			}
+			got := result.PodResults[0]
+			if got.Pod != pod || got.SelectedNodeName != tt.wantSelectedNode || got.Status != nil {
+				t.Errorf("PodResults[0] = %+v, want Pod=%s, SelectedNodeName=%q, Status=nil", got, pod.Name, tt.wantSelectedNode)
+			}
 		})
 	}
 }

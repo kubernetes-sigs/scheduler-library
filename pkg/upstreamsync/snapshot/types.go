@@ -84,7 +84,7 @@ type SchedulingResult struct {
 	Status *fwk.Status
 	// SelectedNodeName is the node the pod was scheduled on, empty if it was not scheduled.
 	SelectedNodeName string
-	// CycleState is the state of the scheduling cycle.
+	// CycleState is the state of the scheduling cycle, nil if the pod is waiting for preemption.
 	CycleState fwk.CycleState
 }
 
