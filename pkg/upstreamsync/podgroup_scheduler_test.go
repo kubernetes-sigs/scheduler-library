@@ -19,7 +19,6 @@ import (
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
-	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
@@ -140,7 +139,7 @@ func TestRunRootSchedulingAlgorithm(t *testing.T) {
 		nodes                   []*v1.Node
 		existingPods            []*v1.Pod
 		podGroups               []*schedulingv1beta1.PodGroup
-		compositePodGroups      []*schedulingv1alpha3.CompositePodGroup
+		compositePodGroups      []*schedulingv1beta1.CompositePodGroup
 		pods                    []*v1.Pod
 		disableTAS              bool
 		wantKey                 fwk.EntityKey
@@ -178,7 +177,7 @@ func TestRunRootSchedulingAlgorithm(t *testing.T) {
 			pods:             []*v1.Pod{gangMin3Pod1, gangMin3Pod2},
 			wantKey:          fwk.PodGroupKey("default", "gang-pg-min3"),
 			wantSuccess:      false,
-			wantStatusMsg:    "0/1 placements are available, first placement status: minCount (3) cannot be satisfied: 0 scheduled, 2 remaining",
+			wantStatusMsg:    "0/1 placements are available, first placement status: scheduling policy's minimum threshold (3) cannot be satisfied: 0 scheduled, 0 unschedulable, 2 not-evaluated",
 			wantPodResults:   0,
 			expectedNodePods: map[string]sets.Set[string]{"node1": sets.New[string]()},
 		},
@@ -190,7 +189,7 @@ func TestRunRootSchedulingAlgorithm(t *testing.T) {
 			disableTAS:       true,
 			wantKey:          fwk.PodGroupKey("default", "gang-pg-min3"),
 			wantSuccess:      false,
-			wantStatusMsg:    "minCount (3) cannot be satisfied: 0 scheduled, 2 remaining",
+			wantStatusMsg:    "scheduling policy's minimum threshold (3) cannot be satisfied: 0 scheduled, 0 unschedulable, 2 not-evaluated",
 			wantPodResults:   0,
 			expectedNodePods: map[string]sets.Set[string]{"node1": sets.New[string]()},
 		},
@@ -201,7 +200,7 @@ func TestRunRootSchedulingAlgorithm(t *testing.T) {
 			pods:                    []*v1.Pod{gangMin3Pod1, gangMin3Pod2, gangMin3Pod3},
 			wantKey:                 fwk.PodGroupKey("default", "gang-pg-min3"),
 			wantSuccess:             false,
-			wantStatusMsg:           "0/1 placements are available, first placement status: minCount (3) cannot be satisfied: 1 scheduled, 1 remaining",
+			wantStatusMsg:           "0/1 placements are available, first placement status: scheduling policy's minimum threshold (3) cannot be satisfied: 1 scheduled, 1 unschedulable, 1 not-evaluated",
 			wantPodResults:          2,
 			expectedNodePods:        map[string]sets.Set[string]{"node1": sets.New[string]()},
 			expectedUnscheduledPods: sets.New("p2"),
@@ -213,7 +212,7 @@ func TestRunRootSchedulingAlgorithm(t *testing.T) {
 			pods:                    []*v1.Pod{gangPod1, gangPod2},
 			wantKey:                 fwk.PodGroupKey("default", "gang-pg"),
 			wantSuccess:             false,
-			wantStatusMsg:           "0/1 placements are available, first placement status: minCount (2) cannot be satisfied: 1 scheduled, 0 remaining",
+			wantStatusMsg:           "0/1 placements are available, first placement status: scheduling policy's minimum threshold (2) cannot be satisfied: 1 scheduled, 1 unschedulable, 0 not-evaluated",
 			wantPodResults:          2,
 			expectedNodePods:        map[string]sets.Set[string]{"node1": sets.New[string]()},
 			expectedUnscheduledPods: sets.New("p2"),
@@ -255,7 +254,7 @@ func TestRunRootSchedulingAlgorithm(t *testing.T) {
 		{
 			name:               "2-Level composite podgroup with gang policy",
 			nodes:              []*v1.Node{node8CPU},
-			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{compositePodGroup1},
+			compositePodGroups: []*schedulingv1beta1.CompositePodGroup{compositePodGroup1},
 			podGroups:          []*schedulingv1beta1.PodGroup{compositePodGroup1leaf1, compositePodGroup1leaf2},
 			pods:               []*v1.Pod{compositePodGroup1leaf1Pod2CPU, compositePodGroup1leaf2Pod2CPU},
 			wantKey:            fwk.CompositePodGroupKey("default", "gang-cpg1"),
@@ -266,7 +265,7 @@ func TestRunRootSchedulingAlgorithm(t *testing.T) {
 		{
 			name:                    "2-Level composite podgroup with gang policy succeeds when minGroupCount subset fits",
 			nodes:                   []*v1.Node{node4CPU},
-			compositePodGroups:      []*schedulingv1alpha3.CompositePodGroup{compositePodGroupMin1},
+			compositePodGroups:      []*schedulingv1beta1.CompositePodGroup{compositePodGroupMin1},
 			podGroups:               []*schedulingv1beta1.PodGroup{compositePodGroupMin1leaf1, compositePodGroupMin1leaf2},
 			pods:                    []*v1.Pod{compositePodGroupMin1leaf1Pod3CPU, compositePodGroupMin1leaf2Pod3CPU},
 			wantKey:                 fwk.CompositePodGroupKey("default", "gang-cpg-min1"),
@@ -278,24 +277,24 @@ func TestRunRootSchedulingAlgorithm(t *testing.T) {
 		{
 			name:               "2-Level composite podgroup with gang policy fails early via PlacementFeasible when fewer children than minGroupCount",
 			nodes:              []*v1.Node{node8CPU},
-			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{compositePodGroup1},
+			compositePodGroups: []*schedulingv1beta1.CompositePodGroup{compositePodGroup1},
 			podGroups:          []*schedulingv1beta1.PodGroup{compositePodGroup1leaf1},
 			pods:               []*v1.Pod{compositePodGroup1leaf1Pod2CPU},
 			wantKey:            fwk.CompositePodGroupKey("default", "gang-cpg1"),
 			wantSuccess:        false,
-			wantStatusMsg:      "0/1 placements are available, first placement status: minCount (2) cannot be satisfied: 0 scheduled, 1 remaining",
+			wantStatusMsg:      "0/1 placements are available, first placement status: scheduling policy's minimum threshold (2) cannot be satisfied: 0 scheduled, 0 unschedulable, 1 not-evaluated",
 			wantPodResults:     0,
 			expectedNodePods:   map[string]sets.Set[string]{"node1": sets.New[string]()},
 		},
 		{
 			name:                    "2-Level composite podgroup with gang policy terminates loop early when minGroupCount can no longer be met",
 			nodes:                   []*v1.Node{node4CPU},
-			compositePodGroups:      []*schedulingv1alpha3.CompositePodGroup{compositePodGroupMin3},
+			compositePodGroups:      []*schedulingv1beta1.CompositePodGroup{compositePodGroupMin3},
 			podGroups:               []*schedulingv1beta1.PodGroup{compositePodGroupMin3leaf1, compositePodGroupMin3leaf2, compositePodGroupMin3leaf3},
 			pods:                    []*v1.Pod{compositePodGroupMin3leaf1Pod3CPU, compositePodGroupMin3leaf2Pod3CPU, compositePodGroupMin3leaf3Pod3CPU},
 			wantKey:                 fwk.CompositePodGroupKey("default", "gang-cpg-min3"),
 			wantSuccess:             false,
-			wantStatusMsg:           "0/1 placements are available, first placement status: minCount (3) cannot be satisfied: 1 scheduled, 1 remaining",
+			wantStatusMsg:           "0/1 placements are available, first placement status: scheduling policy's minimum threshold (3) cannot be satisfied: 1 scheduled, 1 unschedulable, 1 not-evaluated",
 			wantPodResults:          2,
 			expectedNodePods:        map[string]sets.Set[string]{"node1": sets.New[string]()},
 			expectedUnscheduledPods: sets.New("p2"),
@@ -303,12 +302,12 @@ func TestRunRootSchedulingAlgorithm(t *testing.T) {
 		{
 			name:                    "2-Level composite podgroup scheduling failure due to insufficient capacity",
 			nodes:                   []*v1.Node{node4CPU},
-			compositePodGroups:      []*schedulingv1alpha3.CompositePodGroup{compositePodGroup1},
+			compositePodGroups:      []*schedulingv1beta1.CompositePodGroup{compositePodGroup1},
 			podGroups:               []*schedulingv1beta1.PodGroup{compositePodGroup1leaf1, compositePodGroup1leaf2},
 			pods:                    []*v1.Pod{compositePodGroup1leaf1Pod3CPU, compositePodGroup1leaf2Pod3CPU},
 			wantKey:                 fwk.CompositePodGroupKey("default", "gang-cpg1"),
 			wantSuccess:             false,
-			wantStatusMsg:           "0/1 placements are available, first placement status: minCount (2) cannot be satisfied: 1 scheduled, 0 remaining",
+			wantStatusMsg:           "0/1 placements are available, first placement status: scheduling policy's minimum threshold (2) cannot be satisfied: 1 scheduled, 1 unschedulable, 0 not-evaluated",
 			wantPodResults:          2,
 			expectedNodePods:        map[string]sets.Set[string]{"node1": sets.New[string]()},
 			expectedUnscheduledPods: sets.New("p2"),
@@ -316,7 +315,7 @@ func TestRunRootSchedulingAlgorithm(t *testing.T) {
 		{
 			name:               "2-Level composite podgroup with basic policy",
 			nodes:              []*v1.Node{node8CPU},
-			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{basicCompositePodGroup},
+			compositePodGroups: []*schedulingv1beta1.CompositePodGroup{basicCompositePodGroup},
 			podGroups:          []*schedulingv1beta1.PodGroup{basicLeaf1, basicLeaf2},
 			pods:               []*v1.Pod{basicLeaf1Pod, basicLeaf2Pod},
 			wantKey:            fwk.CompositePodGroupKey("default", "root-basic"),
@@ -327,7 +326,7 @@ func TestRunRootSchedulingAlgorithm(t *testing.T) {
 		{
 			name:               "Multi-level hierarchy",
 			nodes:              []*v1.Node{node8CPU},
-			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{rootCompositePodGroup, compositePodGroup2},
+			compositePodGroups: []*schedulingv1beta1.CompositePodGroup{rootCompositePodGroup, compositePodGroup2},
 			podGroups:          []*schedulingv1beta1.PodGroup{compositePodGroup2leaf, rootCompositePodGroupleaf},
 			pods:               []*v1.Pod{compositePodGroup2leafPod, rootCompositePodGroupleafPod},
 			wantKey:            fwk.CompositePodGroupKey("default", "root-cpg"),
@@ -338,12 +337,12 @@ func TestRunRootSchedulingAlgorithm(t *testing.T) {
 		{
 			name:                    "Multi-level hierarchy scheduling failure due to insufficient capacity",
 			nodes:                   []*v1.Node{node4CPU},
-			compositePodGroups:      []*schedulingv1alpha3.CompositePodGroup{rootCompositePodGroup, compositePodGroup2},
+			compositePodGroups:      []*schedulingv1beta1.CompositePodGroup{rootCompositePodGroup, compositePodGroup2},
 			podGroups:               []*schedulingv1beta1.PodGroup{compositePodGroup2leaf, rootCompositePodGroupleaf},
 			pods:                    []*v1.Pod{compositePodGroup2leafPod3CPU, rootCompositePodGroupleafPod3CPU},
 			wantKey:                 fwk.CompositePodGroupKey("default", "root-cpg"),
 			wantSuccess:             false,
-			wantStatusMsg:           "0/1 placements are available, first placement status: minCount (2) cannot be satisfied: 1 scheduled, 0 remaining",
+			wantStatusMsg:           "0/1 placements are available, first placement status: scheduling policy's minimum threshold (2) cannot be satisfied: 1 scheduled, 1 unschedulable, 0 not-evaluated",
 			wantPodResults:          2,
 			expectedNodePods:        map[string]sets.Set[string]{"node1": sets.New[string]()},
 			expectedUnscheduledPods: sets.New("p1"),
@@ -375,7 +374,7 @@ func TestRunRootSchedulingAlgorithm(t *testing.T) {
 			pods:                    []*v1.Pod{tasGangPod1, tasGangPod2},
 			wantKey:                 fwk.PodGroupKey("default", "tas-gang-pg"),
 			wantSuccess:             false,
-			wantStatusMsg:           "0/2 placements are available, first placement status: minCount (2) cannot be satisfied: 1 scheduled, 0 remaining",
+			wantStatusMsg:           "0/2 placements are available, first placement status: scheduling policy's minimum threshold (2) cannot be satisfied: 1 scheduled, 1 unschedulable, 0 not-evaluated",
 			wantPodResults:          2,
 			expectedNodePods:        map[string]sets.Set[string]{"node-a": sets.New[string](), "node-b": sets.New[string]()},
 			expectedUnscheduledPods: sets.New("p2"),
@@ -383,7 +382,7 @@ func TestRunRootSchedulingAlgorithm(t *testing.T) {
 		{
 			name:               "Multi-placement composite podgroup succeeds on feasible placement and cleans up infeasible placement",
 			nodes:              []*v1.Node{zoneANode4CPU, zoneBNode8CPU},
-			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{tasGangCPG},
+			compositePodGroups: []*schedulingv1beta1.CompositePodGroup{tasGangCPG},
 			podGroups:          []*schedulingv1beta1.PodGroup{tasGangCPGLeaf1, tasGangCPGLeaf2},
 			pods:               []*v1.Pod{tasGangCPGPod1, tasGangCPGPod2},
 			wantKey:            fwk.CompositePodGroupKey("default", "tas-gang-cpg"),
@@ -394,7 +393,7 @@ func TestRunRootSchedulingAlgorithm(t *testing.T) {
 		{
 			name:               "Multi-placement composite podgroup selects placement fitting more pods via PodGroupPodsCount",
 			nodes:              []*v1.Node{zoneANode4CPU, zoneBNode8CPU},
-			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{tasBasicCPG},
+			compositePodGroups: []*schedulingv1beta1.CompositePodGroup{tasBasicCPG},
 			podGroups:          []*schedulingv1beta1.PodGroup{tasBasicCPGLeaf1, tasBasicCPGLeaf2},
 			pods:               []*v1.Pod{tasBasicCPGPod1, tasBasicCPGPod2},
 			wantKey:            fwk.CompositePodGroupKey("default", "tas-basic-cpg"),
@@ -405,12 +404,12 @@ func TestRunRootSchedulingAlgorithm(t *testing.T) {
 		{
 			name:                    "Multi-placement composite podgroup fails when all placements are unschedulable",
 			nodes:                   []*v1.Node{zoneANode4CPU, zoneBNode4CPU},
-			compositePodGroups:      []*schedulingv1alpha3.CompositePodGroup{tasGangCPG},
+			compositePodGroups:      []*schedulingv1beta1.CompositePodGroup{tasGangCPG},
 			podGroups:               []*schedulingv1beta1.PodGroup{tasGangCPGLeaf1, tasGangCPGLeaf2},
 			pods:                    []*v1.Pod{tasGangCPGPod1, tasGangCPGPod2},
 			wantKey:                 fwk.CompositePodGroupKey("default", "tas-gang-cpg"),
 			wantSuccess:             false,
-			wantStatusMsg:           "0/2 placements are available, first placement status: minCount (2) cannot be satisfied: 1 scheduled, 0 remaining",
+			wantStatusMsg:           "0/2 placements are available, first placement status: scheduling policy's minimum threshold (2) cannot be satisfied: 1 scheduled, 1 unschedulable, 0 not-evaluated",
 			wantPodResults:          2,
 			expectedNodePods:        map[string]sets.Set[string]{"node-a": sets.New[string](), "node-b": sets.New[string]()},
 			expectedUnscheduledPods: sets.New("p2"),
@@ -541,7 +540,7 @@ func TestBuildPodGroupSchedulingFunc(t *testing.T) {
 				nil,
 				tt.nodes,
 				[]*schedulingv1beta1.PodGroup{leaf1, leaf2},
-				[]*schedulingv1alpha3.CompositePodGroup{compositePodGroup},
+				[]*schedulingv1beta1.CompositePodGroup{compositePodGroup},
 			)
 			if err != nil {
 				t.Fatalf("SetupSnapshotTestWithPodGroups failed: %v", err)

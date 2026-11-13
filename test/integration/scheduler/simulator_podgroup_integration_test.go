@@ -19,7 +19,6 @@ import (
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
-	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
@@ -116,7 +115,7 @@ func TestSimulatorIntegration_PodGroupScheduling(t *testing.T) {
 		name               string
 		nodes              []*v1.Node
 		podGroups          []*schedulingv1beta1.PodGroup
-		compositePodGroups []*schedulingv1alpha3.CompositePodGroup
+		compositePodGroups []*schedulingv1beta1.CompositePodGroup
 		pods               []*v1.Pod
 		wantSuccess        bool
 		wantResultsCount   int
@@ -132,7 +131,7 @@ func TestSimulatorIntegration_PodGroupScheduling(t *testing.T) {
 		{
 			name:               "multi-level hierarchy",
 			nodes:              []*v1.Node{node1},
-			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{rootCPG},
+			compositePodGroups: []*schedulingv1beta1.CompositePodGroup{rootCPG},
 			podGroups:          []*schedulingv1beta1.PodGroup{leafPG1, leafPG2},
 			pods:               []*v1.Pod{cpgPod1, cpgPod2},
 			wantSuccess:        true,
@@ -141,7 +140,7 @@ func TestSimulatorIntegration_PodGroupScheduling(t *testing.T) {
 		{
 			name:               "multi-level hierarchy scheduling failure due to insufficient capacity and reverting results",
 			nodes:              []*v1.Node{node1},
-			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{failRootCPG},
+			compositePodGroups: []*schedulingv1beta1.CompositePodGroup{failRootCPG},
 			podGroups:          []*schedulingv1beta1.PodGroup{failLeafPG1, failLeafPG2},
 			pods:               []*v1.Pod{failPod1, failPod2},
 			wantSuccess:        false,
@@ -158,7 +157,7 @@ func TestSimulatorIntegration_PodGroupScheduling(t *testing.T) {
 		{
 			name:               "multi-level hierarchy TAS success with sufficient zone capacity",
 			nodes:              []*v1.Node{tasNode3, tasNode4},
-			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{rootTASCPG},
+			compositePodGroups: []*schedulingv1beta1.CompositePodGroup{rootTASCPG},
 			podGroups:          []*schedulingv1beta1.PodGroup{leafTASPG1, leafTASPG2},
 			pods:               []*v1.Pod{cpgTASPod1, cpgTASPod2},
 			wantSuccess:        true,
@@ -183,10 +182,10 @@ func TestSimulatorIntegration_PodGroupScheduling(t *testing.T) {
 				cs.Cache.AddNode(logger, n)
 			}
 			for _, cpg := range tt.compositePodGroups {
-				cs.Cache.AddCompositePodGroup(logger, cpg)
+				cs.Cache.AddGenericPodGroup(fwk.NewGenericCompositePodGroup(cpg))
 			}
 			for _, pg := range tt.podGroups {
-				cs.Cache.AddPodGroup(pg)
+				cs.Cache.AddGenericPodGroup(fwk.NewGenericPodGroup(pg))
 			}
 
 			snap := cs.GetAssociatedSnapshot()
@@ -279,7 +278,7 @@ func TestSimulatorIntegration_AddAndRemovePodGroups(t *testing.T) {
 	// 1. Add nodes and initialPG to cluster state cache, then sync snapshot.
 	cs.Cache.AddNode(logger, tasNode1)
 	cs.Cache.AddNode(logger, tasNode2)
-	cs.Cache.AddPodGroup(initialPG)
+	cs.Cache.AddGenericPodGroup(fwk.NewGenericPodGroup(initialPG))
 
 	snap := cs.GetAssociatedSnapshot()
 	if err := cs.SyncSnapshot(logger); err != nil {
@@ -411,7 +410,7 @@ func makePodGroup(ns, name, parentCPG string, minCount int32, topologyKey string
 	return pg.Obj()
 }
 
-func makeCompositePodGroup(ns, name string, minGroupCount int32, topologyKey string) *schedulingv1alpha3.CompositePodGroup {
+func makeCompositePodGroup(ns, name string, minGroupCount int32, topologyKey string) *schedulingv1beta1.CompositePodGroup {
 	cpg := st.MakeCompositePodGroup().Name(name).Namespace(ns)
 	if minGroupCount > 0 {
 		cpg = cpg.MinGroupCount(minGroupCount)
@@ -740,7 +739,7 @@ func TestSimulatorIntegration_PodGroupPreemption(t *testing.T) {
 					t.Fatalf("AddPod(%s) failed: %v", p.Name, err)
 				}
 			}
-			cs.Cache.AddPodGroup(gangPG)
+			cs.Cache.AddGenericPodGroup(fwk.NewGenericPodGroup(gangPG))
 
 			snap := cs.GetAssociatedSnapshot()
 			if err := cs.SyncSnapshot(logger); err != nil {
@@ -968,7 +967,7 @@ func TestSimulatorIntegration_IncrementalPreemption(t *testing.T) {
 				}
 			}
 			for _, pg := range tt.podGroups {
-				cs.Cache.AddPodGroup(pg)
+				cs.Cache.AddGenericPodGroup(fwk.NewGenericPodGroup(pg))
 			}
 
 			snap := cs.GetAssociatedSnapshot()

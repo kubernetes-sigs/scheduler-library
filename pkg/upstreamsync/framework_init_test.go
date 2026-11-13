@@ -203,10 +203,8 @@ func TestNewFrameworkMap(t *testing.T) {
 					SchedulerName: "default-scheduler",
 				},
 			}
-			pgInfo := &framework.PodGroupInfo{
-				PodGroup:        &schedulingv1beta1.PodGroup{},
-				UnscheduledPods: []*v1.Pod{pod},
-			}
+			pgInfo := framework.NewPodGroupInfo(fwk.NewGenericPodGroup(&schedulingv1beta1.PodGroup{}))
+			pgInfo.UnscheduledPods = []*v1.Pod{pod}
 			f, err := profileMap.FrameworkForPodGroup(pgInfo)
 			if err != nil {
 				t.Fatalf("FrameworkForPodGroup failed: %v", err)
@@ -216,9 +214,7 @@ func TestNewFrameworkMap(t *testing.T) {
 			}
 		})
 		t.Run("empty pod group returns error", func(t *testing.T) {
-			pgInfo := &framework.PodGroupInfo{
-				PodGroup: &schedulingv1beta1.PodGroup{},
-			}
+			pgInfo := framework.NewPodGroupInfo(fwk.NewGenericPodGroup(&schedulingv1beta1.PodGroup{}))
 			_, err := profileMap.FrameworkForPodGroup(pgInfo)
 			if err == nil {
 				t.Fatal("expected error for empty pod group, got nil")
@@ -372,7 +368,7 @@ func TestNewFrameworkMapPreemptionManager(t *testing.T) {
 				if !ok {
 					t.Fatalf("preemptionFrameworks has no entry for %q", prof.SchedulerName)
 				}
-				got := pf.PreemptionManager()
+				got := pf.SimPreemptionManager()
 				if !tt.withFactory {
 					if got != nil {
 						t.Errorf("profile %q: PreemptionManager() = %v, want nil", prof.SchedulerName, got)

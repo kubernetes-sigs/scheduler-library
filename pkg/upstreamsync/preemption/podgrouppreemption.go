@@ -69,7 +69,7 @@ func (ev *PodGroupEvaluator) evaluate(ctx context.Context, potentialVictims []Pr
 // The caller is expected to backup the NodeInfo before calling this function
 // And rollback the state to the backup after function is finished.
 func (ev *PodGroupEvaluator) Preempt(ctx context.Context, pgInfo fwk.PodGroupInfo, podGroupSchedulingFunc fwk.PodGroupSchedulingFunc) (*fwk.PodGroupPostFilterResult, *fwk.Status) {
-	preemptionManager := ev.Handle.PreemptionManager()
+	preemptionManager := ev.Handle.SimPreemptionManager()
 
 	if preemptionManager.Executor().IsPodGroupWaitingForVictims(pgInfo) {
 		return &fwk.PodGroupPostFilterResult{NominatingInfos: buildCurrentNominatingInfos(pgInfo)}, fwk.NewStatus(fwk.Success, "ongoing preemption on nominated nodes")
@@ -200,7 +200,7 @@ func (ev *PodGroupEvaluator) selectVictimsOnDomain(
 			validAssignment = append(validAssignment, assignment)
 		}
 	}
-	reprieveFilter := ev.Handle.PreemptionManager().NewReprieveFilter(ctx, potentialVictims)
+	reprieveFilter := ev.Handle.SimPreemptionManager().NewReprieveFilter(ctx, potentialVictims)
 	if reprieveFilter == nil {
 		return nil, fwk.NewStatus(fwk.Error, "got nil reprieve filter")
 	}
@@ -324,7 +324,7 @@ func toPodNames(pods []fwk.PodInfo) string {
 // currently set NNN for the preemptor pods
 func buildCurrentNominatingInfos(preemptor fwk.PodGroupInfo) map[types.NamespacedName]*fwk.NominatingInfo {
 	n := make(map[types.NamespacedName]*fwk.NominatingInfo)
-	for _, pod := range preemptor.GetUnscheduledPods() {
+	for _, pod := range preemptor.GetAllUnscheduledPods() {
 		podKey := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
 		n[podKey] = &fwk.NominatingInfo{
 			NominatingMode:    fwk.ModeOverride,

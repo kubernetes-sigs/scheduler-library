@@ -24,7 +24,6 @@ import (
 	"slices"
 
 	v1 "k8s.io/api/core/v1"
-	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
@@ -652,7 +651,7 @@ func buildFailedWorkloadPodResults(
 		if pgi == nil {
 			return
 		}
-		for _, child := range pgi.Children {
+		for _, child := range pgi.Children() {
 			walk(child)
 		}
 		groupResult, ok := algResultsMap[upstreamsync.GetEntityKey(pgi)]
@@ -732,7 +731,7 @@ func (s *ClusterSnapshot) RemovePodGroup(ctx context.Context, pg *schedulingv1be
 
 // AddCompositePodGroup adds a composite pod group object to the snapshot, linking it
 // to its parent composite pod group if present.
-func (s *ClusterSnapshot) AddCompositePodGroup(ctx context.Context, cpg *schedulingv1alpha3.CompositePodGroup) error {
+func (s *ClusterSnapshot) AddCompositePodGroup(ctx context.Context, cpg *schedulingv1beta1.CompositePodGroup) error {
 	if cpg == nil {
 		return fmt.Errorf("composite pod group is nil")
 	}
@@ -752,7 +751,7 @@ func (s *ClusterSnapshot) AddCompositePodGroup(ctx context.Context, cpg *schedul
 
 // RemoveCompositePodGroup removes a composite pod group object from the snapshot,
 // unlinking it from its parent composite pod group if present.
-func (s *ClusterSnapshot) RemoveCompositePodGroup(ctx context.Context, cpg *schedulingv1alpha3.CompositePodGroup) error {
+func (s *ClusterSnapshot) RemoveCompositePodGroup(ctx context.Context, cpg *schedulingv1beta1.CompositePodGroup) error {
 	if cpg == nil {
 		return fmt.Errorf("composite pod group is nil")
 	}
@@ -834,7 +833,7 @@ func (s *ClusterSnapshot) removePodGroup(pg *schedulingv1beta1.PodGroup) (*sched
 	return existingPG.DeepCopy(), nil
 }
 
-func (s *ClusterSnapshot) addCompositePodGroup(cpg *schedulingv1alpha3.CompositePodGroup) error {
+func (s *ClusterSnapshot) addCompositePodGroup(cpg *schedulingv1beta1.CompositePodGroup) error {
 	key := fwk.CompositePodGroupKey(cpg.Namespace, cpg.Name)
 	rv := reflect.ValueOf(s.schedulerSnapshot).Elem()
 
@@ -849,7 +848,7 @@ func (s *ClusterSnapshot) addCompositePodGroup(cpg *schedulingv1alpha3.Composite
 	return nil
 }
 
-func (s *ClusterSnapshot) removeCompositePodGroup(cpg *schedulingv1alpha3.CompositePodGroup) (*schedulingv1alpha3.CompositePodGroup, error) {
+func (s *ClusterSnapshot) removeCompositePodGroup(cpg *schedulingv1beta1.CompositePodGroup) (*schedulingv1beta1.CompositePodGroup, error) {
 	key := fwk.CompositePodGroupKey(cpg.Namespace, cpg.Name)
 	rv := reflect.ValueOf(s.schedulerSnapshot).Elem()
 	cpgsMap := writableField(rv, "compositePodGroupStates")
@@ -859,7 +858,7 @@ func (s *ClusterSnapshot) removeCompositePodGroup(cpg *schedulingv1alpha3.Compos
 	if !cpgs.IsValid() || cpgs.Elem().FieldByName("compositePodGroup").IsNil() {
 		return nil, fmt.Errorf("composite pod group %s not found in snapshot", key)
 	}
-	existingCPG := writableField(cpgs.Elem(), "compositePodGroup").Interface().(*schedulingv1alpha3.CompositePodGroup)
+	existingCPG := writableField(cpgs.Elem(), "compositePodGroup").Interface().(*schedulingv1beta1.CompositePodGroup)
 	writableField(cpgs.Elem(), "compositePodGroup").SetZero()
 	if compositePodGroupEmpty(cpgs) {
 		cpgsMap.SetMapIndex(keyVal, reflect.Value{})

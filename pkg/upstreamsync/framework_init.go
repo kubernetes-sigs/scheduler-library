@@ -30,6 +30,7 @@ import (
 	corev1informers "k8s.io/client-go/informers/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+	draapi "k8s.io/dynamic-resource-allocation/api"
 	"k8s.io/dynamic-resource-allocation/deviceclass/extendedresourcecache"
 	resourceslicetracker "k8s.io/dynamic-resource-allocation/resourceslice/tracker"
 	"k8s.io/klog/v2"
@@ -47,9 +48,11 @@ import (
 	frameworkplugins "k8s.io/kubernetes/pkg/scheduler/framework/plugins"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/defaultpreemption"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/dynamicresources"
+	plfeature "k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/noderesources"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodevolumelimits"
+	upstreampreemptionpkg "k8s.io/kubernetes/pkg/scheduler/framework/preemption"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
 	"k8s.io/kubernetes/pkg/scheduler/profile"
@@ -85,8 +88,7 @@ type FrameworkComponents struct {
 	apiDispatcher   *apidispatcher.APIDispatcher
 	metricsRecorder *metrics.MetricAsyncRecorder
 
-	// DRA components required for registering event handlers. Nil unless
-	// DynamicResourceAllocation feature gate is enabled.
+	// DRA components required for registering event handlers.
 	// UPSTREAM-DIFF: resourceClaimCache, resourceSliceTracker, and extendedResourceCache are never
 	// mutated by the scheduler outside of PreBind, so they are created and registered on informers
 	// once in FrameworkComponents. Each ProfileMap gets its own draManager (claimTracker) to isolate
@@ -173,38 +175,35 @@ func newFrameworkComponents(ctx context.Context,
 
 	metricsRecorder := metrics.NewMetricsAsyncRecorder(1000, time.Second, stopEverything)
 
-	var resourceClaimCache *assumecache.AssumeCache
-	var resourceSliceTracker *resourceslicetracker.Tracker
 	var extendedResourceCache *extendedresourcecache.ExtendedResourceCache
 	var registeredHandlers []cache.ResourceEventHandlerRegistration
-	if feature.DefaultFeatureGate.Enabled(features.DynamicResourceAllocation) {
-		resourceClaimInformer := informerFactory.Resource().V1().ResourceClaims().Informer()
-		resourceClaimCache = assumecache.NewAssumeCache(logger, resourceClaimInformer, "ResourceClaim", "", nil)
-		resourceSliceTrackerOpts := resourceslicetracker.Options{
-			EnableDeviceTaintRules:   feature.DefaultFeatureGate.Enabled(features.DRADeviceTaintRules),
-			EnableConsumableCapacity: feature.DefaultFeatureGate.Enabled(features.DRAConsumableCapacity),
-			SliceInformer:            informerFactory.Resource().V1().ResourceSlices(),
-			KubeClient:               client,
-		}
-		// If device taint rules are disabled, the additional informers are not needed and
-		// the tracker turns into a simple wrapper around the slice informer.
-		if resourceSliceTrackerOpts.EnableDeviceTaintRules {
-			resourceSliceTrackerOpts.TaintInformer = informerFactory.Resource().V1().DeviceTaintRules()
-		}
-		var err error
-		resourceSliceTracker, err = resourceslicetracker.StartTracker(ctx, resourceSliceTrackerOpts)
+	resourceClaimInformer := informerFactory.Resource().V1().ResourceClaims().Informer()
+	resourceClaimCache := assumecache.NewAssumeCache(logger, resourceClaimInformer, "ResourceClaim", "", nil)
+	sliceInformer := draapi.NewInformerForResourceSlice(informerFactory)
+	resourceSliceTrackerOpts := resourceslicetracker.Options{
+		EnableDeviceTaintRules:   feature.DefaultFeatureGate.Enabled(features.DRADeviceTaintRules),
+		EnableConsumableCapacity: feature.DefaultFeatureGate.Enabled(features.DRAConsumableCapacity),
+		SliceLister:              draapi.NewResourceSliceLister(sliceInformer.GetIndexer()),
+		SliceInformer:            sliceInformer,
+		KubeClient:               client,
+	}
+	// If device taint rules are disabled, the additional informers are not needed and
+	// the tracker turns into a simple wrapper around the slice informer.
+	if resourceSliceTrackerOpts.EnableDeviceTaintRules {
+		resourceSliceTrackerOpts.TaintInformer = informerFactory.Resource().V1().DeviceTaintRules()
+	}
+	resourceSliceTracker, err := resourceslicetracker.StartTracker(ctx, resourceSliceTrackerOpts)
+	if err != nil {
+		return nil, fmt.Errorf("couldn't start resource slice tracker: %w", err)
+	}
+	registeredHandlers = append(registeredHandlers, resourceSliceTracker, resourceClaimCache.AddEventHandler(cache.ResourceEventHandlerFuncs{}))
+	if feature.DefaultFeatureGate.Enabled(features.DRAExtendedResource) {
+		extendedResourceCache = extendedresourcecache.NewExtendedResourceCache(logger)
+		reg, err := informerFactory.Resource().V1().DeviceClasses().Informer().AddEventHandler(extendedResourceCache)
 		if err != nil {
-			return nil, fmt.Errorf("couldn't start resource slice tracker: %w", err)
+			return nil, fmt.Errorf("couldn't add event handler for DeviceClass extendedResourceCache: %w", err)
 		}
-		registeredHandlers = append(registeredHandlers, resourceSliceTracker, resourceClaimCache.AddEventHandler(cache.ResourceEventHandlerFuncs{}))
-		if feature.DefaultFeatureGate.Enabled(features.DRAExtendedResource) {
-			extendedResourceCache = extendedresourcecache.NewExtendedResourceCache(logger)
-			reg, err := informerFactory.Resource().V1().DeviceClasses().Informer().AddEventHandler(extendedResourceCache)
-			if err != nil {
-				return nil, fmt.Errorf("couldn't add event handler for DeviceClass extendedResourceCache: %w", err)
-			}
-			registeredHandlers = append(registeredHandlers, reg)
-		}
+		registeredHandlers = append(registeredHandlers, reg)
 	}
 
 	var apiDispatcher *apidispatcher.APIDispatcher
@@ -288,10 +287,7 @@ func buildExtenders(logger klog.Logger, extenders []schedulerapi.Extender, profi
 
 // ProfileMap holds one framework.Framework per scheduler name.
 //
-// UPSTREAM-DIFF: in upstream PR #140908, FrameworkForPod is a method on profile.Map
-// (func (m Map) FrameworkForPod(pod *v1.Pod) (framework.Framework, error)).
-// Because k8s.io/kubernetes v1.37.0 does not yet include that method on profile.Map,
-// ProfileMap embeds profile.Map to attach FrameworkForPod and FrameworkForPodGroup.
+// UPSTREAM-DIFF: embeds profile.Map to attach FrameworkForPodGroup.
 type ProfileMap struct {
 	profile.Map
 	// preemptionFrameworks stores one PreemptionFramework wrapper per profile so that
@@ -311,19 +307,6 @@ func getProfileName(pod *v1.Pod) string {
 	return name
 }
 
-// FrameworkForPod returns the framework registered for the pod's scheduler
-// name. An empty scheduler name falls back to the default scheduler — this
-// cannot happen for pods observed via the API (the field is defaulted there),
-// but can for synthetic pods used in scheduling simulations.
-func (p *ProfileMap) FrameworkForPod(pod *v1.Pod) (framework.Framework, error) {
-	name := getProfileName(pod)
-	f, ok := p.Map[name]
-	if !ok {
-		return nil, fmt.Errorf("profile not found for scheduler name %q", name)
-	}
-	return f, nil
-}
-
 // FrameworkForPodGroup returns the framework of the profile requested by the pod group,
 // defaulting to the default scheduler name when its member pods do not name one.
 //
@@ -332,7 +315,7 @@ func (p *ProfileMap) FrameworkForPod(pod *v1.Pod) (framework.Framework, error) {
 // Migration Plan (1.38): Change return type to (framework.Framework, error) and delegate
 // directly to p.FrameworkForPod(pods[0]).
 func (p *ProfileMap) FrameworkForPodGroup(podGroupInfo *framework.PodGroupInfo) (*preemption.PreemptionFramework, error) {
-	pods := podGroupInfo.GetUnscheduledPods()
+	pods := podGroupInfo.GetAllUnscheduledPods()
 	if len(pods) == 0 {
 		return nil, fmt.Errorf("no pods in pod group")
 	}
@@ -414,12 +397,16 @@ func NewFrameworkMap(
 	// resourceSliceTracker, and extendedResourceCache initialized in FrameworkComponents, unless
 	// the caller supplied one with WithSharedDRAManager.
 	draManager := mapOptions.sharedDRAManager
-	if draManager == nil && feature.DefaultFeatureGate.Enabled(features.DynamicResourceAllocation) {
+	if draManager == nil {
 		baseDRAManager := dynamicresources.NewDRAManager(ctx, c.resourceClaimCache, c.resourceSliceTracker, c.informerFactory)
 		draManager = &sharedResolverDRAManager{
 			DefaultDRAManager: baseDRAManager,
 			resolver:          c.extendedResourceCache,
 		}
+	}
+
+	preemptionManagerFactory := func(fh fwk.Handle) fwk.PreemptionManager {
+		return upstreampreemptionpkg.NewPreemptionManager(fh, plfeature.NewSchedulerFeaturesFromGates(feature.DefaultFeatureGate))
 	}
 
 	opts := []frameworkruntime.Option{
@@ -442,7 +429,8 @@ func NewFrameworkMap(
 		// because at the moment of creating ProfileMap the snapshot is already created. On the
 		// scheduler side, this should be configurable because the scheduler does not have a
 		// snapshot created yet when building the profile map.
-		frameworkruntime.WithPodGroupManager(snapshot),
+		frameworkruntime.WithPodGroupManager(&snapshotPodGroupManager{Snapshot: snapshot}),
+		frameworkruntime.WithPreemptionManager(preemptionManagerFactory),
 	}
 
 	preemptionFrameworks := wrapRegistryForPreemption(registry, len(c.options.profiles), mapOptions.preemptionManagerFactory)
@@ -471,6 +459,21 @@ type sharedResolverDRAManager struct {
 
 func (m *sharedResolverDRAManager) DeviceClassResolver() fwk.DeviceClassResolver {
 	return m.resolver
+}
+
+// UPSTREAM-DIFF: snapshotPodGroupManager wraps *internalcache.Snapshot to satisfy
+// fwk.PodGroupManager. Embedding *internalcache.Snapshot provides PodGroups(),
+// PodGroupStates(), CompositePodGroups(), and CompositePodGroupStates(); FindRootGroup
+// is only called by DefaultPreemption.PreEnqueue in upstream and is never called in
+// scheduler-library because the library has no scheduling queue and never runs PreEnqueue.
+type snapshotPodGroupManager struct {
+	*internalcache.Snapshot
+}
+
+var _ fwk.PodGroupManager = &snapshotPodGroupManager{}
+
+func (m *snapshotPodGroupManager) FindRootGroup(fwk.EntityKey) (*fwk.GenericPodGroup, error) {
+	return nil, errors.New("not implemented")
 }
 
 // UPSTREAM-DIFF: dedupPodIndexerInformerFactory wraps SharedInformerFactory so that calling

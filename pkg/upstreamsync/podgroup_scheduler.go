@@ -260,11 +260,11 @@ func (sched *Scheduler) podGroupSchedulingRecursiveAlgorithm(
 	results map[fwk.EntityKey]*PodGroupAlgorithmResult,
 ) (*PodGroupAlgorithmResult, revertFns) {
 	logger := klog.FromContext(ctx)
-	logger.V(5).Info("Running recursive podgroup scheduling algorithm", "rootType", podGroupInfo.Type, "root", klog.KObj(podGroupInfo))
+	logger.V(5).Info("Running recursive podgroup scheduling algorithm", "rootType", podGroupInfo.GetType(), "root", klog.KObj(podGroupInfo))
 
 	var algorithmResult *PodGroupAlgorithmResult
 	var childRevertFns revertFns
-	if podGroupInfo.Type == fwk.PodGroupKeyType {
+	if podGroupInfo.GetType() == fwk.PodGroupKeyType {
 		algorithmResult, childRevertFns = sched.podGroupSchedulingAlgorithm(ctx, schedFwk, podGroupCycleState, podGroupInfo)
 		results[GetEntityKey(podGroupInfo)] = algorithmResult
 	} else {
@@ -349,7 +349,7 @@ func (sched *Scheduler) compositePodGroupSchedulingPlacementAlgorithm(
 			}, nil
 		}
 		placementCycleState := framework.NewCycleState()
-		placementCycleState.SetPodGroupSchedulingCycle(podGroupCycleState)
+		placementCycleState.SetPodGroupCycleState(podGroupCycleState)
 		subtreeResult := map[fwk.EntityKey]*PodGroupAlgorithmResult{}
 		result, placementRevertFns := sched.compositePodGroupSchedulingDefaultAlgorithm(ctx, schedFwk, placementCycleState, root, podGroupInfo, subtreeResult)
 		placementRevertFns.revert()
@@ -442,8 +442,8 @@ func (sched *Scheduler) compositePodGroupSchedulingDefaultAlgorithm(
 
 	// Run PlacementFeasible plugins to check if the composite pod group can meet its constraints
 	// before even attempting to schedule any children.
-	placementProgress := framework.PlacementProgress{
-		Remaining: len(podGroupInfo.Children),
+	placementProgress := fwk.PlacementProgress{
+		Remaining: len(podGroupInfo.Children()),
 	}
 	// UPSTREAM-DIFF: cherry-picked from Kubernetes 1.38 schedule_one_podgroup.go (ahead of v1.37.0):
 	// delegates to podGroupPotentiallyFeasible.
@@ -459,7 +459,7 @@ func (sched *Scheduler) compositePodGroupSchedulingDefaultAlgorithm(
 	}
 
 	anyScheduled := false
-	for _, childPGInfo := range podGroupInfo.GetChildGroups() {
+	for _, childPGInfo := range podGroupInfo.Children() {
 		childPodGroupState := framework.NewCycleState()
 		childPodGroupState.SetPlacementCycleState(placementCycleState)
 		childResult, childRevertFns := sched.podGroupSchedulingRecursiveAlgorithm(ctx, schedFwk, childPodGroupState, root, childPGInfo, results)
@@ -475,6 +475,8 @@ func (sched *Scheduler) compositePodGroupSchedulingDefaultAlgorithm(
 		placementProgress.Remaining--
 		if childResult.Status.IsSuccess() {
 			placementProgress.Scheduled++
+		} else {
+			placementProgress.Unschedulable++
 		}
 		// UPSTREAM-DIFF: cherry-picked from Kubernetes 1.38 schedule_one_podgroup.go (ahead of v1.37.0):
 		// delegates to podGroupPotentiallyFeasible.
@@ -515,7 +517,7 @@ func (sched *Scheduler) podGroupSchedulingAlgorithm(
 	// still runs in a single implicit placement context so placement-scoped
 	// extension points can use the same state plumbing as TAS.
 	placementCycleState := framework.NewCycleState()
-	placementCycleState.SetPodGroupSchedulingCycle(podGroupCycleState)
+	placementCycleState.SetPodGroupCycleState(podGroupCycleState)
 	return sched.podGroupSchedulingDefaultAlgorithm(podGroupCycleCtx, schedFwk, placementCycleState, podGroupInfo)
 }
 
@@ -554,7 +556,7 @@ func (sched *Scheduler) podGroupSchedulingPlacementAlgorithm(
 			Status:       status,
 		}, nil
 	}
-	metrics.RecordGeneratedPlacements(schedFwk.ProfileName(), len(placements))
+	metrics.RecordGeneratedPlacements(schedFwk.ProfileName(), string(podGroupInfo.GetType()), len(placements))
 
 	var anyResult *PodGroupAlgorithmResult
 	successfulResults := make(map[*fwk.Placement]*PodGroupAlgorithmResult)
@@ -581,7 +583,7 @@ func (sched *Scheduler) podGroupSchedulingPlacementAlgorithm(
 		}
 
 		placementCycleState := framework.NewCycleState()
-		placementCycleState.SetPodGroupSchedulingCycle(podGroupCycleState)
+		placementCycleState.SetPodGroupCycleState(podGroupCycleState)
 		result, placementRevertFns := sched.podGroupSchedulingDefaultAlgorithm(ctx, schedFwk, placementCycleState, podGroupInfo)
 		placementRevertFns.revert()
 
@@ -600,7 +602,7 @@ func (sched *Scheduler) podGroupSchedulingPlacementAlgorithm(
 			evaluationResult = metrics.FeasibleResult
 			successfulResults[placement] = result
 		}
-		metrics.ObservePlacementEvaluation(evaluationResult, schedFwk.ProfileName(), metrics.SinceInSeconds(evaluationStart))
+		metrics.ObservePlacementEvaluation(evaluationResult, schedFwk.ProfileName(), string(podGroupInfo.GetType()), metrics.SinceInSeconds(evaluationStart))
 	}
 
 	if len(successfulResults) == 0 {
@@ -684,7 +686,7 @@ func (sched *Scheduler) podGroupSchedulingDefaultAlgorithm(
 		}
 	}()
 
-	unscheduledPods := podGroupInfo.GetUnscheduledPods()
+	unscheduledPods := podGroupInfo.GetAllUnscheduledPods()
 
 	result = &PodGroupAlgorithmResult{
 		PodGroupInfo:        podGroupInfo,
@@ -696,7 +698,7 @@ func (sched *Scheduler) podGroupSchedulingDefaultAlgorithm(
 	logger := klog.FromContext(ctx)
 	logger.V(5).Info("Running a pod group scheduling algorithm", "podGroup", klog.KObj(podGroupInfo), "unscheduledPodsCount", len(unscheduledPods))
 
-	podGroupState, err := sched.nodeInfoSnapshot.PodGroupStates().Get(podGroupInfo.Namespace, podGroupInfo.Name)
+	podGroupState, err := sched.nodeInfoSnapshot.PodGroupStates().Get(podGroupInfo.GetNamespace(), podGroupInfo.GetName())
 	if err != nil {
 		result.Status = fwk.AsStatus(fmt.Errorf("failed to get podGroup state for podGroup %s to compute gang feasibility: %w", klog.KObj(podGroupInfo), err))
 		return result, nil
@@ -704,8 +706,8 @@ func (sched *Scheduler) podGroupSchedulingDefaultAlgorithm(
 
 	// Run PlacementFeasible plugins to check if the pod group can meet its constraints
 	// before even attempting to schedule any pods.
-	placementProgress := framework.PlacementProgress{
-		Remaining: len(podGroupInfo.GetUnscheduledPods()),
+	placementProgress := fwk.PlacementProgress{
+		Remaining: len(podGroupInfo.GetAllUnscheduledPods()),
 		Scheduled: podGroupState.ScheduledPodsCount(),
 	}
 	// UPSTREAM-DIFF: cherry-picked from Kubernetes 1.38 schedule_one_podgroup.go (ahead of v1.37.0):
@@ -736,6 +738,8 @@ func (sched *Scheduler) podGroupSchedulingDefaultAlgorithm(
 		placementProgress.Remaining--
 		if podResult.status.IsSuccess() {
 			placementProgress.Scheduled++
+		} else {
+			placementProgress.Unschedulable++
 		}
 		// UPSTREAM-DIFF: cherry-picked from Kubernetes 1.38 schedule_one_podgroup.go (ahead of v1.37.0):
 		// delegates to podGroupPotentiallyFeasible.
@@ -759,7 +763,7 @@ func (sched *Scheduler) podGroupSchedulingDefaultAlgorithm(
 // Returned status is modified to be fine to be copied directly to the podGroupAlgorithmResult.
 //
 // UPSTREAM-DIFF: copied verbatim from Kubernetes 1.38 schedule_one_podgroup.go (ahead of v1.37.0).
-func podGroupPotentiallyFeasible(ctx context.Context, schedFwk framework.Framework, placementCycleState *framework.CycleState, podGroupInfo *framework.PodGroupInfo, placementProgress framework.PlacementProgress) (bool, *fwk.Status) {
+func podGroupPotentiallyFeasible(ctx context.Context, schedFwk framework.Framework, placementCycleState *framework.CycleState, podGroupInfo *framework.PodGroupInfo, placementProgress fwk.PlacementProgress) (bool, *fwk.Status) {
 	status := schedFwk.RunPlacementFeasiblePlugins(ctx, placementCycleState, podGroupInfo, placementProgress)
 	switch status.Code() {
 	case fwk.Error:
@@ -802,7 +806,7 @@ func (sched *Scheduler) podGroupPodSchedulingAlgorithm(
 		}, nil
 	}
 	podCycleState := framework.NewCycleState()
-	podCycleState.SetPodGroupSchedulingCycle(placementCycleState.GetPodGroupSchedulingCycle())
+	podCycleState.SetPodGroupCycleState(placementCycleState.GetPodGroupCycleState())
 	podCycleState.SetPlacementCycleState(placementCycleState)
 
 	pendingPod := &PendingPod{
@@ -866,7 +870,7 @@ func CompletePodGroupAlgorithmResult(
 	podGroupState *framework.CycleState,
 	podGroupResult *PodGroupAlgorithmResult,
 ) *PodGroupAlgorithmResult {
-	unscheduledPods := podGroupResult.PodGroupInfo.GetUnscheduledPods()
+	unscheduledPods := podGroupResult.PodGroupInfo.GetAllUnscheduledPods()
 	numInResult := len(podGroupResult.PodResults)
 	numInQueue := len(unscheduledPods)
 	// UPSTREAM-DIFF: upstream currently overwrites successful pod statuses with the failed
@@ -894,9 +898,9 @@ func CompletePodGroupAlgorithmResult(
 			continue
 		}
 		placementCycleState := framework.NewCycleState()
-		placementCycleState.SetPodGroupSchedulingCycle(podGroupState)
+		placementCycleState.SetPodGroupCycleState(podGroupState)
 		podCycleState := framework.NewCycleState()
-		podCycleState.SetPodGroupSchedulingCycle(podGroupState)
+		podCycleState.SetPodGroupCycleState(podGroupState)
 		podCycleState.SetPlacementCycleState(placementCycleState)
 		newResults[i] = AlgorithmResult{
 			pod:        pod,
@@ -969,7 +973,7 @@ func completeCompositePodGroupAlgorithmResultMap(
 		failedAncestor = result
 	}
 
-	for _, child := range podGroupInfo.Children {
+	for _, child := range podGroupInfo.Children() {
 		completeCompositePodGroupAlgorithmResultMap(child, pgResults, failedAncestor)
 	}
 }
@@ -1011,7 +1015,7 @@ func SuccessfulLeafResults(root *framework.PodGroupInfo, results map[fwk.EntityK
 				return true
 			}
 
-			for _, child := range pgi.Children {
+			for _, child := range pgi.Children() {
 				if !walk(child) {
 					return false
 				}
@@ -1161,8 +1165,5 @@ func makeCompositePodGroupAssignments(
 //
 // UPSTREAM-DIFF: adapted from pgKey; exported for use by pkg/upstreamsync/snapshot.
 func GetEntityKey(pgi *framework.PodGroupInfo) fwk.EntityKey {
-	if pgi.Type == fwk.CompositePodGroupKeyType {
-		return fwk.CompositePodGroupKey(pgi.Namespace, pgi.Name)
-	}
-	return fwk.PodGroupKey(pgi.Namespace, pgi.Name)
+	return pgi.GetKey()
 }

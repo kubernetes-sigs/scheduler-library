@@ -19,7 +19,6 @@ import (
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
-	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
@@ -143,7 +142,7 @@ func SetupSnapshotTestWithPodGroups(
 	pods []*v1.Pod,
 	nodes []*v1.Node,
 	podGroups []*schedulingv1beta1.PodGroup,
-	compositePodGroups []*schedulingv1alpha3.CompositePodGroup,
+	compositePodGroups []*schedulingv1beta1.CompositePodGroup,
 	opts ...SnapshotTestOption,
 ) (*upstreamsync.ProfileMap, *cache.Snapshot, error) {
 	var testOpts snapshotTestOptions
@@ -212,7 +211,7 @@ func SetupSnapshotTestWithPodGroups(
 		features.CompositePodGroup:               true,
 	})
 
-	snap := cache.NewTestSnapshotWithCompositePodGroups(pods, nodes, podGroups, compositePodGroups)
+	snap := cache.NewTestSnapshotWithPodGroups(pods, nodes, podGroups, compositePodGroups)
 	informerFactory := informers.NewSharedInformerFactory(client, 0)
 	registry, err := framework.SimulatorRegistry()
 	if err != nil {

@@ -38,8 +38,8 @@ import (
 // Migration Plan (1.38): Delete this interface and use fwk.Handle directly.
 type Handle interface {
 	fwk.Handle
-	// PreemptionManager returns the PreemptionManager for the current scheduling cycle.
-	PreemptionManager() PreemptionManager
+	// SimPreemptionManager returns the PreemptionManager for the current scheduling cycle.
+	SimPreemptionManager() PreemptionManager
 }
 
 // PreemptionManagerFactory defines a factory function to create a PreemptionManager given a Handle.
@@ -68,7 +68,7 @@ func NewPreemptionFramework(fw framework.Framework, preemptionManagerFactory Pre
 	return f
 }
 
-// PreemptionManager returns the PreemptionManager currently configured on the framework.
-func (f *PreemptionFramework) PreemptionManager() PreemptionManager {
+// SimPreemptionManager returns the PreemptionManager currently configured on the framework.
+func (f *PreemptionFramework) SimPreemptionManager() PreemptionManager {
 	return f.pm
 }

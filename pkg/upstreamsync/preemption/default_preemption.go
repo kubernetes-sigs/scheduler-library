@@ -50,7 +50,7 @@ func NewDefaultPreemption(dp *defaultpreemption.DefaultPreemption, fh Handle) *D
 // PodGroupPostFilter runs a default preemption for the pod group.
 func (pl *DefaultPreemption) PodGroupPostFilter(ctx context.Context, state fwk.PodGroupCycleState, pgInfo fwk.PodGroupInfo, pgSchedulingFunc fwk.PodGroupSchedulingFunc) (postFilterResult *fwk.PodGroupPostFilterResult, status *fwk.Status) {
 	defer func() {
-		metrics.WorkloadPreemptionAttempts.WithLabelValues(status.Code().String()).Inc()
+		metrics.WorkloadPreemptionAttempts.WithLabelValues(metrics.EntityTypeToLabel(pgInfo.GetType()), status.Code().String()).Inc()
 	}()
 
 	mutableLister := pl.fh.MutableSnapshotSharedLister()

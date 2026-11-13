@@ -102,13 +102,9 @@ var _ fwk.FilterPlugin = &mockFilterPlugin{}
 
 func makePodGroupPreemptor(pg *schedulingv1beta1.PodGroup, pods []*v1.Pod) fwk.PodGroupInfo {
 	pgCopy := pg.DeepCopy()
-	return &framework.PodGroupInfo{
-		Namespace:       pgCopy.Namespace,
-		Name:            pgCopy.Name,
-		Type:            fwk.PodGroupKeyType,
-		PodGroup:        pgCopy,
-		UnscheduledPods: pods,
-	}
+	pgi := framework.NewPodGroupInfo(fwk.NewGenericPodGroup(pgCopy))
+	pgi.UnscheduledPods = pods
+	return pgi
 }
 
 type mockVictim struct {
@@ -1071,8 +1067,7 @@ func TestPodGroupEvaluator_Preempt_Victims(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
-				features.GenericWorkload:          true,
-				features.PodGroupPreemptionPolicy: true,
+				features.GenericWorkload: true,
 			})
 			logger, ctx := ktesting.NewTestContext(t)
 
@@ -1088,7 +1083,7 @@ func TestPodGroupEvaluator_Preempt_Victims(t *testing.T) {
 				tf.RegisterBindPlugin(defaultbinder.Name, defaultbinder.New),
 			)
 			var objs []runtime.Object
-			for _, p := range append(tt.initPods, tt.preemptor.GetUnscheduledPods()...) {
+			for _, p := range append(tt.initPods, tt.preemptor.GetAllUnscheduledPods()...) {
 				objs = append(objs, p)
 			}
 			for _, n := range tt.nodes {
@@ -1098,7 +1093,7 @@ func TestPodGroupEvaluator_Preempt_Victims(t *testing.T) {
 			parallelism := parallelize.DefaultParallelism
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
-			snapshot := internalcache.NewTestSnapshotWithPodGroups(tt.initPods, tt.nodes, tt.initPodGroups)
+			snapshot := internalcache.NewTestSnapshotWithPodGroups(tt.initPods, tt.nodes, tt.initPodGroups, nil)
 			mockPM := &mockPreemptionManager{
 				victims:           tt.potentialVictims,
 				nilReprieveFilter: tt.nilReprieveFilter,
@@ -1149,7 +1144,7 @@ func TestPodGroupEvaluator_Preempt_Victims(t *testing.T) {
 
 				nodeIdx := 0
 				numNodes := len(tt.nodes)
-				for _, p := range tt.preemptor.GetUnscheduledPods() {
+				for _, p := range tt.preemptor.GetAllUnscheduledPods() {
 					pSize := getCapacity(p)
 					for step := range numNodes {
 						i := (nodeIdx + step) % numNodes
@@ -1388,7 +1383,6 @@ func TestPodGroupEvaluator_Preempt(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.GenericWorkload, true)
-			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PodGroupPreemptionPolicy, true)
 			logger, ctx := ktesting.NewTestContext(t)
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
@@ -1405,7 +1399,7 @@ func TestPodGroupEvaluator_Preempt(t *testing.T) {
 				tf.RegisterQueueSortPlugin(queuesort.Name, queuesort.New),
 				tf.RegisterBindPlugin(defaultbinder.Name, defaultbinder.New),
 			}
-			snapshot := internalcache.NewTestSnapshotWithPodGroups(tt.initPods, tt.nodes, tt.initPodGroups)
+			snapshot := internalcache.NewTestSnapshotWithPodGroups(tt.initPods, tt.nodes, tt.initPodGroups, nil)
 			f, err := tf.NewFramework(
 				ctx,
 				registeredPlugins, "",

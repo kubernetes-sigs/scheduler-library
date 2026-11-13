@@ -86,7 +86,7 @@ func (n *noopPodNominator) AddNominatedPod(logger klog.Logger, pod fwk.PodInfo, 
 func (n *noopPodNominator) DeleteNominatedPodIfExists(pod *v1.Pod) {}
 func (n *noopPodNominator) UpdateNominatedPod(logger klog.Logger, oldPod *v1.Pod, newPodInfo fwk.PodInfo) {
 }
-func (n *noopPodNominator) NominatedPodsForNode(nodeName string) []fwk.PodInfo {
+func (n *noopPodNominator) NominatedPodsForNode(logger klog.Logger, nodeName string) []fwk.PodInfo {
 	return nil
 }
 
