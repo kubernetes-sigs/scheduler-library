@@ -36,7 +36,7 @@ func TestCommittedVictimPlugin_Filter(t *testing.T) {
 			name: "unset data in cycle state allows all nodes to pass",
 			cycleState: func() fwk.CycleState {
 				c := framework.NewCycleState()
-				c.SetPodGroupSchedulingCycle(framework.NewCycleState())
+				c.SetPodGroupCycleState(framework.NewCycleState())
 				return c
 			}(),
 			nodes: []*v1.Node{
@@ -72,7 +72,7 @@ func TestCommittedVictimPlugin_Filter(t *testing.T) {
 				if err := preemption.SetCommittedVictimsInCycleState(pgc, []preemption.PreemptionVictim{}); err != nil {
 					t.Fatalf("SetCommittedVictimsInCycleState failed: %v", err)
 				}
-				c.SetPodGroupSchedulingCycle(pgc)
+				c.SetPodGroupCycleState(pgc)
 				return c
 			}(),
 			nodes: []*v1.Node{
@@ -107,7 +107,7 @@ func TestCommittedVictimPlugin_Filter(t *testing.T) {
 				}); err != nil {
 					t.Fatalf("SetCommittedVictimsInCycleState failed: %v", err)
 				}
-				c.SetPodGroupSchedulingCycle(pgc)
+				c.SetPodGroupCycleState(pgc)
 				return c
 			}(),
 			nodes: []*v1.Node{
@@ -138,19 +138,19 @@ func TestCommittedVictimPlugin_Filter(t *testing.T) {
 				}
 
 				rootPlacement := framework.NewCycleState()
-				rootPlacement.SetPodGroupSchedulingCycle(rootPGC)
+				rootPlacement.SetPodGroupCycleState(rootPGC)
 
 				midPGC := framework.NewCycleState()
 				midPGC.SetPlacementCycleState(rootPlacement)
 
 				midPlacement := framework.NewCycleState()
-				midPlacement.SetPodGroupSchedulingCycle(midPGC)
+				midPlacement.SetPodGroupCycleState(midPGC)
 
 				leafPGC := framework.NewCycleState()
 				leafPGC.SetPlacementCycleState(midPlacement)
 
 				podState := framework.NewCycleState()
-				podState.SetPodGroupSchedulingCycle(leafPGC)
+				podState.SetPodGroupCycleState(leafPGC)
 				return podState
 			}(),
 			nodes: []*v1.Node{

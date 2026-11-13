@@ -169,14 +169,15 @@ func TestDefaultPreemption_PodGroupPostFilter(t *testing.T) {
 			}
 
 			metricLabel := tt.expectedStatus.Code().String()
-			beforeMetric, err := testutil.GetCounterMetricValue(metrics.WorkloadPreemptionAttempts.WithLabelValues(metricLabel))
+			entityTypeLabel := metrics.EntityTypeToLabel(pgInfo.GetType())
+			beforeMetric, err := testutil.GetCounterMetricValue(metrics.WorkloadPreemptionAttempts.WithLabelValues(entityTypeLabel, metricLabel))
 			if err != nil {
 				t.Fatalf("Failed to read WorkloadPreemptionAttempts metric: %v", err)
 			}
 
 			gotResult, gotStatus := dp.PodGroupPostFilter(ctx, framework.NewCycleState(), pgInfo, schedulingFunc)
 
-			afterMetric, err := testutil.GetCounterMetricValue(metrics.WorkloadPreemptionAttempts.WithLabelValues(metricLabel))
+			afterMetric, err := testutil.GetCounterMetricValue(metrics.WorkloadPreemptionAttempts.WithLabelValues(entityTypeLabel, metricLabel))
 			if err != nil {
 				t.Fatalf("Failed to read WorkloadPreemptionAttempts metric: %v", err)
 			}

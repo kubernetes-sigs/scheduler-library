@@ -106,7 +106,7 @@ func scheduleOnePod(ctx context.Context, profiles *upstreamsync.ProfileMap, sche
 	}
 
 	cycleState := framework.NewCycleState()
-	cycleState.SetPodGroupSchedulingCycle(framework.NewCycleState())
+	cycleState.SetPodGroupCycleState(framework.NewCycleState())
 	podInfo, err := framework.NewPodInfo(pod)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create pod info for pod %s: %w", klog.KObj(pod), err)

@@ -47,11 +47,11 @@ func EvaluateWorkloadPreemption(
 	baseSchedulingFunc fwk.PodGroupSchedulingFunc,
 	opts WorkloadPreemptionOptions,
 ) (*fwk.PodGroupAssignments, []PreemptionVictim, *fwk.Status) {
-	pm, ok := schedFramework.PreemptionManager().(*prefixPreemptionManager)
+	pm, ok := schedFramework.SimPreemptionManager().(*prefixPreemptionManager)
 	if !ok {
 		return nil, nil, fwk.AsStatus(fmt.Errorf(
 			"unexpected PreemptionManager type %T, want one from NewPrefixPreemptionManager",
-			schedFramework.PreemptionManager()))
+			schedFramework.SimPreemptionManager()))
 	}
 	if opts.PotentialVictims == nil {
 		return nil, nil, fwk.NewStatus(fwk.Unschedulable)

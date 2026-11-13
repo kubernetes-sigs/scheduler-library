@@ -335,7 +335,7 @@ func TestEvaluateWorkloadPreemption(t *testing.T) {
 			if !slices.Equal(gotVictims, tt.wantVictims) {
 				t.Errorf("EvaluateWorkloadPreemption() victims = %v, want %v", gotVictims, tt.wantVictims)
 			}
-			if pm := schedFramework.PreemptionManager(); pm != nil {
+			if pm := schedFramework.SimPreemptionManager(); pm != nil {
 				if victims, _ := pm.GenerateVictims(ctx, podGroupInfo); len(victims) != 0 {
 					t.Errorf("GenerateVictims() after EvaluateWorkloadPreemption returned %d victims, want 0", len(victims))
 				}

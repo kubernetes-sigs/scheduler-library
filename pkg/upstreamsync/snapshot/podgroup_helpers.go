@@ -16,11 +16,9 @@ package snapshot
 
 import (
 	"fmt"
-	"maps"
 
 	"github.com/google/uuid"
 	v1 "k8s.io/api/core/v1"
-	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -126,14 +124,9 @@ func buildPodGroupInfosMap(
 		}
 		key := fwk.PodGroupKey(namespace, pgName)
 
-		podGroupInfosMap[key] = &framework.PodGroupInfo{
-			Namespace:       namespace,
-			Name:            pgName,
-			Type:            fwk.PodGroupKeyType,
-			PodGroup:        pg,
-			UnscheduledPods: pgPods,
-			Children:        make([]*framework.PodGroupInfo, 0),
-		}
+		pgi := framework.NewPodGroupInfo(fwk.NewGenericPodGroup(pg))
+		pgi.UnscheduledPods = pgPods
+		podGroupInfosMap[key] = pgi
 	}
 	return podGroupInfosMap, nil
 }
@@ -156,7 +149,7 @@ func getPodGroup(snapshot *cache.Snapshot, name string, namespace string) (*sche
 
 // getCompositePodGroup retrieves the CompositePodGroup from the snapshot.
 // It returns an error if the CompositePodGroup is not found in the snapshot.
-func getCompositePodGroup(snapshot *cache.Snapshot, name string, namespace string) (*schedulingv1alpha3.CompositePodGroup, error) {
+func getCompositePodGroup(snapshot *cache.Snapshot, name string, namespace string) (*schedulingv1beta1.CompositePodGroup, error) {
 	if snapshot == nil {
 		return nil, fmt.Errorf("failed to get composite pod group %s/%s: snapshot is nil", namespace, name)
 	}
@@ -178,18 +171,17 @@ func buildHierarchy(
 	namespace string,
 	podGroupInfosMap map[fwk.EntityKey]*framework.PodGroupInfo,
 ) (*framework.PodGroupInfo, error) {
-	var root *framework.PodGroupInfo
+	var rootKey fwk.EntityKey
 
-	// Create a copy of podGroupInfosMap, to avoid concurrent modifications on podGroupInfosMap.
-	treeNodes := make(map[fwk.EntityKey]*framework.PodGroupInfo, len(podGroupInfosMap))
-	maps.Copy(treeNodes, podGroupInfosMap)
+	cpgByKey := make(map[fwk.EntityKey]*schedulingv1beta1.CompositePodGroup)
+	childrenByParent := make(map[fwk.EntityKey][]fwk.EntityKey)
 
-	for _, podGroupInfo := range podGroupInfosMap {
+	for key, podGroupInfo := range podGroupInfosMap {
 		parentCompositePodGroupName := podGroupInfo.PodGroup.Spec.ParentCompositePodGroupName
 		if parentCompositePodGroupName != nil && *parentCompositePodGroupName != "" && !utilfeature.DefaultFeatureGate.Enabled(features.CompositePodGroup) {
-			return nil, fmt.Errorf("pod group %s/%s references parent composite pod group %q, but the %s feature gate is disabled", namespace, podGroupInfo.Name, *parentCompositePodGroupName, features.CompositePodGroup)
+			return nil, fmt.Errorf("pod group %s/%s references parent composite pod group %q, but the %s feature gate is disabled", namespace, podGroupInfo.GetName(), *parentCompositePodGroupName, features.CompositePodGroup)
 		}
-		child := podGroupInfo
+		childKey := key
 		visited := sets.New[string]()
 
 		for parentCompositePodGroupName != nil && *parentCompositePodGroupName != "" {
@@ -199,44 +191,50 @@ func buildHierarchy(
 			visited.Insert(*parentCompositePodGroupName)
 
 			parentCompositePodGroupKey := fwk.CompositePodGroupKey(namespace, *parentCompositePodGroupName)
-			parentCompositePodGroup, exists := treeNodes[parentCompositePodGroupKey]
+			cpg, exists := cpgByKey[parentCompositePodGroupKey]
 			if !exists {
-				cpg, err := getCompositePodGroup(snapshot, *parentCompositePodGroupName, namespace)
+				var err error
+				cpg, err = getCompositePodGroup(snapshot, *parentCompositePodGroupName, namespace)
 				if err != nil {
 					return nil, err
 				}
-				// Register parentCompositePodGroup.
-				parentCompositePodGroup = &framework.PodGroupInfo{
-					Namespace:         namespace,
-					Name:              *parentCompositePodGroupName,
-					Type:              fwk.CompositePodGroupKeyType,
-					CompositePodGroup: cpg,
-					Children:          make([]*framework.PodGroupInfo, 0),
-				}
-				treeNodes[parentCompositePodGroupKey] = parentCompositePodGroup
+				cpgByKey[parentCompositePodGroupKey] = cpg
 			}
 
 			// Link the child to the parentCompositePodGroup.
-			parentCompositePodGroup.Children = append(parentCompositePodGroup.Children, child)
+			childrenByParent[parentCompositePodGroupKey] = append(childrenByParent[parentCompositePodGroupKey], childKey)
 
 			// This path has been already explored, we can skip to the next pod group.
 			if exists {
 				break
 			}
 
-			child = parentCompositePodGroup
-			parentCompositePodGroupName = parentCompositePodGroup.CompositePodGroup.Spec.ParentCompositePodGroupName
+			childKey = parentCompositePodGroupKey
+			parentCompositePodGroupName = cpg.Spec.ParentCompositePodGroupName
 		}
 
 		// Ensure that all podgroups converge to the same root, otherwise return an error.
 		if parentCompositePodGroupName == nil || *parentCompositePodGroupName == "" {
-			if root == nil {
-				root = child
-			} else if root != child {
+			if rootKey == (fwk.EntityKey{}) {
+				rootKey = childKey
+			} else if rootKey != childKey {
 				return nil, fmt.Errorf("validation failed: pods belong to multiple disjoint hierarchies")
 			}
 		}
 	}
 
-	return root, nil
+	var buildNode func(key fwk.EntityKey) *framework.PodGroupInfo
+	buildNode = func(key fwk.EntityKey) *framework.PodGroupInfo {
+		if leaf, ok := podGroupInfosMap[key]; ok {
+			return leaf
+		}
+		childKeys := childrenByParent[key]
+		children := make([]*framework.PodGroupInfo, 0, len(childKeys))
+		for _, ck := range childKeys {
+			children = append(children, buildNode(ck))
+		}
+		return framework.NewPodGroupInfo(fwk.NewGenericCompositePodGroup(cpgByKey[key]), children...)
+	}
+
+	return buildNode(rootKey), nil
 }

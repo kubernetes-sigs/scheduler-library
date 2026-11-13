@@ -28,7 +28,6 @@ package testutils
 
 import (
 	v1 "k8s.io/api/core/v1"
-	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
@@ -67,12 +66,12 @@ func makeCompositePodGroup(name, parentCompositePodGroupName string) *st.Composi
 }
 
 // MakeGangCompositePodGroup returns a composite pod group with the gang scheduling policy.
-func MakeGangCompositePodGroup(name, parentCompositePodGroupName string, minGroupCount int32) *schedulingv1alpha3.CompositePodGroup {
+func MakeGangCompositePodGroup(name, parentCompositePodGroupName string, minGroupCount int32) *schedulingv1beta1.CompositePodGroup {
 	return makeCompositePodGroup(name, parentCompositePodGroupName).MinGroupCount(minGroupCount).Obj()
 }
 
 // MakeBasicCompositePodGroup returns a composite pod group with the basic scheduling policy.
-func MakeBasicCompositePodGroup(name, parentCompositePodGroupName string) *schedulingv1alpha3.CompositePodGroup {
+func MakeBasicCompositePodGroup(name, parentCompositePodGroupName string) *schedulingv1beta1.CompositePodGroup {
 	return makeCompositePodGroup(name, parentCompositePodGroupName).BasicPolicy().Obj()
 }
 
