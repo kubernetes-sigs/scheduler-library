@@ -621,10 +621,6 @@ func TestMultipleSnapshotsAndStates_NoInformerIndexerPanic(t *testing.T) {
 }
 
 func TestDRASnapshotIsolation(t *testing.T) {
-	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
-		features.DynamicResourceAllocation: true,
-	})
-
 	ctx := t.Context()
 	driverName := "test-driver.cdi.k8s.io"
 	className := "dra-test-class"

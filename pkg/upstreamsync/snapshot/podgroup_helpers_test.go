@@ -18,7 +18,6 @@ import (
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
-	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
@@ -179,7 +178,7 @@ func TestBuildPodGroupHierarchy(t *testing.T) {
 		name               string
 		pods               []*v1.Pod
 		podGroups          []*schedulingv1beta1.PodGroup
-		compositePodGroups []*schedulingv1alpha3.CompositePodGroup
+		compositePodGroups []*schedulingv1beta1.CompositePodGroup
 		wantRootName       string
 		wantType           fwk.EntityKeyType
 		wantChildren       int
@@ -210,7 +209,7 @@ func TestBuildPodGroupHierarchy(t *testing.T) {
 				cpg2Leaf2Pod2,
 			},
 			podGroups:          []*schedulingv1beta1.PodGroup{cpg1Leaf1, cpg1Leaf2, cpg2Leaf1, cpg2Leaf2},
-			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{rootCPG, cpg1, cpg2},
+			compositePodGroups: []*schedulingv1beta1.CompositePodGroup{rootCPG, cpg1, cpg2},
 			wantRootName:       "root-cpg",
 			wantType:           fwk.CompositePodGroupKeyType,
 			wantChildren:       2,
@@ -245,7 +244,7 @@ func TestBuildPodGroupHierarchy(t *testing.T) {
 				cyclicPod,
 			},
 			podGroups:          []*schedulingv1beta1.PodGroup{cyclicCPG1Leaf},
-			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{cyclicCPG1, cyclicCPG2},
+			compositePodGroups: []*schedulingv1beta1.CompositePodGroup{cyclicCPG1, cyclicCPG2},
 			wantErr:            true,
 		},
 		{
@@ -261,14 +260,14 @@ func TestBuildPodGroupHierarchy(t *testing.T) {
 				cpg2Leaf2Pod2,
 			},
 			podGroups:          []*schedulingv1beta1.PodGroup{cpg1Leaf1, cpg1Leaf2, cpg2Leaf1, cpg2Leaf2},
-			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{cpg1, cpg2},
+			compositePodGroups: []*schedulingv1beta1.CompositePodGroup{cpg1, cpg2},
 			wantErr:            true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			snapshot := cache.NewTestSnapshotWithCompositePodGroups(nil, nil, tt.podGroups, tt.compositePodGroups)
+			snapshot := cache.NewTestSnapshotWithPodGroups(nil, nil, tt.podGroups, tt.compositePodGroups)
 
 			root, err := buildPodGroupHierarchy(snapshot, tt.pods)
 			if (err != nil) != tt.wantErr {
@@ -276,11 +275,11 @@ func TestBuildPodGroupHierarchy(t *testing.T) {
 				return
 			}
 			if !tt.wantErr {
-				if root == nil || root.Name != tt.wantRootName || root.Type != tt.wantType {
+				if root == nil || root.GetName() != tt.wantRootName || root.GetType() != tt.wantType {
 					t.Errorf("BuildPodGroupHierarchy() root = %v, want name=%q type=%v", root, tt.wantRootName, tt.wantType)
 				}
-				if len(root.Children) != tt.wantChildren {
-					t.Errorf("BuildPodGroupHierarchy() children count = %d, want %d", len(root.Children), tt.wantChildren)
+				if len(root.Children()) != tt.wantChildren {
+					t.Errorf("BuildPodGroupHierarchy() children count = %d, want %d", len(root.Children()), tt.wantChildren)
 				}
 			}
 		})

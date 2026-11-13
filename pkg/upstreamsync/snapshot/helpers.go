@@ -16,6 +16,7 @@ package snapshot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -23,6 +24,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
+	fwk "k8s.io/kube-scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
 )
@@ -99,28 +102,52 @@ func createPodFromTemplate(template *v1.PodTemplateSpec, index int) *v1.Pod {
 // On success it returns the revert function undoing the changes the cycle made to the snapshot;
 // on a scheduling failure the returned function is nil and the reason is carried by the result's
 // Status. The pod is left untouched: it is up to the caller to reflect suggestedHost on it.
-func scheduleOnePod(ctx context.Context, profiles *upstreamsync.ProfileMap, sched *upstreamsync.Scheduler, pod *v1.Pod) (*upstreamsync.AlgorithmResult, func(), error) {
+func scheduleOnePod(ctx context.Context, profiles *upstreamsync.ProfileMap, alg *scheduler.SchedulingAlgorithm, pod *v1.Pod) (SchedulingResult, func(), error) {
 	schedFramework, err := profiles.FrameworkForPod(pod)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get framework for pod %s: %w", klog.KObj(pod), err)
+		return SchedulingResult{}, nil, fmt.Errorf("failed to get framework for pod %s: %w", klog.KObj(pod), err)
 	}
 
 	cycleState := framework.NewCycleState()
-	cycleState.SetPodGroupSchedulingCycle(framework.NewCycleState())
+	cycleState.SetPodGroupCycleState(framework.NewCycleState())
 	podInfo, err := framework.NewPodInfo(pod)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create pod info for pod %s: %w", klog.KObj(pod), err)
+		return SchedulingResult{}, nil, fmt.Errorf("failed to create pod info for pod %s: %w", klog.KObj(pod), err)
 	}
 
-	pendingPod := &upstreamsync.PendingPod{
-		PodInfo:    podInfo,
-		CycleState: cycleState,
+	queuedPodInfo := &framework.QueuedPodInfo{
+		PodInfo: podInfo,
 	}
-	algRes, revertFn := sched.SchedulePod(ctx, schedFramework, pendingPod)
-
-	if !algRes.GetStatus().IsSuccess() {
-		return &algRes, nil, nil
+	scheduleResult, err := alg.SchedulePod(ctx, schedFramework, cycleState, queuedPodInfo)
+	if err != nil {
+		var status *fwk.Status
+		if errors.Is(err, scheduler.ErrNoNodesAvailable) {
+			status = fwk.NewStatus(fwk.UnschedulableAndUnresolvable).WithError(err)
+		} else if _, ok := errors.AsType[*framework.FitError](err); !ok {
+			status = fwk.AsStatus(err)
+		} else {
+			status = fwk.NewStatus(fwk.Unschedulable).WithError(err)
+		}
+		return SchedulingResult{
+			Pod:        pod,
+			Status:     status,
+			CycleState: cycleState,
+		}, nil, nil
 	}
 
-	return &algRes, revertFn, nil
+	assumeStatus, revertFn := alg.AssumeAndReserveInSnapshot(ctx, cycleState, schedFramework, queuedPodInfo, scheduleResult)
+	if !assumeStatus.IsSuccess() {
+		return SchedulingResult{
+			Pod:        pod,
+			Status:     assumeStatus,
+			CycleState: cycleState,
+		}, nil, nil
+	}
+
+	return SchedulingResult{
+		Pod:              pod,
+		Status:           nil,
+		SelectedNodeName: scheduleResult.SuggestedHost,
+		CycleState:       cycleState,
+	}, revertFn, nil
 }

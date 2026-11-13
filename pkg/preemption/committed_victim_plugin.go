@@ -68,7 +68,7 @@ func getRootCycleState(pgState fwk.PodGroupCycleState) fwk.PodGroupCycleState {
 		if parentState == nil {
 			break
 		}
-		pgState = parentState.GetPodGroupSchedulingCycle()
+		pgState = parentState.GetPodGroupCycleState()
 	}
 	return pgState
 }
@@ -86,7 +86,7 @@ func getCommittedVictimsFromPodGroupState(pgState fwk.PodGroupCycleState) *commi
 }
 
 func getCommittedVictims(state fwk.CycleState) *committedVictims {
-	return getCommittedVictimsFromPodGroupState(state.GetPodGroupSchedulingCycle())
+	return getCommittedVictimsFromPodGroupState(state.GetPodGroupCycleState())
 }
 
 // SetCommittedVictimsInCycleState validates provided victims and records the set of nodes occupied
