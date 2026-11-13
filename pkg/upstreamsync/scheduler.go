@@ -62,6 +62,23 @@ or on the exact line that differs. See pkg/upstreamsync/doc.go and CONTRIBUTING.
 
 */
 
+const (
+	// minFeasibleNodesToFind is the minimum number of nodes that would be scored
+	// in each scheduling cycle. This is a semi-arbitrary value to ensure that a
+	// certain minimum of nodes are checked for feasibility. This in turn helps
+	// ensure a minimum level of spreading.
+	//
+	// UPSTREAM-DIFF: none, copied verbatim.
+	minFeasibleNodesToFind = 100
+	// minFeasibleNodesPercentageToFind is the minimum percentage of nodes that
+	// would be scored in each scheduling cycle. This is a semi-arbitrary value
+	// to ensure that a certain minimum of nodes are checked for feasibility.
+	// This in turn helps ensure a minimum level of spreading.
+	//
+	// UPSTREAM-DIFF: none, copied verbatim.
+	minFeasibleNodesPercentageToFind = 5
+)
+
 // ScheduleResult represents the result of scheduling a pod.
 type ScheduleResult = scheduler.ScheduleResult
 
@@ -70,15 +87,16 @@ type ScheduleResult = scheduler.ScheduleResult
 // UPSTREAM-DIFF: replaces scheduler.Scheduler, keeping only the fields the scheduling algorithm
 // reads. The library has no scheduler cache (the snapshot is mutated directly), no scheduling
 // queue and no scheduler-level extenders (they are taken from the framework), so those fields are
-// absent. currentCycle, nextStartNodeIndex and numNodesToFind are supplied by the caller instead of
-// being owned and advanced by a long-running scheduler, because each simulation drives its own
-// sequence of scheduling cycles.
+// absent. currentCycle and nextStartNodeIndex are supplied by the caller instead of being owned and
+// advanced by a long-running scheduler, because each simulation drives its own sequence of
+// scheduling cycles. firstFit is library-only (see WithFirstFit).
 type Scheduler struct {
-	nodeInfoSnapshot   *cache.Snapshot
-	currentCycle       int64
-	nextStartNodeIndex int
-	numNodesToFind     int32
-	cache              cache.Cache
+	nodeInfoSnapshot         *cache.Snapshot
+	currentCycle             int64
+	nextStartNodeIndex       int
+	percentageOfNodesToScore int32
+	firstFit                 bool
+	cache                    cache.Cache
 }
 
 type schedulerOptions struct {
@@ -171,25 +189,65 @@ func WithPreemptionManager(f preemption.PreemptionManagerFactory) FrameworkMapOp
 	}
 }
 
-// NewScheduler creates a Scheduler operating on the given snapshot.
-// numNodesToFind caps how many feasible nodes a scheduling attempt looks for; pass math.MaxInt32
-// to consider all of them.
+// AlgorithmOption configures a Scheduler built by NewScheduler.
 //
-// UPSTREAM-DIFF: upstream derives numNodesToFind per attempt from PercentageOfNodesToScore
-// (see Scheduler.numFeasibleNodesToFind), which is not copied here. Simulations need a
-// deterministic, caller-controlled bound instead of a sampling heuristic.
+// UPSTREAM-DIFF: mirrors AlgorithmOption from Kubernetes 1.38 algorithm.go (ahead of v1.37.0), but
+// configures Scheduler instead of SchedulingAlgorithm.
+type AlgorithmOption func(*Scheduler)
+
+// WithAlgorithmPercentageOfNodesToScore sets how many nodes the algorithm should evaluate
+// while filtering, as a percentage of all nodes: once the number of evaluated nodes reaches the set value and
+// at least N feasible nodes are found (where N is calculated by numFeasibleNodesToFind),
+// the search stops, and those are the nodes that go on to scoring.
+// If percentageOfNodesToScore is set on scheduler profile level, the value in profile will be used
+// instead of the global percentageOfNodesToScore value.
+// If percentageOfNodesToScore is set to 0, scheduler will use an adaptive algorithm to calculate a percentage
+// value to use; the larger the cluster, the lower the result value.
+// If the limit of nodes to score is reached but the number of feasible nodes found is lower than the value
+// from numFeasibleNodesToFind, the filtering of subsequent nodes will continue.
+//
+// UPSTREAM-DIFF: copied from Kubernetes 1.38 algorithm.go (ahead of v1.37.0), but configures
+// Scheduler instead of SchedulingAlgorithm.
+func WithAlgorithmPercentageOfNodesToScore(percentage int32) AlgorithmOption {
+	return func(sched *Scheduler) {
+		sched.percentageOfNodesToScore = percentage
+	}
+}
+
+// WithFirstFit makes every scheduling attempt stop at the first feasible node Filter finds, so no
+// node is scored and the percentage of nodes to score is ignored. FindAllNodesThatFitPod still
+// evaluates every node.
+//
+// UPSTREAM-DIFF: library-only. It gives ClusterSnapshot.SchedulePods and SchedulePodsByTemplate
+// their first-fit packing semantics.
+func WithFirstFit() AlgorithmOption {
+	return func(sched *Scheduler) {
+		sched.firstFit = true
+	}
+}
+
+// NewScheduler creates a Scheduler operating on the given snapshot.
+//
+// UPSTREAM-DIFF: replaces scheduler.New, taking currentCycle and nextStartNodeIndex directly and
+// constructing only the in-memory scheduling state without informers, event handlers, or a
+// scheduling queue. Like NewSchedulingAlgorithm in Kubernetes 1.38 (ahead of v1.37.0), it takes
+// AlgorithmOptions and defaults the percentage of nodes to score to DefaultPercentageOfNodesToScore.
 func NewScheduler(nodeInfoSnapshot *cache.Snapshot,
 	currentCycle int64,
 	nextStartNodeIndex int,
-	numNodesToFind int32,
-	cache cache.Cache) *Scheduler {
-	return &Scheduler{
-		nodeInfoSnapshot:   nodeInfoSnapshot,
-		currentCycle:       currentCycle,
-		nextStartNodeIndex: nextStartNodeIndex,
-		numNodesToFind:     numNodesToFind,
-		cache:              cache,
+	cache cache.Cache,
+	opts ...AlgorithmOption) *Scheduler {
+	sched := &Scheduler{
+		nodeInfoSnapshot:         nodeInfoSnapshot,
+		currentCycle:             currentCycle,
+		nextStartNodeIndex:       nextStartNodeIndex,
+		percentageOfNodesToScore: schedulerapi.DefaultPercentageOfNodesToScore,
+		cache:                    cache,
 	}
+	for _, opt := range opts {
+		opt(sched)
+	}
+	return sched
 }
 
 // PendingPod is the pod being scheduled together with the state of its scheduling cycle.
@@ -566,7 +624,9 @@ func (sched *Scheduler) FindAllNodesThatFitPod(ctx context.Context, schedFramewo
 // UPSTREAM-DIFF: takes the additional findAll flag (see FindAllNodesThatFitPod). When it is set,
 // the nominated node shortcut is skipped, because returning early with the nominated node alone
 // would hide the other feasible nodes the caller asked for. The CycleState comes from podInfo and
-// the extenders come from the framework instead of sched.Extenders.
+// the extenders come from the framework instead of sched.Extenders. The early return for an empty
+// candidate list, the per-attempt budget and the guarded nextStartNodeIndex update follow
+// Kubernetes 1.38 algorithm.go (ahead of v1.37.0).
 func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework framework.Framework, podInfo *PendingPod, findAll bool) ([]fwk.NodeInfo, framework.Diagnosis, string, error) {
 	state := podInfo.CycleState
 	logger := klog.FromContext(ctx)
@@ -630,11 +690,30 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework 
 		}
 		diagnosis.NodeToStatus.SetAbsentNodesStatus(fwk.NewStatus(fwk.UnschedulableAndUnresolvable, fmt.Sprintf("node(s) didn't satisfy plugin(s) %v", sets.List(unscheduledPlugins))))
 	}
-	feasibleNodes, err := sched.findNodesThatPassFilters(ctx, schedFramework, state, pod, &diagnosis, nodes, findAll)
+	if len(nodes) == 0 {
+		return nil, diagnosis, nodeHint, nil
+	}
+
+	// The budget is computed from the candidate list, which PreFilter may have narrowed —
+	// not from allNodes.
+	// UPSTREAM-DIFF: evaluate all nodes when findAll is set, and stop at the first feasible node
+	// when the Scheduler was built WithFirstFit.
+	var numNodesToFind int32
+	switch {
+	case findAll:
+		numNodesToFind = int32(len(nodes))
+	case sched.firstFit:
+		numNodesToFind = 1
+	default:
+		numNodesToFind = sched.numNodesToFind(schedFramework, int32(len(nodes)))
+	}
+	feasibleNodes, err := sched.findNodesThatPassFilters(ctx, schedFramework, state, pod, &diagnosis, nodes, numNodesToFind)
 	// always try to update the sched.nextStartNodeIndex regardless of whether an error has occurred
 	// this is helpful to make sure that all the nodes have a chance to be searched
 	processedNodes := len(feasibleNodes) + diagnosis.NodeToStatus.Len()
-	sched.nextStartNodeIndex = (sched.nextStartNodeIndex + processedNodes) % len(allNodes)
+	if len(allNodes) > 0 {
+		sched.nextStartNodeIndex = (sched.nextStartNodeIndex + processedNodes) % len(allNodes)
+	}
 	if err != nil {
 		return nil, diagnosis, nodeHint, err
 	}
@@ -663,9 +742,10 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework 
 
 // evaluateNominatedNode checks whether the pod fits the node it was nominated to (or hinted at).
 //
-// UPSTREAM-DIFF: identical to Scheduler.evaluateNominatedNode, except that the extenders come from
-// the framework and findNodesThatPassFilters is called with findAll=false, which does not matter
-// as there is only one node to check anyway.
+// UPSTREAM-DIFF: copied from SchedulingAlgorithm.evaluateNominatedNode in Kubernetes 1.38 (ahead of
+// v1.37.0), except that diagnosis is passed by value and the feasible nodes are returned as
+// []fwk.NodeInfo instead of []framework.NodeWithRank. Like 1.38, it takes the extenders from the
+// framework, whereas Scheduler.evaluateNominatedNode in v1.37.0 uses sched.Extenders.
 func (sched *Scheduler) evaluateNominatedNode(ctx context.Context, pod *v1.Pod, schedFramework framework.Framework, state fwk.CycleState, nodeHint string, diagnosis framework.Diagnosis) ([]fwk.NodeInfo, error) {
 	// In the future we could potentially use the hint if the nominated node failed.
 	// https://github.com/kubernetes/kubernetes/issues/135163
@@ -686,7 +766,7 @@ func (sched *Scheduler) evaluateNominatedNode(ctx context.Context, pod *v1.Pod, 
 		return nil, nil
 	}
 	node := []fwk.NodeInfo{nodeInfo}
-	feasibleNodes, err := sched.findNodesThatPassFilters(ctx, schedFramework, state, pod, &diagnosis, node, false /* doesn't matter as there's only 1 node anyway */)
+	feasibleNodes, err := sched.findNodesThatPassFilters(ctx, schedFramework, state, pod, &diagnosis, node, int32(len(node)))
 	if err != nil {
 		return nil, err
 	}
@@ -730,10 +810,10 @@ func hasExtenderFilters(fwk framework.Framework) bool {
 
 // findNodesThatPassFilters finds the nodes that fit the filter plugins.
 //
-// UPSTREAM-DIFF: takes the additional findAll flag, which makes it evaluate every node instead of
-// stopping early. Upstream computes the bound from PercentageOfNodesToScore via
-// Scheduler.numFeasibleNodesToFind; the library uses the caller-provided sched.numNodesToFind
-// (see NewScheduler). The body below is otherwise unchanged.
+// UPSTREAM-DIFF: follows Kubernetes 1.38 algorithm.go (ahead of v1.37.0), which takes numNodesToFind
+// from the caller and returns early for an empty node list, but returns []fwk.NodeInfo instead of
+// []framework.NodeWithRank and skips the RankNodes pass, which is not wired in
+// k8s.io/kubernetes v1.37.0.
 func (sched *Scheduler) findNodesThatPassFilters(
 	ctx context.Context,
 	schedFramework framework.Framework,
@@ -741,17 +821,10 @@ func (sched *Scheduler) findNodesThatPassFilters(
 	pod *v1.Pod,
 	diagnosis *framework.Diagnosis,
 	nodes []fwk.NodeInfo,
-	findAll bool) ([]fwk.NodeInfo, error) {
+	numNodesToFind int32) ([]fwk.NodeInfo, error) {
 	numAllNodes := len(nodes)
-	// UPSTREAM-DIFF: upstream always samples via sched.numFeasibleNodesToFind(
-	// schedFramework.PercentageOfNodesToScore(), int32(numAllNodes)). Here the bound is either all
-	// the nodes (findAll) or the one the caller passed to NewScheduler.
-	numNodesToFind := int32(numAllNodes)
-	if !findAll {
-		numNodesToFind = sched.numNodesToFind
-		if !hasExtenderFilters(schedFramework) && !hasScoring(schedFramework) {
-			numNodesToFind = 1
-		}
+	if numAllNodes == 0 {
+		return nil, nil
 	}
 
 	// Create feasible list with enough space to avoid growing it
@@ -824,6 +897,51 @@ func (sched *Scheduler) findNodesThatPassFilters(
 		return feasibleNodes, err
 	}
 	return feasibleNodes, nil
+}
+
+// numNodesToFind decides how many feasible nodes Filter should collect, following
+// kube-scheduler's percentageOfNodesToScore policy. A profile that neither filters
+// through extenders nor scores has no use for a second candidate, so one is enough.
+//
+// UPSTREAM-DIFF: copied verbatim from Kubernetes 1.38 algorithm.go (ahead of v1.37.0).
+func (sched *Scheduler) numNodesToFind(schedFramework framework.Framework, numAllNodes int32) int32 {
+	if numAllNodes == 0 {
+		return 0
+	}
+
+	if !hasExtenderFilters(schedFramework) && !hasScoring(schedFramework) {
+		return 1
+	}
+	return sched.numFeasibleNodesToFind(schedFramework.PercentageOfNodesToScore(), numAllNodes)
+}
+
+// numFeasibleNodesToFind returns the number of feasible nodes that once found, the scheduler stops
+// its search for more feasible nodes.
+//
+// UPSTREAM-DIFF: copied verbatim from Kubernetes 1.38 algorithm.go (ahead of v1.37.0).
+func (sched *Scheduler) numFeasibleNodesToFind(percentageOfNodesToScore *int32, numAllNodes int32) (numNodes int32) {
+	if numAllNodes < minFeasibleNodesToFind {
+		return numAllNodes
+	}
+
+	// Use profile percentageOfNodesToScore if it's set. Otherwise, use global percentageOfNodesToScore.
+	var percentage int32
+	if percentageOfNodesToScore != nil {
+		percentage = *percentageOfNodesToScore
+	} else {
+		percentage = sched.percentageOfNodesToScore
+	}
+
+	if percentage == 0 {
+		percentage = max(int32(50)-numAllNodes/125, minFeasibleNodesPercentageToFind)
+	}
+
+	numNodes = numAllNodes * percentage / 100
+	if numNodes < minFeasibleNodesToFind {
+		return minFeasibleNodesToFind
+	}
+
+	return numNodes
 }
 
 // findNodesThatPassExtenders runs the filter extenders over the nodes that passed the filter plugins.
