@@ -38,15 +38,15 @@ import (
 // If opts.PreemptionFilter is set, it tracks active victims in the prefix and uses MayFit
 // as a fast pre-check to skip probing prefixes or attempting victim reprievals that cannot
 // satisfy external constraints. When opts.PreemptionFilter is nil, this pre-check is skipped.
-// It returns the last successful PodGroupAssignments along with the victims that were not reprieved.
+// It returns the PodGroupPostFilterResult from the final pass along with the victims that were not reprieved.
 func EvaluateWorkloadPreemption(
 	ctx context.Context,
 	schedFramework *upstreampreemption.PreemptionFramework,
 	podGroupCycleState *framework.CycleState,
 	podGroupInfo fwk.PodGroupInfo,
-	baseSchedulingFunc fwk.PodGroupSchedulingFunc,
+	pgSchedulingFunc fwk.PodGroupSchedulingFunc,
 	opts WorkloadPreemptionOptions,
-) (*fwk.PodGroupAssignments, []PreemptionVictim, *fwk.Status) {
+) (*fwk.PodGroupPostFilterResult, []PreemptionVictim, *fwk.Status) {
 	pm, ok := schedFramework.PreemptionManager().(*prefixPreemptionManager)
 	if !ok {
 		return nil, nil, fwk.AsStatus(fmt.Errorf(
@@ -59,21 +59,11 @@ func EvaluateWorkloadPreemption(
 	pm.preemptionFilter = opts.PreemptionFilter
 	defer pm.reset()
 
-	var lastAssignments *fwk.PodGroupAssignments
-	pgSchedulingFunc := func(ctx context.Context) (*fwk.PodGroupAssignments, *fwk.Status) {
-		assignments, status := baseSchedulingFunc(ctx)
-		if status.IsSuccess() {
-			lastAssignments = assignments
-		}
-		return assignments, status
-	}
-
-	probe := func() *fwk.Status {
+	probe := func() (*fwk.PodGroupPostFilterResult, *fwk.Status) {
 		if opts.PreemptionFilter != nil && !opts.PreemptionFilter.MayFit() {
-			return fwk.NewStatus(fwk.Unschedulable)
+			return nil, fwk.NewStatus(fwk.Unschedulable)
 		}
-		_, status := schedFramework.RunPodGroupPostFilterPlugins(ctx, podGroupCycleState, podGroupInfo, pgSchedulingFunc)
-		return status
+		return schedFramework.RunPodGroupPostFilterPlugins(ctx, podGroupCycleState, podGroupInfo, pgSchedulingFunc)
 	}
 
 	// Step 1: Exponential search over opts.PotentialVictims (with allowReprieve = false)
@@ -94,7 +84,7 @@ func EvaluateWorkloadPreemption(
 		}
 
 		pm.moveCursor(len(pm.victims))
-		status := probe()
+		_, status := probe()
 		if status.IsError() {
 			return nil, nil, status
 		}
@@ -112,7 +102,7 @@ func EvaluateWorkloadPreemption(
 			return nil, nil, fwk.NewStatus(fwk.Unschedulable)
 		}
 		pm.moveCursor(len(pm.victims))
-		status := probe()
+		_, status := probe()
 		if status.IsError() {
 			return nil, nil, status
 		}
@@ -126,7 +116,7 @@ func EvaluateWorkloadPreemption(
 	for lo+1 < hi {
 		mid := lo + (hi-lo)/2
 		pm.moveCursor(mid)
-		status := probe()
+		_, status := probe()
 		if status.IsError() {
 			return nil, nil, status
 		}
@@ -144,14 +134,14 @@ func EvaluateWorkloadPreemption(
 	// is a potential future optimization if profiling ever indicates a bottleneck.
 	pm.moveCursor(hi)
 	pm.allowReprieve = true
-	status := probe()
+	postFilterResult, status := probe()
 	if status.IsError() {
 		return nil, nil, status
 	}
 	if !status.IsSuccess() {
 		return nil, nil, fwk.NewStatus(fwk.Unschedulable)
 	}
-	return lastAssignments, pm.preemptedVictims(), nil
+	return postFilterResult, pm.preemptedVictims(), nil
 }
 
 // simPreemptionVictim adapts a PreemptionVictim to the framework's PreemptionVictim interface.
