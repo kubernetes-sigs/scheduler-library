@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"sync"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 	coreinformers "k8s.io/client-go/informers/core"
 	corev1informers "k8s.io/client-go/informers/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
+	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	draapi "k8s.io/dynamic-resource-allocation/api"
 	"k8s.io/dynamic-resource-allocation/deviceclass/extendedresourcecache"
@@ -74,6 +76,96 @@ see pkg/upstreamsync/doc.go.
 // UPSTREAM-DIFF: Package-level variables in k8s.io/kubernetes/pkg/scheduler/metrics stay nil
 // until metrics.InitMetrics is called, which causes panics when frameworks record metrics.
 var InitMetricsOnce = sync.OnceFunc(metrics.InitMetrics)
+
+type schedulerOptions struct {
+	profiles                   []schedulerapi.KubeSchedulerProfile
+	extenders                  []schedulerapi.Extender
+	frameworkOutOfTreeRegistry frameworkruntime.Registry
+	kubeConfig                 *restclient.Config
+	parallelism                int32
+	applyDefaultProfile        bool
+}
+
+// Option configures scheduler framework components and profiles.
+type Option func(*schedulerOptions)
+
+// WithProfiles sets profiles for the scheduler framework.
+func WithProfiles(p ...schedulerapi.KubeSchedulerProfile) Option {
+	return func(o *schedulerOptions) {
+		o.profiles = p
+		o.applyDefaultProfile = false
+	}
+}
+
+// WithExtenders sets extenders for the scheduler.
+func WithExtenders(e ...schedulerapi.Extender) Option {
+	return func(o *schedulerOptions) {
+		o.extenders = e
+	}
+}
+
+// WithParallelism sets the parallelism for scheduler plugins.
+func WithParallelism(threads int32) Option {
+	return func(o *schedulerOptions) {
+		o.parallelism = threads
+	}
+}
+
+// WithFrameworkOutOfTreeRegistry registers out-of-tree plugins with the in-tree registry.
+//
+// UPSTREAM-DIFF: clones registry with maps.Clone so that mutating the caller's map after
+// passing it to this option cannot alter the stored registry across subsequent NewFrameworkMap calls.
+// Tracked upstream in https://github.com/kubernetes/kubernetes/pull/142968.
+func WithFrameworkOutOfTreeRegistry(registry frameworkruntime.Registry) Option {
+	cloned := maps.Clone(registry)
+	return func(o *schedulerOptions) {
+		o.frameworkOutOfTreeRegistry = cloned
+	}
+}
+
+// WithKubeConfig sets the client config exposed to plugins via fwk.Handle.KubeConfig().
+func WithKubeConfig(cfg *restclient.Config) Option {
+	return func(o *schedulerOptions) {
+		o.kubeConfig = cfg
+	}
+}
+
+type frameworkMapOptions struct {
+	sharedDRAManager         fwk.SharedDRAManager
+	preemptionManagerFactory preemption.PreemptionManagerFactory
+}
+
+// FrameworkMapOption configures a single ProfileMap built by NewFrameworkMap. Unlike Option,
+// which configures the FrameworkComponents shared by every map, it applies to that map only.
+//
+// UPSTREAM-DIFF: library-only. Upstream builds a single profile map per scheduler, so its options
+// all live on scheduler.New. The library builds one ProfileMap per snapshot from shared
+// FrameworkComponents, and the DRA manager is per ProfileMap, so it is configured here.
+type FrameworkMapOption func(*frameworkMapOptions)
+
+// WithSharedDRAManager makes the plugins of the map read DRA objects through the given manager
+// rather than through the one built from FrameworkComponents. A nil manager keeps the default.
+//
+// UPSTREAM-DIFF: library-only. Upstream has one cluster to schedule against and builds the
+// manager from its own informers. The interface is documented as the place to plug a simulated
+// state in, so a caller holding claims the cluster has never seen can have them judged by the
+// same plugin kube-scheduler runs.
+func WithSharedDRAManager(m fwk.SharedDRAManager) FrameworkMapOption {
+	return func(o *frameworkMapOptions) {
+		o.sharedDRAManager = m
+	}
+}
+
+// WithPreemptionManager sets the factory that creates the PreemptionManager of each profile in the
+// map. Without it the profiles have no PreemptionManager.
+//
+// UPSTREAM-DIFF: upstream WithPreemptionManager uses a frameworkruntime.PreemptionManagerFactory.
+// Migration Plan (1.38): Delete this function and use frameworkruntime.WithPreemptionManager.
+func WithPreemptionManager(f preemption.PreemptionManagerFactory) FrameworkMapOption {
+	return func(o *frameworkMapOptions) {
+		o.preemptionManagerFactory = f
+	}
+}
 
 // FrameworkComponents holds the shared scheduler dependencies that span across
 // all framework profiles, the scheduling queue, and event handlers.
