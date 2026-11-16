@@ -25,7 +25,6 @@ import (
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
 
 	v1 "k8s.io/api/core/v1"
-	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
@@ -94,10 +93,10 @@ type Simulator interface {
 	RemovePodGroup(ctx context.Context, pg *schedulingv1beta1.PodGroup) error
 
 	// AddCompositePodGroup adds a composite pod group to the snapshot.
-	AddCompositePodGroup(ctx context.Context, cpg *schedulingv1alpha3.CompositePodGroup) error
+	AddCompositePodGroup(ctx context.Context, cpg *schedulingv1beta1.CompositePodGroup) error
 
 	// RemoveCompositePodGroup removes a composite pod group from the snapshot.
-	RemoveCompositePodGroup(ctx context.Context, cpg *schedulingv1alpha3.CompositePodGroup) error
+	RemoveCompositePodGroup(ctx context.Context, cpg *schedulingv1beta1.CompositePodGroup) error
 }
 
 type simulatorOptions struct {
@@ -243,10 +242,10 @@ func (s *SchedulingSimulator) NewClusterSnapshot(
 	pods []*v1.Pod,
 	nodes []*v1.Node,
 	podGroups []*schedulingv1beta1.PodGroup,
-	compositePodGroups []*schedulingv1alpha3.CompositePodGroup,
+	compositePodGroups []*schedulingv1beta1.CompositePodGroup,
 	opts ...Option,
 ) (Simulator, error) {
-	snap := cache.NewTestSnapshotWithCompositePodGroups(pods, nodes, podGroups, compositePodGroups)
+	snap := cache.NewTestSnapshotWithPodGroups(pods, nodes, podGroups, compositePodGroups)
 	profiles, err := s.buildProfileMap(ctx, snap, opts...)
 	if err != nil {
 		return nil, err

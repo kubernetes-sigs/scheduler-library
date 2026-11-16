@@ -18,7 +18,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -26,7 +25,6 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	v1 "k8s.io/api/core/v1"
-	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -1265,7 +1263,7 @@ func TestScheduleWorkload(t *testing.T) {
 		name                string
 		nodes               []*v1.Node
 		podGroups           []*schedulingv1beta1.PodGroup
-		compositePodGroups  []*schedulingv1alpha3.CompositePodGroup
+		compositePodGroups  []*schedulingv1beta1.CompositePodGroup
 		pods                []*v1.Pod
 		opts                ScheduleWorkloadOptions
 		expectResults       []SchedulingResult
@@ -1302,7 +1300,7 @@ func TestScheduleWorkload(t *testing.T) {
 			name:               "Success - schedule composite pod group",
 			nodes:              []*v1.Node{node8CPU},
 			podGroups:          []*schedulingv1beta1.PodGroup{leafPG1, leafPG2},
-			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{rootCPG},
+			compositePodGroups: []*schedulingv1beta1.CompositePodGroup{rootCPG},
 			pods:               []*v1.Pod{leafPod1, leafPod2},
 			opts:               NewScheduleWorkloadOptions(false),
 			expectResults: []SchedulingResult{
@@ -1332,9 +1330,9 @@ func TestScheduleWorkload(t *testing.T) {
 			pods:               []*v1.Pod{heavyPod1, heavyPod2, heavyPod3},
 			opts:               NewScheduleWorkloadOptions(false),
 			expectResults: []SchedulingResult{
-				{Pod: heavyPod1, SelectedNodeName: "", Status: fwk.NewStatus(fwk.Unschedulable, "0/1 placements are available, first placement status: minCount (3) cannot be satisfied: 1 scheduled, 1 remaining")},
+				{Pod: heavyPod1, SelectedNodeName: "", Status: fwk.NewStatus(fwk.Unschedulable, "0/1 placements are available, first placement status: scheduling policy's minimum threshold (3) cannot be satisfied: 1 scheduled, 1 unschedulable, 1 not-evaluated")},
 				{Pod: heavyPod2, SelectedNodeName: "", Status: fwk.NewStatus(fwk.Unschedulable, "0/1 nodes are available: 1 Insufficient cpu.")},
-				{Pod: heavyPod3, SelectedNodeName: "", Status: fwk.NewStatus(fwk.Unschedulable, "0/1 placements are available, first placement status: minCount (3) cannot be satisfied: 1 scheduled, 1 remaining")},
+				{Pod: heavyPod3, SelectedNodeName: "", Status: fwk.NewStatus(fwk.Unschedulable, "0/1 placements are available, first placement status: scheduling policy's minimum threshold (3) cannot be satisfied: 1 scheduled, 1 unschedulable, 1 not-evaluated")},
 			},
 			expectSnapshotState: map[string]sets.Set[string]{"node1": nil},
 		},
@@ -1342,7 +1340,7 @@ func TestScheduleWorkload(t *testing.T) {
 			name:               "Failure - composite pod group unschedulable rolls back snapshot reservations",
 			nodes:              []*v1.Node{node4CPU},
 			podGroups:          []*schedulingv1beta1.PodGroup{leafPG1, leafPG2, leafPG3},
-			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{testutils.MakeGangCompositePodGroup(rootCPG.Name, "", 3)},
+			compositePodGroups: []*schedulingv1beta1.CompositePodGroup{testutils.MakeGangCompositePodGroup(rootCPG.Name, "", 3)},
 			pods:               []*v1.Pod{heavyLeafPod1, heavyLeafPod2, heavyLeafPod3},
 			opts:               NewScheduleWorkloadOptions(false),
 			expectResults: []SchedulingResult{
@@ -1596,28 +1594,14 @@ func TestSnapshot_ActionSequences_ScheduleWorkload(t *testing.T) {
 	}
 }
 
-// UPSTREAM-DIFF: Upstream kubernetes PR #142177 (https://github.com/kubernetes/kubernetes/pull/142177)
-// provides TestSnapshot_AddGenericPodGroup and TestSnapshot_RemoveGenericPodGroup in k8s.io/kubernetes.
-//
-// Test Migration Plan:
-// When go.mod updates k8s.io/kubernetes to include PR #142177:
-// 1. Delete verifySnapshotPodGroups below. Upstream tests already verify the internal map state of cache.Snapshot.
-// 2. Simplify TestSnapshot_AddPodGroups and TestSnapshot_RemovePodGroups. Upstream tests already cover tree permutations.
-// 3. Keep tests focused on ClusterSnapshot responsibilities: transaction rollback (undoLog) and preemption version bumps.
-
-// verifySnapshotPodGroups verifies the internal pod group and composite pod group state of cache.Snapshot.
-// It uses reflection to inspect unexported snapshot maps until upstream cache.Snapshot exposes inspection methods.
+// verifySnapshotPodGroups verifies the pod group and composite pod group state of cache.Snapshot.
 func verifySnapshotPodGroups(
 	t *testing.T,
 	snap *cache.Snapshot,
 	wantPodGroups []*schedulingv1beta1.PodGroup,
-	wantCompositePodGroups []*schedulingv1alpha3.CompositePodGroup,
+	wantCompositePodGroups []*schedulingv1beta1.CompositePodGroup,
 ) {
 	t.Helper()
-
-	rv := reflect.ValueOf(snap).Elem()
-	podGroupStates := writableField(rv, "podGroupStates")
-	compositePodGroupStates := writableField(rv, "compositePodGroupStates")
 
 	wantPGMap := make(map[fwk.EntityKey]*schedulingv1beta1.PodGroup, len(wantPodGroups))
 	wantChildren := make(map[fwk.EntityKey]sets.Set[fwk.EntityKey])
@@ -1638,24 +1622,16 @@ func verifySnapshotPodGroups(
 			wantChildren[parentKey].Insert(key)
 		}
 	}
-
-	gotPGMap := make(map[fwk.EntityKey]*schedulingv1beta1.PodGroup)
-	pgIter := podGroupStates.MapRange()
-	for pgIter.Next() {
-		key := pgIter.Key().Interface().(fwk.EntityKey)
-		pgs := pgIter.Value()
-		if podGroupEmpty(pgs) {
-			t.Errorf("empty podGroupStateSnapshot left in snapshot for key %s", key)
-		}
-		if pgField := writableField(pgs.Elem(), "podGroup"); !pgField.IsNil() {
-			gotPGMap[key] = pgField.Interface().(*schedulingv1beta1.PodGroup)
+	for _, name := range []string{"pg1", "pg2", "leaf-pg1", "leaf-pg2", "gang-pg1", "gang-pg2", "gang-pg3"} {
+		key := fwk.PodGroupKey("default", name)
+		if _, ok := wantPGMap[key]; !ok {
+			if _, err := snap.PodGroups().Get("default", name); err == nil {
+				t.Errorf("snap.PodGroups().Get(default, %s) succeeded, want not found error", name)
+			}
 		}
 	}
-	if diff := cmp.Diff(wantPGMap, gotPGMap, cmpopts.EquateEmpty()); diff != "" {
-		t.Errorf("snapshot podGroups mismatch (-want +got):\n%s", diff)
-	}
 
-	wantCPGMap := make(map[fwk.EntityKey]*schedulingv1alpha3.CompositePodGroup, len(wantCompositePodGroups))
+	wantCPGMap := make(map[fwk.EntityKey]*schedulingv1beta1.CompositePodGroup, len(wantCompositePodGroups))
 	for _, cpg := range wantCompositePodGroups {
 		key := fwk.CompositePodGroupKey(cpg.Namespace, cpg.Name)
 		wantCPGMap[key] = cpg
@@ -1677,27 +1653,25 @@ func verifySnapshotPodGroups(
 		}
 	}
 
-	gotCPGMap := make(map[fwk.EntityKey]*schedulingv1alpha3.CompositePodGroup)
 	gotChildren := make(map[fwk.EntityKey]sets.Set[fwk.EntityKey])
-	cpgIter := compositePodGroupStates.MapRange()
-	for cpgIter.Next() {
-		key := cpgIter.Key().Interface().(fwk.EntityKey)
-		cpgs := cpgIter.Value()
-		if compositePodGroupEmpty(cpgs) {
-			t.Errorf("empty compositePodGroupStateSnapshot left in snapshot for key %s", key)
+	for _, name := range []string{"root-cpg", "cpg1", "cpg2"} {
+		key := fwk.CompositePodGroupKey("default", name)
+		_, wantCPG := wantCPGMap[key]
+		if !wantCPG {
+			if _, err := snap.CompositePodGroups().Get("default", name); err == nil {
+				t.Errorf("snap.CompositePodGroups().Get(default, %s) succeeded, want not found error", name)
+			}
 		}
-		if cpgField := writableField(cpgs.Elem(), "compositePodGroup"); !cpgField.IsNil() {
-			gotCPGMap[key] = cpgField.Interface().(*schedulingv1alpha3.CompositePodGroup)
+		if wantCPG || len(wantChildren[key]) > 0 {
+			state, err := snap.CompositePodGroupStates().Get("default", name)
+			if err != nil {
+				t.Errorf("snap.CompositePodGroupStates().Get(default, %s) unexpected error: %v", name, err)
+			} else {
+				gotChildren[key] = sets.New(state.GetChildren()...)
+			}
+		} else if _, err := snap.CompositePodGroupStates().Get("default", name); err == nil {
+			t.Errorf("snap.CompositePodGroupStates().Get(default, %s) succeeded, want not found error", name)
 		}
-		state, err := snap.CompositePodGroupStates().Get(key.Namespace, key.Name)
-		if err != nil {
-			t.Errorf("snap.CompositePodGroupStates().Get(%s, %s) unexpected error: %v", key.Namespace, key.Name, err)
-		} else {
-			gotChildren[key] = sets.New(state.GetChildren()...)
-		}
-	}
-	if diff := cmp.Diff(wantCPGMap, gotCPGMap, cmpopts.EquateEmpty()); diff != "" {
-		t.Errorf("snapshot compositePodGroups mismatch (-want +got):\n%s", diff)
 	}
 	if diff := cmp.Diff(wantChildren, gotChildren, cmpopts.EquateEmpty()); diff != "" {
 		t.Errorf("snapshot compositePodGroup children mismatch (-want +got):\n%s", diff)
@@ -1705,8 +1679,6 @@ func verifySnapshotPodGroups(
 }
 
 // TestSnapshot_AddPodGroups tests adding PodGroups and CompositePodGroups to ClusterSnapshot.
-// When k8s.io/kubernetes includes PR #142177, this test will verify the calls delegated
-// to cache.Snapshot.AddGenericPodGroup.
 func TestSnapshot_AddPodGroups(t *testing.T) {
 	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
 		features.TopologyAwareWorkloadScheduling: true,
@@ -1727,11 +1699,11 @@ func TestSnapshot_AddPodGroups(t *testing.T) {
 		name                   string
 		initPods               []*v1.Pod
 		initPodGroups          []*schedulingv1beta1.PodGroup
-		initCompositePodGroups []*schedulingv1alpha3.CompositePodGroup
+		initCompositePodGroups []*schedulingv1beta1.CompositePodGroup
 		addPodGroups           []*schedulingv1beta1.PodGroup
-		addCompositePodGroups  []*schedulingv1alpha3.CompositePodGroup
+		addCompositePodGroups  []*schedulingv1beta1.CompositePodGroup
 		wantPodGroups          []*schedulingv1beta1.PodGroup
-		wantCompositePodGroups []*schedulingv1alpha3.CompositePodGroup
+		wantCompositePodGroups []*schedulingv1beta1.CompositePodGroup
 		wantErr                bool
 	}{
 		{
@@ -1742,23 +1714,23 @@ func TestSnapshot_AddPodGroups(t *testing.T) {
 		{
 			name:                   "Add hierarchical pod groups and composite pod groups",
 			addPodGroups:           []*schedulingv1beta1.PodGroup{leafPG1, leafPG2},
-			addCompositePodGroups:  []*schedulingv1alpha3.CompositePodGroup{rootCPG, cpg1, cpg2},
+			addCompositePodGroups:  []*schedulingv1beta1.CompositePodGroup{rootCPG, cpg1, cpg2},
 			wantPodGroups:          []*schedulingv1beta1.PodGroup{leafPG1, leafPG2},
-			wantCompositePodGroups: []*schedulingv1alpha3.CompositePodGroup{rootCPG, cpg1, cpg2},
+			wantCompositePodGroups: []*schedulingv1beta1.CompositePodGroup{rootCPG, cpg1, cpg2},
 		},
 		{
 			name:                   "Add child pod group when parent composite pod group already exists",
-			initCompositePodGroups: []*schedulingv1alpha3.CompositePodGroup{rootCPG, cpg1},
+			initCompositePodGroups: []*schedulingv1beta1.CompositePodGroup{rootCPG, cpg1},
 			addPodGroups:           []*schedulingv1beta1.PodGroup{leafPG1},
 			wantPodGroups:          []*schedulingv1beta1.PodGroup{leafPG1},
-			wantCompositePodGroups: []*schedulingv1alpha3.CompositePodGroup{rootCPG, cpg1},
+			wantCompositePodGroups: []*schedulingv1beta1.CompositePodGroup{rootCPG, cpg1},
 		},
 		{
 			name:                   "Add parent composite pod group when child pod group already exists",
 			initPodGroups:          []*schedulingv1beta1.PodGroup{leafPG1},
-			addCompositePodGroups:  []*schedulingv1alpha3.CompositePodGroup{cpg1},
+			addCompositePodGroups:  []*schedulingv1beta1.CompositePodGroup{cpg1},
 			wantPodGroups:          []*schedulingv1beta1.PodGroup{leafPG1},
-			wantCompositePodGroups: []*schedulingv1alpha3.CompositePodGroup{cpg1},
+			wantCompositePodGroups: []*schedulingv1beta1.CompositePodGroup{cpg1},
 		},
 		{
 			name:          "Add pod group when pods belonging to it already exist in snapshot",
@@ -1781,17 +1753,17 @@ func TestSnapshot_AddPodGroups(t *testing.T) {
 		},
 		{
 			name:                   "Fallback on error when adding already existing composite pod group rolls back added pod groups and composite pod groups",
-			initCompositePodGroups: []*schedulingv1alpha3.CompositePodGroup{cpg2},
+			initCompositePodGroups: []*schedulingv1beta1.CompositePodGroup{cpg2},
 			addPodGroups:           []*schedulingv1beta1.PodGroup{leafPG1, leafPG2},
-			addCompositePodGroups:  []*schedulingv1alpha3.CompositePodGroup{rootCPG, cpg1, cpg2},
+			addCompositePodGroups:  []*schedulingv1beta1.CompositePodGroup{rootCPG, cpg1, cpg2},
 			wantPodGroups:          nil,
-			wantCompositePodGroups: []*schedulingv1alpha3.CompositePodGroup{cpg2},
+			wantCompositePodGroups: []*schedulingv1beta1.CompositePodGroup{cpg2},
 			wantErr:                true,
 		},
 		{
 			name:                   "Fallback on error when adding duplicate composite pod groups in same call rolls back all additions",
 			addPodGroups:           []*schedulingv1beta1.PodGroup{leafPG1},
-			addCompositePodGroups:  []*schedulingv1alpha3.CompositePodGroup{cpg1, cpg1},
+			addCompositePodGroups:  []*schedulingv1beta1.CompositePodGroup{cpg1, cpg1},
 			wantPodGroups:          nil,
 			wantCompositePodGroups: nil,
 			wantErr:                true,
@@ -1808,7 +1780,7 @@ func TestSnapshot_AddPodGroups(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			snap := cache.NewTestSnapshotWithCompositePodGroups(tc.initPods, nil, tc.initPodGroups, tc.initCompositePodGroups)
+			snap := cache.NewTestSnapshotWithPodGroups(tc.initPods, nil, tc.initPodGroups, tc.initCompositePodGroups)
 			cs := New(snap, nil)
 
 			err := cs.Transaction(t.Context(), func() (TransactionResult, error) {
@@ -1844,8 +1816,6 @@ func TestSnapshot_AddPodGroups(t *testing.T) {
 }
 
 // TestSnapshot_RemovePodGroups tests removing PodGroups and CompositePodGroups from ClusterSnapshot.
-// When k8s.io/kubernetes includes PR #142177, this test will verify the calls delegated
-// to cache.Snapshot.RemoveGenericPodGroup.
 func TestSnapshot_RemovePodGroups(t *testing.T) {
 	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
 		features.TopologyAwareWorkloadScheduling: true,
@@ -1866,11 +1836,11 @@ func TestSnapshot_RemovePodGroups(t *testing.T) {
 		name                    string
 		initPods                []*v1.Pod
 		initPodGroups           []*schedulingv1beta1.PodGroup
-		initCompositePodGroups  []*schedulingv1alpha3.CompositePodGroup
+		initCompositePodGroups  []*schedulingv1beta1.CompositePodGroup
 		removePodGroups         []*schedulingv1beta1.PodGroup
-		removeCompositePodGroup []*schedulingv1alpha3.CompositePodGroup
+		removeCompositePodGroup []*schedulingv1beta1.CompositePodGroup
 		wantPodGroups           []*schedulingv1beta1.PodGroup
-		wantCompositePodGroups  []*schedulingv1alpha3.CompositePodGroup
+		wantCompositePodGroups  []*schedulingv1beta1.CompositePodGroup
 		wantErr                 bool
 	}{
 		{
@@ -1882,24 +1852,24 @@ func TestSnapshot_RemovePodGroups(t *testing.T) {
 		{
 			name:                    "Remove entire hierarchy of pod groups and composite pod groups",
 			initPodGroups:           []*schedulingv1beta1.PodGroup{leafPG1, leafPG2},
-			initCompositePodGroups:  []*schedulingv1alpha3.CompositePodGroup{rootCPG, cpg1, cpg2},
+			initCompositePodGroups:  []*schedulingv1beta1.CompositePodGroup{rootCPG, cpg1, cpg2},
 			removePodGroups:         []*schedulingv1beta1.PodGroup{leafPG1, leafPG2},
-			removeCompositePodGroup: []*schedulingv1alpha3.CompositePodGroup{rootCPG, cpg1, cpg2},
+			removeCompositePodGroup: []*schedulingv1beta1.CompositePodGroup{rootCPG, cpg1, cpg2},
 			wantPodGroups:           nil,
 			wantCompositePodGroups:  nil,
 		},
 		{
 			name:                   "Remove child pod group unlinks it from parent composite pod group",
 			initPodGroups:          []*schedulingv1beta1.PodGroup{leafPG1, leafPG2},
-			initCompositePodGroups: []*schedulingv1alpha3.CompositePodGroup{rootCPG, cpg1},
+			initCompositePodGroups: []*schedulingv1beta1.CompositePodGroup{rootCPG, cpg1},
 			removePodGroups:        []*schedulingv1beta1.PodGroup{leafPG1},
 			wantPodGroups:          []*schedulingv1beta1.PodGroup{leafPG2},
-			wantCompositePodGroups: []*schedulingv1alpha3.CompositePodGroup{rootCPG, cpg1},
+			wantCompositePodGroups: []*schedulingv1beta1.CompositePodGroup{rootCPG, cpg1},
 		},
 		{
 			name:                   "Remove child pod group using lightweight lookup object unlinks it from parent composite pod group",
 			initPodGroups:          []*schedulingv1beta1.PodGroup{leafPG1, leafPG2},
-			initCompositePodGroups: []*schedulingv1alpha3.CompositePodGroup{rootCPG, cpg1},
+			initCompositePodGroups: []*schedulingv1beta1.CompositePodGroup{rootCPG, cpg1},
 			removePodGroups: []*schedulingv1beta1.PodGroup{
 				{
 					ObjectMeta: metav1.ObjectMeta{
@@ -1909,12 +1879,12 @@ func TestSnapshot_RemovePodGroups(t *testing.T) {
 				},
 			},
 			wantPodGroups:          []*schedulingv1beta1.PodGroup{leafPG2},
-			wantCompositePodGroups: []*schedulingv1alpha3.CompositePodGroup{rootCPG, cpg1},
+			wantCompositePodGroups: []*schedulingv1beta1.CompositePodGroup{rootCPG, cpg1},
 		},
 		{
 			name:                   "Fallback on error when removing with lightweight object restores full original pod group",
 			initPodGroups:          []*schedulingv1beta1.PodGroup{leafPG1},
-			initCompositePodGroups: []*schedulingv1alpha3.CompositePodGroup{rootCPG, cpg1},
+			initCompositePodGroups: []*schedulingv1beta1.CompositePodGroup{rootCPG, cpg1},
 			removePodGroups: []*schedulingv1beta1.PodGroup{
 				{
 					ObjectMeta: metav1.ObjectMeta{
@@ -1925,14 +1895,14 @@ func TestSnapshot_RemovePodGroups(t *testing.T) {
 				pg2,
 			},
 			wantPodGroups:          []*schedulingv1beta1.PodGroup{leafPG1},
-			wantCompositePodGroups: []*schedulingv1alpha3.CompositePodGroup{rootCPG, cpg1},
+			wantCompositePodGroups: []*schedulingv1beta1.CompositePodGroup{rootCPG, cpg1},
 			wantErr:                true,
 		},
 		{
 			name:                    "Remove parent composite pod group while child pod group remains",
 			initPodGroups:           []*schedulingv1beta1.PodGroup{leafPG1},
-			initCompositePodGroups:  []*schedulingv1alpha3.CompositePodGroup{cpg1},
-			removeCompositePodGroup: []*schedulingv1alpha3.CompositePodGroup{cpg1},
+			initCompositePodGroups:  []*schedulingv1beta1.CompositePodGroup{cpg1},
+			removeCompositePodGroup: []*schedulingv1beta1.CompositePodGroup{cpg1},
 			wantPodGroups:           []*schedulingv1beta1.PodGroup{leafPG1},
 			wantCompositePodGroups:  nil,
 		},
@@ -1960,28 +1930,28 @@ func TestSnapshot_RemovePodGroups(t *testing.T) {
 		{
 			name:                    "Fallback on error when removing non-existent composite pod group restores removed pod groups and composite pod groups",
 			initPodGroups:           []*schedulingv1beta1.PodGroup{leafPG1, leafPG2},
-			initCompositePodGroups:  []*schedulingv1alpha3.CompositePodGroup{rootCPG, cpg1},
+			initCompositePodGroups:  []*schedulingv1beta1.CompositePodGroup{rootCPG, cpg1},
 			removePodGroups:         []*schedulingv1beta1.PodGroup{leafPG1, leafPG2},
-			removeCompositePodGroup: []*schedulingv1alpha3.CompositePodGroup{rootCPG, cpg1, cpg2},
+			removeCompositePodGroup: []*schedulingv1beta1.CompositePodGroup{rootCPG, cpg1, cpg2},
 			wantPodGroups:           []*schedulingv1beta1.PodGroup{leafPG1, leafPG2},
-			wantCompositePodGroups:  []*schedulingv1alpha3.CompositePodGroup{rootCPG, cpg1},
+			wantCompositePodGroups:  []*schedulingv1beta1.CompositePodGroup{rootCPG, cpg1},
 			wantErr:                 true,
 		},
 		{
 			name:                    "Fallback on error when removing same composite pod group twice in one call",
 			initPodGroups:           []*schedulingv1beta1.PodGroup{leafPG1},
-			initCompositePodGroups:  []*schedulingv1alpha3.CompositePodGroup{cpg1},
+			initCompositePodGroups:  []*schedulingv1beta1.CompositePodGroup{cpg1},
 			removePodGroups:         []*schedulingv1beta1.PodGroup{leafPG1},
-			removeCompositePodGroup: []*schedulingv1alpha3.CompositePodGroup{cpg1, cpg1},
+			removeCompositePodGroup: []*schedulingv1beta1.CompositePodGroup{cpg1, cpg1},
 			wantPodGroups:           []*schedulingv1beta1.PodGroup{leafPG1},
-			wantCompositePodGroups:  []*schedulingv1alpha3.CompositePodGroup{cpg1},
+			wantCompositePodGroups:  []*schedulingv1beta1.CompositePodGroup{cpg1},
 			wantErr:                 true,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			snap := cache.NewTestSnapshotWithCompositePodGroups(tc.initPods, nil, tc.initPodGroups, tc.initCompositePodGroups)
+			snap := cache.NewTestSnapshotWithPodGroups(tc.initPods, nil, tc.initPodGroups, tc.initCompositePodGroups)
 			cs := New(snap, nil)
 
 			err := cs.Transaction(t.Context(), func() (TransactionResult, error) {

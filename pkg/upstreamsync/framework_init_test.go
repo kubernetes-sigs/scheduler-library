@@ -38,7 +38,6 @@ import (
 	internalcache "k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
-	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/preemption"
 )
 
 // verifyErr verifies that the given error is the error expected by the test case.
@@ -203,10 +202,8 @@ func TestNewFrameworkMap(t *testing.T) {
 					SchedulerName: "default-scheduler",
 				},
 			}
-			pgInfo := &framework.PodGroupInfo{
-				PodGroup:        &schedulingv1beta1.PodGroup{},
-				UnscheduledPods: []*v1.Pod{pod},
-			}
+			pgInfo := framework.NewPodGroupInfo(fwk.NewGenericPodGroup(&schedulingv1beta1.PodGroup{}))
+			pgInfo.UnscheduledPods = []*v1.Pod{pod}
 			f, err := profileMap.FrameworkForPodGroup(pgInfo)
 			if err != nil {
 				t.Fatalf("FrameworkForPodGroup failed: %v", err)
@@ -216,9 +213,7 @@ func TestNewFrameworkMap(t *testing.T) {
 			}
 		})
 		t.Run("empty pod group returns error", func(t *testing.T) {
-			pgInfo := &framework.PodGroupInfo{
-				PodGroup: &schedulingv1beta1.PodGroup{},
-			}
+			pgInfo := framework.NewPodGroupInfo(fwk.NewGenericPodGroup(&schedulingv1beta1.PodGroup{}))
 			_, err := profileMap.FrameworkForPodGroup(pgInfo)
 			if err == nil {
 				t.Fatal("expected error for empty pod group, got nil")
@@ -309,16 +304,19 @@ func TestNewFrameworkMapSharedDRAManager(t *testing.T) {
 // only checks which manager each framework was given, so none of the methods are ever called.
 type stubPreemptionManager struct {
 	// handle is the Handle the factory created the manager for.
-	handle preemption.Handle
+	handle fwk.Handle
 }
 
-var _ preemption.PreemptionManager = &stubPreemptionManager{}
+var _ fwk.PreemptionManager = &stubPreemptionManager{}
 
-func (s *stubPreemptionManager) GenerateVictims(context.Context, fwk.PodGroupInfo) ([]preemption.PreemptionVictim, *fwk.Status) {
+func (s *stubPreemptionManager) GenerateVictims(context.Context, fwk.PodGroupInfo) ([]fwk.PreemptionVictim, *fwk.Status) {
 	return nil, nil
 }
-func (s *stubPreemptionManager) Executor() preemption.PreemptionExecutor { return nil }
-func (s *stubPreemptionManager) NewReprieveFilter(context.Context, []preemption.PreemptionVictim) preemption.ReprieveFilter {
+func (s *stubPreemptionManager) CompareVictimSets(context.Context, []fwk.PreemptionVictim, []fwk.PreemptionVictim) int {
+	return 0
+}
+func (s *stubPreemptionManager) Executor() fwk.PreemptionExecutor { return nil }
+func (s *stubPreemptionManager) NewReprieveFilter(context.Context, []fwk.PreemptionVictim) fwk.ReprieveFilter {
 	return nil
 }
 
@@ -330,13 +328,18 @@ func TestNewFrameworkMapPreemptionManager(t *testing.T) {
 	tests := []struct {
 		name        string
 		withFactory bool
+		nilFactory  bool
 	}{
 		{
 			name:        "the factory creates a separate PreemptionManager for each profile",
 			withFactory: true,
 		},
 		{
-			name: "without a factory the profiles have no PreemptionManager",
+			name: "without a factory the profiles use the default PreemptionManager",
+		},
+		{
+			name:       "with a nil factory the profiles have no PreemptionManager",
+			nilFactory: true,
 		},
 	}
 
@@ -353,10 +356,12 @@ func TestNewFrameworkMapPreemptionManager(t *testing.T) {
 			factoryCalls := 0
 			var opts []FrameworkMapOption
 			if tt.withFactory {
-				opts = append(opts, WithPreemptionManager(func(fh preemption.Handle) preemption.PreemptionManager {
+				opts = append(opts, WithPreemptionManager(func(fh fwk.Handle) fwk.PreemptionManager {
 					factoryCalls++
 					return &stubPreemptionManager{handle: fh}
 				}))
+			} else if tt.nilFactory {
+				opts = append(opts, WithPreemptionManager(nil))
 			}
 
 			profileMap, err := NewFrameworkMap(ctx, comps, fakeRecorderFactory, internalcache.NewEmptySnapshot(), opts...)
@@ -368,19 +373,25 @@ func TestNewFrameworkMapPreemptionManager(t *testing.T) {
 				t.Errorf("factory called %d times, want once per profile (%d)", factoryCalls, len(profiles))
 			}
 			for _, prof := range profiles {
-				pf, ok := profileMap.preemptionFrameworks[prof.SchedulerName]
+				pf, ok := profileMap.Map[prof.SchedulerName]
 				if !ok {
-					t.Fatalf("preemptionFrameworks has no entry for %q", prof.SchedulerName)
+					t.Fatalf("profileMap.Map has no entry for %q", prof.SchedulerName)
 				}
 				got := pf.PreemptionManager()
-				if !tt.withFactory {
+				if tt.nilFactory {
 					if got != nil {
 						t.Errorf("profile %q: PreemptionManager() = %v, want nil", prof.SchedulerName, got)
 					}
 					continue
 				}
+				if !tt.withFactory {
+					if _, ok := got.(*noopActuationPreemptionManager); !ok {
+						t.Errorf("profile %q: PreemptionManager() = %T, want *noopActuationPreemptionManager", prof.SchedulerName, got)
+					}
+					continue
+				}
 				if stub, ok := got.(*stubPreemptionManager); !ok || stub.handle != pf {
-					t.Errorf("profile %q: PreemptionManager() = %v, want the one the factory created for the profile's PreemptionFramework", prof.SchedulerName, got)
+					t.Errorf("profile %q: PreemptionManager() = %v, want the one the factory created for the profile's Framework", prof.SchedulerName, got)
 				}
 			}
 		})

@@ -15,6 +15,7 @@
 package preemption_test
 
 import (
+	"fmt"
 	"slices"
 	"testing"
 
@@ -23,15 +24,27 @@ import (
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	fwk "k8s.io/kube-scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler"
+	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	ft "sigs.k8s.io/scheduler-library/pkg/framework/testing"
 	"sigs.k8s.io/scheduler-library/pkg/preemption"
-	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
-	upstreampreemption "sigs.k8s.io/scheduler-library/pkg/upstreamsync/preemption"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
 	testutils "sigs.k8s.io/scheduler-library/pkg/upstreamsync/testutils"
 )
+
+type nilPreemptionManagerFramework struct {
+	framework.Framework
+}
+
+type noopCacheWrapper struct {
+	cache.Cache
+}
+
+func (nilPreemptionManagerFramework) PreemptionManager() fwk.PreemptionManager {
+	return nil
+}
 
 type testVictim struct {
 	name string
@@ -103,13 +116,12 @@ func (f *fakeFilter) MayFit() bool {
 func TestEvaluateWorkloadPreemption(t *testing.T) {
 	ctx := t.Context()
 
-	gangPG := testutils.MakeGangPodGroup("gang-pg", "", 1)
-
 	// Victims for 6-CPU node1 scenarios:
 	v2CPUa := makeVictimOnNode("v2CPUa", "node1", "2")
 	v2CPUb := makeVictimOnNode("v2CPUb", "node1", "2")
 	v2CPUc := makeVictimOnNode("v2CPUc", "node1", "2")
 	v4CPU := makeVictimOnNode("v4CPU", "node1", "4")
+	vNode3 := makeVictimOnNode("vNode3", "node3", "4")
 
 	// Victims for binary-search scenario (workload requests 6 CPU):
 	// b0..b5 (1 CPU each) and b8..b9 (2 CPU each) occupy 10 CPU on node1 (10 CPU capacity).
@@ -135,6 +147,7 @@ func TestEvaluateWorkloadPreemption(t *testing.T) {
 		name                 string
 		nodes                []*v1.Node
 		workloadCPU          string
+		workloadCPUs         []string
 		potentialVictims     []preemption.PreemptionVictim
 		filter               *fakeFilter
 		nilPreemptionManager bool
@@ -225,6 +238,25 @@ func TestEvaluateWorkloadPreemption(t *testing.T) {
 			// v4CPU is kept for node1; b2, b1, b0 are reprieved;
 			// b6 and b7 are kept because MayFit() requires at least 3 victims.
 			wantVictims: []preemption.PreemptionVictim{b6, b7, v4CPU},
+		},
+		{
+			name: "CompareVictimSets ranks node with more-preferred preemption victim ahead of earlier-listed node",
+			nodes: []*v1.Node{
+				makeNode("node1", "2"),
+				makeNode("node2", "2"),
+				makeNode("node3", "4"),
+			},
+			workloadCPUs: []string{"4", "2"},
+			potentialVictims: []preemption.PreemptionVictim{
+				b7,     // index 0: 2 CPU on node2
+				v2CPUa, // index 1: 2 CPU on node1
+				vNode3, // index 2: 4 CPU on node3
+			},
+			wantStatusCode: fwk.Success,
+			// At prefix size 3, all 3 nodes are free. The 4-CPU pod schedules on node3,
+			// and CompareVictimSets ranks node2 (victim index 0) ahead of node1 (victim index 1)
+			// for the 2-CPU pod, so v2CPUa on node1 is reprieved.
+			wantVictims: []preemption.PreemptionVictim{b7, vNode3},
 		},
 		{
 			name:             "PreemptionFilter MayFit never satisfied returns Unschedulable",
@@ -376,33 +408,48 @@ func TestEvaluateWorkloadPreemption(t *testing.T) {
 				}
 			}
 
+			cpus := tt.workloadCPUs
+			if len(cpus) == 0 {
+				cpus = []string{tt.workloadCPU}
+			}
+			workloadPods := make([]*v1.Pod, len(cpus))
+			for i, cpu := range cpus {
+				workloadPods[i] = testutils.MakePod(fmt.Sprintf("w-pod-%d", i), "gang-pg", cpu)
+			}
+			pg := testutils.MakeGangPodGroup("gang-pg", "", int32(len(workloadPods)))
+
 			profileMap, snap, err := ft.SetupSnapshotTestWithPodGroups(
 				ctx,
 				t,
 				existingPods,
 				tt.nodes,
-				[]*schedulingv1beta1.PodGroup{gangPG},
+				[]*schedulingv1beta1.PodGroup{pg},
 				nil,
 			)
 			if err != nil {
 				t.Fatalf("SetupSnapshotTestWithPodGroups failed: %v", err)
 			}
 
-			workloadPod := testutils.MakePod("w-pod", "gang-pg", tt.workloadCPU)
-			podGroupInfo, err := snapshot.BuildGroupHierarchyForTest(snap, []*v1.Pod{workloadPod})
+			queuedPodGroupInfo, err := snapshot.BuildGroupHierarchyForTest(snap, workloadPods)
 			if err != nil {
 				t.Fatalf("BuildGroupHierarchyForTest failed: %v", err)
 			}
+			podGroupInfo := queuedPodGroupInfo.PodGroupInfo
 			schedFramework, err := profileMap.FrameworkForPodGroup(podGroupInfo)
 			if err != nil {
 				t.Fatalf("FrameworkForPodGroup failed: %v", err)
 			}
 			if tt.nilPreemptionManager {
-				schedFramework = upstreampreemption.NewPreemptionFramework(schedFramework.Framework, nil)
+				schedFramework = nilPreemptionManagerFramework{Framework: schedFramework}
 			}
 
-			sched := upstreamsync.NewScheduler(snap, 0, 0, 1, nil)
-			baseSchedFn := sched.BuildPodGroupSchedulingFunc(schedFramework, podGroupInfo)
+			podAlg, err := scheduler.NewSchedulingAlgorithm(snap, noopCacheWrapper{})
+			if err != nil {
+				t.Fatalf("NewSchedulingAlgorithm failed: %v", err)
+			}
+			pgAlg := scheduler.NewPodGroupAlgorithm(snap, podAlg)
+			cycleState := framework.NewCycleState()
+			baseSchedFn := pgAlg.BuildPodGroupSchedulingFunc(schedFramework, cycleState, queuedPodGroupInfo)
 
 			var opts preemption.WorkloadPreemptionOptions
 			if tt.filter != nil {
@@ -413,7 +460,7 @@ func TestEvaluateWorkloadPreemption(t *testing.T) {
 			}
 
 			gotAssignments, gotVictims, gotStatus := preemption.EvaluateWorkloadPreemption(
-				ctx, schedFramework, framework.NewCycleState(), podGroupInfo, baseSchedFn, opts,
+				ctx, schedFramework, cycleState, podGroupInfo, baseSchedFn, opts,
 			)
 			if gotStatus.Code() != tt.wantStatusCode {
 				t.Fatalf("EvaluateWorkloadPreemption() Status.Code() = %v, want %v (status: %v)", gotStatus.Code(), tt.wantStatusCode, gotStatus)
@@ -452,8 +499,8 @@ func TestEvaluateWorkloadPreemption(t *testing.T) {
 			if tt.filter != nil && !tt.filter.activeVictimSet.Equal(sets.New(tt.wantVictims...)) {
 				t.Errorf("filter.activeVictimSet = %v, want %v", tt.filter.activeVictimSet.UnsortedList(), tt.wantVictims)
 			}
-			if gotAssignments == nil || len(gotAssignments.ProposedAssignments) != 1 {
-				t.Errorf("EvaluateWorkloadPreemption() assignments = %v, want 1 proposed assignment", gotAssignments)
+			if gotAssignments == nil || len(gotAssignments.ProposedAssignments) != len(workloadPods) {
+				t.Errorf("EvaluateWorkloadPreemption() assignments = %v, want %d proposed assignments", gotAssignments, len(workloadPods))
 			}
 		})
 	}
@@ -479,15 +526,20 @@ func TestEvaluateWorkloadPreemptionRepeated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SetupSnapshotTestWithPodGroups failed: %v", err)
 	}
-	podGroupInfo, err := snapshot.BuildGroupHierarchyForTest(snap, []*v1.Pod{testutils.MakePod("w-pod", "gang-pg", "4")})
+	queuedPodGroupInfo, err := snapshot.BuildGroupHierarchyForTest(snap, []*v1.Pod{testutils.MakePod("w-pod", "gang-pg", "4")})
 	if err != nil {
 		t.Fatalf("BuildGroupHierarchyForTest failed: %v", err)
 	}
+	podGroupInfo := queuedPodGroupInfo.PodGroupInfo
 	schedFramework, err := profileMap.FrameworkForPodGroup(podGroupInfo)
 	if err != nil {
 		t.Fatalf("FrameworkForPodGroup failed: %v", err)
 	}
-	baseSchedFn := upstreamsync.NewScheduler(snap, 0, 0, 1, nil).BuildPodGroupSchedulingFunc(schedFramework, podGroupInfo)
+	podAlg, err := scheduler.NewSchedulingAlgorithm(snap, noopCacheWrapper{})
+	if err != nil {
+		t.Fatalf("NewSchedulingAlgorithm failed: %v", err)
+	}
+	pgAlg := scheduler.NewPodGroupAlgorithm(snap, podAlg)
 
 	calls := []struct {
 		opts        preemption.WorkloadPreemptionOptions
@@ -509,8 +561,10 @@ func TestEvaluateWorkloadPreemptionRepeated(t *testing.T) {
 	}
 
 	for i, call := range calls {
+		cycleState := framework.NewCycleState()
+		baseSchedFn := pgAlg.BuildPodGroupSchedulingFunc(schedFramework, cycleState, queuedPodGroupInfo)
 		_, gotVictims, gotStatus := preemption.EvaluateWorkloadPreemption(
-			ctx, schedFramework, framework.NewCycleState(), podGroupInfo, baseSchedFn, call.opts,
+			ctx, schedFramework, cycleState, podGroupInfo, baseSchedFn, call.opts,
 		)
 		if !gotStatus.IsSuccess() {
 			t.Fatalf("call %d: EvaluateWorkloadPreemption() status = %v, want success", i+1, gotStatus)

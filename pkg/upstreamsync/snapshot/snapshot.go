@@ -19,25 +19,27 @@ import (
 	"errors"
 	"fmt"
 	"iter"
-	"math"
-	"reflect"
 	"slices"
 
 	v1 "k8s.io/api/core/v1"
-	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
-	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/klog/v2"
 
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/kubernetes/pkg/scheduler"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"sigs.k8s.io/scheduler-library/pkg/preemption"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
-	upstreampreemption "sigs.k8s.io/scheduler-library/pkg/upstreamsync/preemption"
 )
+
+// noopCacheWrapper satisfies cache.Cache for SchedulingAlgorithm instances that only
+// operate on the in-memory snapshot and never touch the scheduler cache.
+type noopCacheWrapper struct {
+	cache.Cache
+}
 
 // ClusterSnapshot wraps a scheduler snapshot and its associated frameworks.
 // The ClusterSnapshot of a ClusterState (state.ClusterState.GetAssociatedSnapshot) shares its
@@ -179,38 +181,26 @@ func (s *ClusterSnapshot) CanSchedulePod(ctx context.Context, pod *v1.Pod, place
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create pod info: %w", err)
 	}
-	pendingPod := &upstreamsync.PendingPod{
-		PodInfo:    podInfo,
-		CycleState: state,
-	}
 
-	feasibleNodes := make([]string, 0)
-	var diagnosis framework.Diagnosis
-	sched := upstreamsync.NewScheduler(s.schedulerSnapshot, 0, 0, math.MaxInt32, nil)
+	alg, err := scheduler.NewSchedulingAlgorithm(s.schedulerSnapshot, noopCacheWrapper{})
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create scheduling algorithm: %w", err)
+	}
 	err = s.schedulerSnapshot.AssumePlacement(placement)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to assume placement: %w", err)
 	}
 	defer s.schedulerSnapshot.ForgetPlacement()
-	nodes, diag, _, err := sched.FindAllNodesThatFitPod(ctx, schedFramework, pendingPod)
-	diagnosis = diag
+	nodes, diagnosis, err := alg.FindAllNodesThatFitPod(ctx, state, schedFramework, &framework.QueuedPodInfo{PodInfo: podInfo})
+	feasibleNodes := make([]string, 0, len(nodes))
 	for _, node := range nodes {
 		feasibleNodes = append(feasibleNodes, node.Node().Name)
 	}
 	if err != nil {
-		return nil, &diagnosis, fmt.Errorf("failed to find nodes that fit pod: %w", err)
+		return nil, diagnosis, fmt.Errorf("failed to find nodes that fit pod: %w", err)
 	}
 
-	return feasibleNodes, &diagnosis, nil
-}
-
-func schedulingResult(algRes *upstreamsync.AlgorithmResult) SchedulingResult {
-	return SchedulingResult{
-		Pod:              algRes.GetPod(),
-		Status:           algRes.GetStatus(),
-		SelectedNodeName: algRes.GetNodeName(),
-		CycleState:       algRes.GetCycleState(),
-	}
+	return feasibleNodes, diagnosis, nil
 }
 
 // SchedulePods schedules the given pods onto the specified placement using PreFilter and Filter plugins.
@@ -289,28 +279,36 @@ func (s *ClusterSnapshot) schedulePods(ctx context.Context, pods iter.Seq[*v1.Po
 		return nil, fmt.Errorf("error assuming placement: %w", err)
 	}
 	defer s.schedulerSnapshot.ForgetPlacement()
-	for pod := range pods {
-		sched := upstreamsync.NewScheduler(s.schedulerSnapshot, currentCycle, 0, 1, nil)
 
-		res, revertFn, err := scheduleOnePod(ctx, s.profiles, sched, pod)
+	alg, err := scheduler.NewSchedulingAlgorithm(
+		s.schedulerSnapshot,
+		noopCacheWrapper{},
+		scheduler.WithCurrentCycleProvider(func() int64 { return currentCycle }),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create scheduling algorithm: %w", err)
+	}
+
+	for pod := range pods {
+		res, revertFn, err := scheduleOnePod(ctx, s.profiles, alg, pod)
 
 		if err != nil {
 			return result, err
 		}
 
-		if res.GetStatus().IsSuccess() {
+		if res.Status.IsSuccess() {
 			// The pod object is a copy made within the simulation library. It is not modified by
 			// scheduleOnePod, but it is returned in the result object. To make the result placement
 			// visible to the caller, pod.Spec.NodeName needs to be set.
-			pod.Spec.NodeName = res.GetNodeName()
+			pod.Spec.NodeName = res.SelectedNodeName
 		}
 
 		if revertFn != nil {
 			s.undoLog.registerOperation(revertFn)
 		}
-		result = append(result, schedulingResult(res))
+		result = append(result, res)
 
-		if !res.GetStatus().IsSuccess() {
+		if !res.Status.IsSuccess() {
 			if opts.StopOnFailure {
 				return result, nil
 			}
@@ -492,10 +490,11 @@ func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, 
 		}
 	}()
 
-	podGroupInfo, err := buildPodGroupHierarchy(s.schedulerSnapshot, pods)
+	queuedPodGroupInfo, err := buildPodGroupHierarchy(s.schedulerSnapshot, pods)
 	if err != nil {
 		return WorkloadSchedulingResult{Status: fwk.AsStatus(fmt.Errorf("failed to build pod group hierarchy: %w", err))}
 	}
+	podGroupInfo := queuedPodGroupInfo.PodGroupInfo
 
 	schedFramework, err := s.profiles.FrameworkForPodGroup(podGroupInfo)
 	if err != nil {
@@ -504,7 +503,11 @@ func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, 
 
 	// First, try scheduling without preemption with the nodes occupied by committed victims filtered out.
 	// Fit here means the workload doesn't need to wait for preemption.
-	sched := upstreamsync.NewScheduler(s.schedulerSnapshot, 0, 0, 1, nil)
+	podAlg, err := scheduler.NewSchedulingAlgorithm(s.schedulerSnapshot, noopCacheWrapper{})
+	if err != nil {
+		return WorkloadSchedulingResult{Status: fwk.AsStatus(fmt.Errorf("failed to create scheduling algorithm: %w", err))}
+	}
+	pgAlg := scheduler.NewPodGroupAlgorithm(s.schedulerSnapshot, podAlg)
 	rootCycleState := framework.NewCycleState()
 	err = preemption.SetCommittedVictimsInCycleState(rootCycleState, opts.CommittedVictims)
 	if err != nil {
@@ -517,7 +520,7 @@ func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, 
 			opts.PreemptionFilter.UnpreemptVictim(v)
 		}
 	}
-	initialResult := s.scheduleWorkloadWithoutPreemption(ctx, sched, schedFramework, rootCycleState, podGroupInfo, opts)
+	initialResult := s.scheduleWorkloadWithoutPreemption(ctx, podAlg, pgAlg, schedFramework, rootCycleState, queuedPodGroupInfo, opts, !opts.DryRun)
 	if opts.PreemptionFilter != nil {
 		for _, v := range opts.CommittedVictims {
 			opts.PreemptionFilter.PreemptVictim(v)
@@ -531,7 +534,7 @@ func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, 
 	// Fit here means the workload needs to wait for preemption of CommittedVictims.
 	if len(opts.CommittedVictims) > 0 {
 		rootCycleState = framework.NewCycleState()
-		initialResult = s.scheduleWorkloadWithoutPreemption(ctx, sched, schedFramework, rootCycleState, podGroupInfo, opts)
+		initialResult = s.scheduleWorkloadWithoutPreemption(ctx, podAlg, pgAlg, schedFramework, rootCycleState, queuedPodGroupInfo, opts, false)
 		if initialResult.Status.IsSuccess() {
 			initialResult.Status = fwk.NewStatus(fwk.Unschedulable, "waiting for preemption of committed victims")
 			initialResult.WaitingForPreemption = true
@@ -548,16 +551,18 @@ func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, 
 
 	// Third, try scheduling with preemption of the provided potential victims.
 	// Fit here means the workload needs to wait for new victims to be preempted.
-	return s.workloadPreemption(ctx, sched, schedFramework, rootCycleState, podGroupInfo, initialResult, opts)
+	return s.workloadPreemption(ctx, pgAlg, schedFramework, rootCycleState, queuedPodGroupInfo, initialResult, opts)
 }
 
 func (s *ClusterSnapshot) scheduleWorkloadWithoutPreemption(
 	ctx context.Context,
-	sched *upstreamsync.Scheduler,
-	schedFramework *upstreampreemption.PreemptionFramework,
+	podAlg *scheduler.SchedulingAlgorithm,
+	pgAlg *scheduler.PodGroupSchedulingAlgorithm,
+	schedFramework framework.Framework,
 	podGroupCycleState *framework.CycleState,
-	podGroupInfo *framework.PodGroupInfo,
+	queuedPodGroupInfo *framework.QueuedPodGroupInfo,
 	opts ScheduleWorkloadOptions,
+	assumeInSnapshot bool,
 ) WorkloadSchedulingResult {
 	if opts.PreemptionFilter != nil && !opts.PreemptionFilter.MayFit() {
 		return WorkloadSchedulingResult{
@@ -565,28 +570,42 @@ func (s *ClusterSnapshot) scheduleWorkloadWithoutPreemption(
 		}
 	}
 
-	algResultsMap, revertFn := sched.RunRootSchedulingAlgorithm(ctx, schedFramework, podGroupCycleState, podGroupInfo)
-	rootResult := algResultsMap[upstreamsync.GetEntityKey(podGroupInfo)]
-	if rootResult.Status.IsError() {
-		return WorkloadSchedulingResult{Status: rootResult.Status}
+	podGroupInfo := queuedPodGroupInfo.PodGroupInfo
+	algResultsMap := pgAlg.RunRootSchedulingAlgorithm(ctx, schedFramework, podGroupCycleState, queuedPodGroupInfo)
+	rootResult := algResultsMap[podGroupInfo.GetKey()]
+	if rootResult.Status().IsError() {
+		return WorkloadSchedulingResult{Status: rootResult.Status()}
 	}
-	if !rootResult.Status.IsSuccess() {
+	if !rootResult.Status().IsSuccess() {
 		return WorkloadSchedulingResult{
-			Status:     rootResult.Status,
-			PodResults: buildFailedWorkloadPodResults(podGroupInfo, podGroupCycleState, algResultsMap),
+			Status:     rootResult.Status(),
+			PodResults: buildFailedWorkloadPodResults(queuedPodGroupInfo, podGroupCycleState, algResultsMap),
 		}
 	}
 
-	if revertFn != nil {
-		s.undoLog.registerOperation(revertFn)
-	}
 	var podResults []SchedulingResult
-	for res := range upstreamsync.SuccessfulLeafResults(podGroupInfo, algResultsMap) {
-		for _, pRes := range res.PodResults {
-			if pRes.GetStatus().IsSuccess() {
+	for res := range scheduler.SuccessfulLeafResults(podGroupInfo, algResultsMap) {
+		for _, pRes := range res.PodResults() {
+			if pRes.Status().IsSuccess() && pRes.GetNodeName() != "" {
+				if assumeInSnapshot {
+					qpi := pRes.GetPodInfo().(*framework.QueuedPodInfo)
+					assumeStatus, revertFn := podAlg.AssumeAndReserveInSnapshot(
+						ctx,
+						pRes.GetCycleState(),
+						schedFramework,
+						qpi,
+						scheduler.ScheduleResult{SuggestedHost: pRes.GetNodeName()},
+					)
+					if revertFn != nil {
+						s.undoLog.registerOperation(revertFn)
+					}
+					if !assumeStatus.IsSuccess() {
+						return WorkloadSchedulingResult{Status: assumeStatus}
+					}
+				}
 				podResults = append(podResults, SchedulingResult{
 					Pod:              pRes.GetPod(),
-					Status:           pRes.GetStatus(),
+					Status:           pRes.Status(),
 					SelectedNodeName: pRes.GetNodeName(),
 					CycleState:       pRes.GetCycleState(),
 				})
@@ -594,28 +613,28 @@ func (s *ClusterSnapshot) scheduleWorkloadWithoutPreemption(
 		}
 	}
 	return WorkloadSchedulingResult{
-		Status:     rootResult.Status,
+		Status:     rootResult.Status(),
 		PodResults: podResults,
 	}
 }
 
 func (s *ClusterSnapshot) workloadPreemption(
 	ctx context.Context,
-	sched *upstreamsync.Scheduler,
-	schedFramework *upstreampreemption.PreemptionFramework,
+	pgAlg *scheduler.PodGroupSchedulingAlgorithm,
+	schedFramework framework.Framework,
 	podGroupCycleState *framework.CycleState,
-	podGroupInfo *framework.PodGroupInfo,
+	queuedPodGroupInfo *framework.QueuedPodGroupInfo,
 	initialResult WorkloadSchedulingResult,
 	opts ScheduleWorkloadOptions,
 ) WorkloadSchedulingResult {
-	baseSchedulingFunc := sched.BuildPodGroupSchedulingFunc(schedFramework, podGroupInfo)
+	baseSchedulingFunc := pgAlg.BuildPodGroupSchedulingFunc(schedFramework, podGroupCycleState, queuedPodGroupInfo)
 
 	// Pull PotentialVictims and run PodGroup preemption with reprieval.
 	assignments, preemptedVictims, status := preemption.EvaluateWorkloadPreemption(
 		ctx,
 		schedFramework,
 		podGroupCycleState,
-		podGroupInfo,
+		queuedPodGroupInfo.PodGroupInfo,
 		baseSchedulingFunc,
 		opts.WorkloadPreemptionOptions,
 	)
@@ -637,14 +656,17 @@ func (s *ClusterSnapshot) workloadPreemption(
 // buildFailedWorkloadPodResults completes pod group results across the hierarchy and traverses
 // the hierarchy in DFS order to collect results for all pods with SelectedNodeName cleared.
 func buildFailedWorkloadPodResults(
-	root *framework.PodGroupInfo,
+	root *framework.QueuedPodGroupInfo,
 	podGroupCycleState *framework.CycleState,
-	algResultsMap map[fwk.EntityKey]*upstreamsync.PodGroupAlgorithmResult,
+	algResultsMap map[fwk.EntityKey]*scheduler.PodGroupScheduledResult,
 ) []SchedulingResult {
+	var completePGResults map[fwk.EntityKey]*upstreamsync.PodGroupScheduledResult
 	if utilfeature.DefaultFeatureGate.Enabled(features.CompositePodGroup) && root.GetType() == fwk.CompositePodGroupKeyType {
-		upstreamsync.CompleteCompositePodGroupAlgorithmResult(root, podGroupCycleState, algResultsMap)
+		completePGResults = upstreamsync.CompleteCompositePodGroupAlgorithmResult(root, podGroupCycleState, algResultsMap)
 	} else {
-		upstreamsync.CompletePodGroupAlgorithmResult(podGroupCycleState, algResultsMap[upstreamsync.GetEntityKey(root)])
+		queuedPodInfos := root.PodInfosForGroup(root.PodGroupInfo.GetKey())
+		result := upstreamsync.CompletePodGroupAlgorithmResult(queuedPodInfos, podGroupCycleState, algResultsMap[root.PodGroupInfo.GetKey()])
+		completePGResults = map[fwk.EntityKey]*upstreamsync.PodGroupScheduledResult{root.PodGroupInfo.GetKey(): result}
 	}
 	var results []SchedulingResult
 	var walk func(pgi *framework.PodGroupInfo)
@@ -652,23 +674,23 @@ func buildFailedWorkloadPodResults(
 		if pgi == nil {
 			return
 		}
-		for _, child := range pgi.Children {
+		for _, child := range pgi.Children() {
 			walk(child)
 		}
-		groupResult, ok := algResultsMap[upstreamsync.GetEntityKey(pgi)]
+		groupResult, ok := completePGResults[pgi.GetKey()]
 		if !ok || groupResult == nil {
 			return
 		}
-		for _, pRes := range groupResult.PodResults {
+		for _, pRes := range groupResult.PodResults() {
 			results = append(results, SchedulingResult{
 				Pod:              pRes.GetPod(),
-				Status:           pRes.GetStatus(),
+				Status:           pRes.Status(),
 				SelectedNodeName: "",
 				CycleState:       pRes.GetCycleState(),
 			})
 		}
 	}
-	walk(root)
+	walk(root.PodGroupInfo)
 	return results
 }
 
@@ -697,12 +719,13 @@ func (s *ClusterSnapshot) AddPodGroup(ctx context.Context, pg *schedulingv1beta1
 		return fmt.Errorf("pod group is nil")
 	}
 	pgCopy := pg.DeepCopy()
-	if err := s.addPodGroup(pgCopy); err != nil {
+	gpg := fwk.NewGenericPodGroup(pgCopy)
+	if err := s.schedulerSnapshot.AddGenericPodGroup(gpg); err != nil {
 		return err
 	}
 	logger := klog.FromContext(ctx)
 	s.undoLog.registerOperation(func() {
-		if _, err := s.removePodGroup(pgCopy); err != nil {
+		if err := s.schedulerSnapshot.RemoveGenericPodGroup(gpg); err != nil {
 			logger.Error(err, "failed to remove pod group during state revert", "podGroup", klog.KObj(pgCopy))
 		}
 	})
@@ -716,13 +739,17 @@ func (s *ClusterSnapshot) RemovePodGroup(ctx context.Context, pg *schedulingv1be
 	if pg == nil {
 		return fmt.Errorf("pod group is nil")
 	}
-	removedPG, err := s.removePodGroup(pg)
+	existingPG, err := s.schedulerSnapshot.PodGroups().Get(pg.Namespace, pg.Name)
 	if err != nil {
 		return err
 	}
+	if err := s.schedulerSnapshot.RemoveGenericPodGroup(fwk.NewGenericPodGroup(existingPG)); err != nil {
+		return err
+	}
+	removedPG := existingPG.DeepCopy()
 	logger := klog.FromContext(ctx)
 	s.undoLog.registerOperation(func() {
-		if err := s.addPodGroup(removedPG); err != nil {
+		if err := s.schedulerSnapshot.AddGenericPodGroup(fwk.NewGenericPodGroup(removedPG)); err != nil {
 			logger.Error(err, "failed to restore pod group during state revert", "podGroup", klog.KObj(removedPG))
 		}
 	})
@@ -732,17 +759,18 @@ func (s *ClusterSnapshot) RemovePodGroup(ctx context.Context, pg *schedulingv1be
 
 // AddCompositePodGroup adds a composite pod group object to the snapshot, linking it
 // to its parent composite pod group if present.
-func (s *ClusterSnapshot) AddCompositePodGroup(ctx context.Context, cpg *schedulingv1alpha3.CompositePodGroup) error {
+func (s *ClusterSnapshot) AddCompositePodGroup(ctx context.Context, cpg *schedulingv1beta1.CompositePodGroup) error {
 	if cpg == nil {
 		return fmt.Errorf("composite pod group is nil")
 	}
 	cpgCopy := cpg.DeepCopy()
-	if err := s.addCompositePodGroup(cpgCopy); err != nil {
+	gpg := fwk.NewGenericCompositePodGroup(cpgCopy)
+	if err := s.schedulerSnapshot.AddGenericPodGroup(gpg); err != nil {
 		return err
 	}
 	logger := klog.FromContext(ctx)
 	s.undoLog.registerOperation(func() {
-		if _, err := s.removeCompositePodGroup(cpgCopy); err != nil {
+		if err := s.schedulerSnapshot.RemoveGenericPodGroup(gpg); err != nil {
 			logger.Error(err, "failed to remove composite pod group during state revert", "compositePodGroup", klog.KObj(cpgCopy))
 		}
 	})
@@ -752,188 +780,24 @@ func (s *ClusterSnapshot) AddCompositePodGroup(ctx context.Context, cpg *schedul
 
 // RemoveCompositePodGroup removes a composite pod group object from the snapshot,
 // unlinking it from its parent composite pod group if present.
-func (s *ClusterSnapshot) RemoveCompositePodGroup(ctx context.Context, cpg *schedulingv1alpha3.CompositePodGroup) error {
+func (s *ClusterSnapshot) RemoveCompositePodGroup(ctx context.Context, cpg *schedulingv1beta1.CompositePodGroup) error {
 	if cpg == nil {
 		return fmt.Errorf("composite pod group is nil")
 	}
-	removedCPG, err := s.removeCompositePodGroup(cpg)
+	existingCPG, err := s.schedulerSnapshot.CompositePodGroups().Get(cpg.Namespace, cpg.Name)
 	if err != nil {
 		return err
 	}
+	if err := s.schedulerSnapshot.RemoveGenericPodGroup(fwk.NewGenericCompositePodGroup(existingCPG)); err != nil {
+		return err
+	}
+	removedCPG := existingCPG.DeepCopy()
 	logger := klog.FromContext(ctx)
 	s.undoLog.registerOperation(func() {
-		if err := s.addCompositePodGroup(removedCPG); err != nil {
+		if err := s.schedulerSnapshot.AddGenericPodGroup(fwk.NewGenericCompositePodGroup(removedCPG)); err != nil {
 			logger.Error(err, "failed to restore composite pod group during state revert", "compositePodGroup", klog.KObj(removedCPG))
 		}
 	})
 	s.stateVersionForPreemption++
 	return nil
-}
-
-// UPSTREAM-DIFF: Upstream kubernetes PR #142177 (https://github.com/kubernetes/kubernetes/pull/142177)
-// adds AddGenericPodGroup and RemoveGenericPodGroup directly to cache.Snapshot.
-//
-// Migration Plan:
-// When go.mod updates k8s.io/kubernetes to a version that includes PR #142177:
-// 1. Delete all reflection helper functions below:
-//    - writableField
-//    - addPodGroup
-//    - removePodGroup
-//    - addCompositePodGroup
-//    - removeCompositePodGroup
-//    - addChildToParent
-//    - removeChildFromParent
-//    - getOrCreatePodGroupState
-//    - getOrCreateCompositePodGroupState
-//    - podGroupEmpty
-//    - compositePodGroupEmpty
-// 2. Change AddPodGroup and AddCompositePodGroup to call s.schedulerSnapshot.AddGenericPodGroup.
-//    Preserve DeepCopy() on input objects because AddGenericPodGroup does not copy the passed object.
-// 3. Change RemovePodGroup and RemoveCompositePodGroup to look up the existing object in the
-//    snapshot first, pass that existing object to s.schedulerSnapshot.RemoveGenericPodGroup,
-//    and store existing.DeepCopy() in the undo log.
-// 4. Keep the public ClusterSnapshot methods unchanged so callers do not break.
-
-func writableField(v reflect.Value, name string) reflect.Value {
-	f := v.FieldByName(name)
-	return reflect.NewAt(f.Type(), f.Addr().UnsafePointer()).Elem()
-}
-
-func (s *ClusterSnapshot) addPodGroup(pg *schedulingv1beta1.PodGroup) error {
-	key := fwk.PodGroupKey(pg.Namespace, pg.Name)
-	rv := reflect.ValueOf(s.schedulerSnapshot).Elem()
-
-	pgs := s.getOrCreatePodGroupState(rv, key)
-	pgField := writableField(pgs.Elem(), "podGroup")
-	if !pgField.IsNil() {
-		return fmt.Errorf("pod group %s already exists in snapshot", key)
-	}
-	pgField.Set(reflect.ValueOf(pg))
-
-	s.addChildToParent(rv, key, pg.Namespace, pg.Spec.ParentCompositePodGroupName)
-	return nil
-}
-
-func (s *ClusterSnapshot) removePodGroup(pg *schedulingv1beta1.PodGroup) (*schedulingv1beta1.PodGroup, error) {
-	key := fwk.PodGroupKey(pg.Namespace, pg.Name)
-	rv := reflect.ValueOf(s.schedulerSnapshot).Elem()
-	pgsMap := writableField(rv, "podGroupStates")
-	keyVal := reflect.ValueOf(key)
-
-	pgs := pgsMap.MapIndex(keyVal)
-	if !pgs.IsValid() || pgs.Elem().FieldByName("podGroup").IsNil() {
-		return nil, fmt.Errorf("pod group %s not found in snapshot", key)
-	}
-	existingPG := writableField(pgs.Elem(), "podGroup").Interface().(*schedulingv1beta1.PodGroup)
-	writableField(pgs.Elem(), "podGroup").SetZero()
-	if podGroupEmpty(pgs) {
-		pgsMap.SetMapIndex(keyVal, reflect.Value{})
-	}
-
-	s.removeChildFromParent(rv, key, existingPG.Namespace, existingPG.Spec.ParentCompositePodGroupName)
-	return existingPG.DeepCopy(), nil
-}
-
-func (s *ClusterSnapshot) addCompositePodGroup(cpg *schedulingv1alpha3.CompositePodGroup) error {
-	key := fwk.CompositePodGroupKey(cpg.Namespace, cpg.Name)
-	rv := reflect.ValueOf(s.schedulerSnapshot).Elem()
-
-	cpgs := s.getOrCreateCompositePodGroupState(rv, key)
-	cpgField := writableField(cpgs.Elem(), "compositePodGroup")
-	if !cpgField.IsNil() {
-		return fmt.Errorf("composite pod group %s already exists in snapshot", key)
-	}
-	cpgField.Set(reflect.ValueOf(cpg))
-
-	s.addChildToParent(rv, key, cpg.Namespace, cpg.Spec.ParentCompositePodGroupName)
-	return nil
-}
-
-func (s *ClusterSnapshot) removeCompositePodGroup(cpg *schedulingv1alpha3.CompositePodGroup) (*schedulingv1alpha3.CompositePodGroup, error) {
-	key := fwk.CompositePodGroupKey(cpg.Namespace, cpg.Name)
-	rv := reflect.ValueOf(s.schedulerSnapshot).Elem()
-	cpgsMap := writableField(rv, "compositePodGroupStates")
-	keyVal := reflect.ValueOf(key)
-
-	cpgs := cpgsMap.MapIndex(keyVal)
-	if !cpgs.IsValid() || cpgs.Elem().FieldByName("compositePodGroup").IsNil() {
-		return nil, fmt.Errorf("composite pod group %s not found in snapshot", key)
-	}
-	existingCPG := writableField(cpgs.Elem(), "compositePodGroup").Interface().(*schedulingv1alpha3.CompositePodGroup)
-	writableField(cpgs.Elem(), "compositePodGroup").SetZero()
-	if compositePodGroupEmpty(cpgs) {
-		cpgsMap.SetMapIndex(keyVal, reflect.Value{})
-	}
-
-	s.removeChildFromParent(rv, key, existingCPG.Namespace, existingCPG.Spec.ParentCompositePodGroupName)
-	return existingCPG.DeepCopy(), nil
-}
-
-func (s *ClusterSnapshot) addChildToParent(rv reflect.Value, childKey fwk.EntityKey, namespace string, parentName *string) {
-	if !rv.FieldByName("compositePodGroupEnabled").Bool() || parentName == nil || *parentName == "" {
-		return
-	}
-	parentKey := fwk.CompositePodGroupKey(namespace, *parentName)
-	parent := s.getOrCreateCompositePodGroupState(rv, parentKey)
-	children := writableField(parent.Elem(), "children").Interface().(sets.Set[fwk.EntityKey])
-	children.Insert(childKey)
-}
-
-func (s *ClusterSnapshot) removeChildFromParent(rv reflect.Value, childKey fwk.EntityKey, namespace string, parentName *string) {
-	if !rv.FieldByName("compositePodGroupEnabled").Bool() || parentName == nil || *parentName == "" {
-		return
-	}
-	parentKey := fwk.CompositePodGroupKey(namespace, *parentName)
-	cpgsMap := writableField(rv, "compositePodGroupStates")
-	parentKeyVal := reflect.ValueOf(parentKey)
-	if parent := cpgsMap.MapIndex(parentKeyVal); parent.IsValid() {
-		children := writableField(parent.Elem(), "children").Interface().(sets.Set[fwk.EntityKey])
-		children.Delete(childKey)
-		if compositePodGroupEmpty(parent) {
-			cpgsMap.SetMapIndex(parentKeyVal, reflect.Value{})
-		}
-	}
-}
-
-func (s *ClusterSnapshot) getOrCreatePodGroupState(rv reflect.Value, key fwk.EntityKey) reflect.Value {
-	pgsMap := writableField(rv, "podGroupStates")
-	if pgsMap.IsNil() {
-		pgsMap.Set(reflect.MakeMap(pgsMap.Type()))
-	}
-	keyVal := reflect.ValueOf(key)
-	pgs := pgsMap.MapIndex(keyVal)
-	if !pgs.IsValid() {
-		pgs = reflect.New(pgsMap.Type().Elem().Elem())
-		for _, field := range []string{"allPods", "unscheduledPods", "assumedPods", "assignedPods"} {
-			f := writableField(pgs.Elem(), field)
-			f.Set(reflect.MakeMap(f.Type()))
-		}
-		pgsMap.SetMapIndex(keyVal, pgs)
-	}
-	return pgs
-}
-
-func (s *ClusterSnapshot) getOrCreateCompositePodGroupState(rv reflect.Value, key fwk.EntityKey) reflect.Value {
-	cpgsMap := writableField(rv, "compositePodGroupStates")
-	if cpgsMap.IsNil() {
-		cpgsMap.Set(reflect.MakeMap(cpgsMap.Type()))
-	}
-	keyVal := reflect.ValueOf(key)
-	cpgs := cpgsMap.MapIndex(keyVal)
-	if !cpgs.IsValid() {
-		cpgs = reflect.New(cpgsMap.Type().Elem().Elem())
-		writableField(cpgs.Elem(), "children").Set(reflect.ValueOf(sets.New[fwk.EntityKey]()))
-		cpgsMap.SetMapIndex(keyVal, cpgs)
-	}
-	return cpgs
-}
-
-func podGroupEmpty(pgs reflect.Value) bool {
-	return pgs.Elem().FieldByName("podGroup").IsNil() &&
-		pgs.Elem().FieldByName("allPods").Len() == 0
-}
-
-func compositePodGroupEmpty(cpgs reflect.Value) bool {
-	return cpgs.Elem().FieldByName("compositePodGroup").IsNil() &&
-		cpgs.Elem().FieldByName("children").Len() == 0
 }
