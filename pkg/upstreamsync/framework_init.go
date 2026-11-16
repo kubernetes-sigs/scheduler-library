@@ -353,14 +353,17 @@ func (p *ProfileMap) FrameworkForPodGroup(podGroupInfo *framework.PodGroupInfo) 
 // Each profile's PreemptionFramework gets its own PreemptionManager from pmFactory, if it is not nil.
 //
 // UPSTREAM-DIFF: Temporary 1.37 bridge for PodGroup preemption and out-of-tree PodGroupPostFilter plugins.
-// Migration Plan (1.38): Delete wrapRegistryForPreemption completely once k8s.io/kubernetes 1.38
-// provides PreemptionManager() on framework.Framework.
-func wrapRegistryForPreemption(registry frameworkruntime.Registry, numProfiles int, pmFactory preemption.PreemptionManagerFactory) map[string]*preemption.PreemptionFramework {
+// Migration Plan (1.38): Delete wrapRegistryForPreemption once k8s.io/kubernetes 1.38
+// provides PreemptionManager() on framework.Framework. Deleting this also requires revisiting
+// the profileCtx cancellation workaround in NewFrameworkMap (which relies on this wrapper to
+// forward the outer ctx to plugin factories), and removing it once
+// https://github.com/kubernetes/kubernetes/pull/144291 is available.
+func wrapRegistryForPreemption(ctx context.Context, registry frameworkruntime.Registry, numProfiles int, pmFactory preemption.PreemptionManagerFactory) map[string]*preemption.PreemptionFramework {
 	preemptionFrameworks := make(map[string]*preemption.PreemptionFramework, numProfiles)
 	for name, factory := range registry {
 		origFactory := factory
 		pluginName := name
-		registry[name] = func(ctx context.Context, args runtime.Object, fh fwk.Handle) (fwk.Plugin, error) {
+		registry[name] = func(_ context.Context, args runtime.Object, fh fwk.Handle) (fwk.Plugin, error) {
 			pf, ok := preemptionFrameworks[fh.ProfileName()]
 			if !ok {
 				pf = preemption.NewPreemptionFramework(fh.(framework.Framework), pmFactory)
@@ -445,9 +448,19 @@ func NewFrameworkMap(
 		frameworkruntime.WithPodGroupManager(snapshot),
 	}
 
-	preemptionFrameworks := wrapRegistryForPreemption(registry, len(c.options.profiles), mapOptions.preemptionManagerFactory)
+	preemptionFrameworks := wrapRegistryForPreemption(ctx, registry, len(c.options.profiles), mapOptions.preemptionManagerFactory)
 
-	profiles, err := profile.NewMap(ctx, c.options.profiles, registry, recorderFactory, opts...)
+	// UPSTREAM-DIFF: scheduler-library-only workaround to stop the unused MetricAsyncRecorder
+	// goroutine started by defaultFrameworkOptions(ctx.Done()) inside frameworkruntime.NewFramework
+	// before WithMetricsRecorder overrides it (relying on wrapRegistryForPreemption to forward the
+	// outer ctx to plugin factories). We cannot upstream this context cancellation to k/k because
+	// NewFramework passes ctx directly to plugin factories there; instead, k/k fixes this by only
+	// creating the default MetricAsyncRecorder in NewFramework when WithMetricsRecorder is not
+	// provided (https://github.com/kubernetes/kubernetes/pull/144291).
+	profileCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	profiles, err := profile.NewMap(profileCtx, c.options.profiles, registry, recorderFactory, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("initializing profiles: %w", err)
 	}
