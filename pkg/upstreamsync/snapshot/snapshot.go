@@ -26,6 +26,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/klog/v2"
@@ -458,33 +459,35 @@ func (s *ClusterSnapshot) Unpreempt(u *Unpreemption) ([]*v1.Pod, error) {
 // All PodGroup and CompositePodGroup objects in the hierarchy must exist in the snapshot before calling this method.
 // Callers can register virtual groups (groups not present in the cluster) with AddPodGroup and AddCompositePodGroup.
 //
+// Callers are expected to pass pods that are not yet tracked in the snapshot's pod group states, because
+// ScheduleWorkload adds each input pod to its pod group state as an unscheduled member. If an input pod is already
+// tracked (for example, added through Cache.AddPodGroupMember or passed to SchedulingSimulator.NewClusterSnapshot),
+// ScheduleWorkload returns an error status.
+//
 // Callers must enable the GenericWorkload feature gate (plus TopologyAwareWorkloadScheduling and
 // CompositePodGroup when using topology-aware scheduling or composite hierarchies). Custom scheduler
 // profiles should keep the GangScheduling plugin enabled (via MultiPoint or Permit, which registers its
 // PlacementFeasible extension point) for gang and basic quorum enforcement.
-//
-// Note: Virtual pods (input pods not present in the snapshot beforehand) are assumed on nodes,
-// but not added to internal pod group sets (allPods/assumedPods). Consequently,
-// PodGroupState.ScheduledPods() does not include virtual pods from previous ScheduleWorkload calls.
-// This is safe when evaluating an entire virtual workload in a single call (such as Kueue admission).
-// However, when scheduling a hierarchy incrementally across multiple ScheduleWorkload calls, plugins
-// that query ScheduledPods() (such as TAS or gang scheduling) do not observe virtual pods from earlier calls.
 func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, opts ScheduleWorkloadOptions) (result WorkloadSchedulingResult) {
 	if len(pods) == 0 {
 		return WorkloadSchedulingResult{Status: fwk.NewStatus(fwk.Success)}
 	}
 
 	initialStateVersion := s.undoLog.stateVersion
+	var unscheduledPodsRevertFns map[types.UID]func()
 
 	defer func() {
 		if !result.Status.IsSuccess() || opts.DryRun {
 			s.undoLog.restoreState(initialStateVersion)
-		}
-		if result.Status.IsSuccess() && !opts.DryRun {
+		} else {
 			for _, r := range result.PodResults {
 				if r.SelectedNodeName != "" && r.Pod != nil {
 					r.Pod.Spec.NodeName = r.SelectedNodeName
+					delete(unscheduledPodsRevertFns, r.Pod.UID)
 				}
+			}
+			for _, revertUnscheduledPod := range unscheduledPodsRevertFns {
+				revertUnscheduledPod()
 			}
 		}
 		if initialStateVersion != s.undoLog.stateVersion {
@@ -500,6 +503,11 @@ func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, 
 	schedFramework, err := s.profiles.FrameworkForPodGroup(podGroupInfo)
 	if err != nil {
 		return WorkloadSchedulingResult{Status: fwk.AsStatus(fmt.Errorf("failed to get framework for pod group: %w", err))}
+	}
+
+	unscheduledPodsRevertFns, err = s.addUnscheduledPodGroupMembers(ctx, pods)
+	if err != nil {
+		return WorkloadSchedulingResult{Status: fwk.AsStatus(err)}
 	}
 
 	// First, try scheduling without preemption with the nodes occupied by committed victims filtered out.
@@ -549,6 +557,38 @@ func (s *ClusterSnapshot) ScheduleWorkload(ctx context.Context, pods []*v1.Pod, 
 	// Third, try scheduling with preemption of the provided potential victims.
 	// Fit here means the workload needs to wait for new victims to be preempted.
 	return s.workloadPreemption(ctx, sched, schedFramework, rootCycleState, podGroupInfo, initialResult, opts)
+}
+
+// addUnscheduledPodGroupMembers adds a copy of each pod to its pod group state as an unscheduled member.
+// For each pod, a revert function is created and registered in the undo log, and returned so that
+// ScheduleWorkload can remove only the pods that weren't scheduled.
+func (s *ClusterSnapshot) addUnscheduledPodGroupMembers(ctx context.Context, pods []*v1.Pod) (map[types.UID]func(), error) {
+	logger := klog.FromContext(ctx)
+	unscheduledPodsRevertFns := make(map[types.UID]func(), len(pods))
+	for _, pod := range pods {
+		// Store a copy, since the pod group state keeps it by reference and the input pod changes on success.
+		podCopy := pod.DeepCopy()
+		podCopy.Spec.NodeName = ""
+		if err := s.addPodGroupMember(podCopy); err != nil {
+			return nil, fmt.Errorf("failed to add pod %s to its pod group state: %w", klog.KObj(pod), err)
+		}
+
+		// revertFn may run twice: from ScheduleWorkload for pods that weren't scheduled, and later from the
+		// undo log (ResetMutations or a reverted Transaction). If the pod is already removed, the second call is a no-op.
+		podRemoved := false
+		revertFn := func() {
+			if podRemoved {
+				return
+			}
+			podRemoved = true
+			if err := s.removePodGroupMember(podCopy); err != nil {
+				logger.Error(err, "Failed to remove pod group member during state revert", "pod", klog.KObj(podCopy))
+			}
+		}
+		unscheduledPodsRevertFns[podCopy.UID] = revertFn
+		s.undoLog.registerOperation(revertFn)
+	}
+	return unscheduledPodsRevertFns, nil
 }
 
 func (s *ClusterSnapshot) scheduleWorkloadWithoutPreemption(
@@ -770,17 +810,27 @@ func (s *ClusterSnapshot) RemoveCompositePodGroup(ctx context.Context, cpg *sche
 	return nil
 }
 
-// UPSTREAM-DIFF: Upstream kubernetes PR #142177 (https://github.com/kubernetes/kubernetes/pull/142177)
-// adds AddGenericPodGroup and RemoveGenericPodGroup directly to cache.Snapshot.
+// UPSTREAM-DIFF:
+//   - Upstream kubernetes PR #142177 (https://github.com/kubernetes/kubernetes/pull/142177)
+//     adds AddGenericPodGroup and RemoveGenericPodGroup directly to cache.Snapshot.
+//   - Upstream kubernetes PR #144202 (https://github.com/kubernetes/kubernetes/pull/144202)
+//     adds AddPodGroupMember, UpdatePodGroupMember and RemovePodGroupMember directly to cache.Snapshot.
 //
 // Migration Plan:
-// When go.mod updates k8s.io/kubernetes to a version that includes PR #142177:
-// 1. Delete all reflection helper functions below:
+// When go.mod updates k8s.io/kubernetes to a version that includes PR #142177 and PR #144202:
+// 1. Delete all reflection helper functions and types below:
 //    - writableField
 //    - addPodGroup
 //    - removePodGroup
 //    - addCompositePodGroup
 //    - removeCompositePodGroup
+//    - addPodGroupMember
+//    - removePodGroupMember
+//    - podGroupKeyOf
+//    - podGroupStateWithMember
+//    - deletePodGroupState
+//    - podGroupStateData and its methods
+//    - podGroupStateDataOf
 //    - addChildToParent
 //    - removeChildFromParent
 //    - getOrCreatePodGroupState
@@ -792,11 +842,147 @@ func (s *ClusterSnapshot) RemoveCompositePodGroup(ctx context.Context, cpg *sche
 // 3. Change RemovePodGroup and RemoveCompositePodGroup to look up the existing object in the
 //    snapshot first, pass that existing object to s.schedulerSnapshot.RemoveGenericPodGroup,
 //    and store existing.DeepCopy() in the undo log.
-// 4. Keep the public ClusterSnapshot methods unchanged so callers do not break.
+// 4. Change addUnscheduledPodGroupMembers to call s.schedulerSnapshot.AddPodGroupMember and
+//    s.schedulerSnapshot.RemovePodGroupMember instead of addPodGroupMember and removePodGroupMember.
+// 5. Keep the public ClusterSnapshot methods unchanged so callers do not break.
 
 func writableField(v reflect.Value, name string) reflect.Value {
 	f := v.FieldByName(name)
 	return reflect.NewAt(f.Type(), f.Addr().UnsafePointer()).Elem()
+}
+
+// addPodGroupMember adds the pod to its pod group state in the snapshot,
+// creating the state if it does not exist yet.
+// Depending on the NodeName, the pod is tracked as either assigned or unscheduled.
+// It returns an error if the pod is already in its pod group state.
+// The pod is stored by reference and must not be mutated afterwards.
+// The change only affects the snapshot and is reverted by the next Cache.UpdateSnapshot.
+// This function is not thread safe, so it should be executed when no other routines can write/read from the snapshot.
+//
+// UPSTREAM-DIFF: copy of Snapshot.AddPodGroupMember from PR #144202, accessing the unexported
+// fields of cache.Snapshot through reflection. It doesn't bump the generation, so callers must revert
+// the change through the undo log rather than rely on Cache.UpdateSnapshot.
+func (s *ClusterSnapshot) addPodGroupMember(pod *v1.Pod) error {
+	rv := reflect.ValueOf(s.schedulerSnapshot).Elem()
+	if !rv.FieldByName("genericWorkloadEnabled").Bool() {
+		return fmt.Errorf("generic workload feature gate is disabled")
+	}
+	key, err := podGroupKeyOf(pod)
+	if err != nil {
+		return err
+	}
+	state := s.getOrCreatePodGroupState(rv, key)
+	pgs := podGroupStateDataOf(state)
+	if _, ok := pgs.allPods[pod.UID]; ok {
+		return fmt.Errorf("pod %s already exists in pod group state %s", klog.KObj(pod), key)
+	}
+	pgs.addPod(pod)
+	return nil
+}
+
+// removePodGroupMember removes the pod from its pod group state in the snapshot,
+// deleting the state once it has neither pods nor a PodGroup object.
+// The change only affects the snapshot and is reverted by the next Cache.UpdateSnapshot.
+// This function is not thread safe, so it should be executed when no other routines can write/read from the snapshot.
+//
+// UPSTREAM-DIFF: copy of Snapshot.RemovePodGroupMember from PR #144202, accessing the unexported
+// fields of cache.Snapshot through reflection. It doesn't bump the generation, so callers must revert
+// the change through the undo log rather than rely on Cache.UpdateSnapshot.
+func (s *ClusterSnapshot) removePodGroupMember(pod *v1.Pod) error {
+	rv := reflect.ValueOf(s.schedulerSnapshot).Elem()
+	if !rv.FieldByName("genericWorkloadEnabled").Bool() {
+		return fmt.Errorf("generic workload feature gate is disabled")
+	}
+	key, err := podGroupKeyOf(pod)
+	if err != nil {
+		return err
+	}
+	pgs, err := podGroupStateWithMember(rv, key, pod)
+	if err != nil {
+		return err
+	}
+	pgs.deletePod(pod.UID)
+	if pgs.empty() {
+		deletePodGroupState(rv, key)
+	}
+	return nil
+}
+
+func podGroupKeyOf(pod *v1.Pod) (fwk.EntityKey, error) {
+	if len(pod.UID) == 0 {
+		return fwk.EntityKey{}, fmt.Errorf("pod %s has an empty UID", klog.KObj(pod))
+	}
+	if pod.Spec.SchedulingGroup == nil || pod.Spec.SchedulingGroup.PodGroupName == nil {
+		return fwk.EntityKey{}, fmt.Errorf("pod %s does not belong to a pod group", klog.KObj(pod))
+	}
+	return fwk.PodGroupKey(pod.Namespace, *pod.Spec.SchedulingGroup.PodGroupName), nil
+}
+
+func podGroupStateWithMember(rv reflect.Value, key fwk.EntityKey, pod *v1.Pod) (podGroupStateData, error) {
+	state := writableField(rv, "podGroupStates").MapIndex(reflect.ValueOf(key))
+	if !state.IsValid() {
+		return podGroupStateData{}, fmt.Errorf("pod group state %s not found in snapshot", key)
+	}
+	pgs := podGroupStateDataOf(state)
+	if _, ok := pgs.allPods[pod.UID]; !ok {
+		return podGroupStateData{}, fmt.Errorf("pod %s not found in pod group state %s", klog.KObj(pod), key)
+	}
+	return pgs, nil
+}
+
+// deletePodGroupState removes the pod group state with the given key from rv, the reflected cache.Snapshot.
+func deletePodGroupState(rv reflect.Value, key fwk.EntityKey) {
+	writableField(rv, "podGroupStates").SetMapIndex(reflect.ValueOf(key), reflect.Value{})
+}
+
+// podGroupStateData gives access to the pod tracking fields of a pod group state stored in cache.Snapshot.
+// The maps and sets are shared with the pod group state, so changes made through them apply to the snapshot.
+// addPod, deletePod, and empty are methods similar to internal methods of cache.podGroupStateData in k8s.io/kubernetes v1.37.0.
+//
+// UPSTREAM-DIFF: unlike upstream, addPod and deletePod leave the generation unchanged.
+// Cache.UpdateSnapshot skips the pod group states whose generation matches the cache's, so it may keep these changes;
+// they are reverted through the undo log instead, which ClusterState.SyncSnapshot runs (ResetMutations) before Cache.UpdateSnapshot.
+type podGroupStateData struct {
+	// state is the *podGroupStateSnapshot value in cache.Snapshot's podGroupStates map.
+	state           reflect.Value
+	allPods         map[types.UID]*v1.Pod
+	unscheduledPods sets.Set[types.UID]
+	assumedPods     map[types.UID]*v1.Pod
+	assignedPods    sets.Set[types.UID]
+}
+
+// podGroupStateDataOf reads the pod tracking fields of the given *podGroupStateSnapshot value.
+func podGroupStateDataOf(state reflect.Value) podGroupStateData {
+	data := state.Elem()
+	return podGroupStateData{
+		state:           state,
+		allPods:         writableField(data, "allPods").Interface().(map[types.UID]*v1.Pod),
+		unscheduledPods: writableField(data, "unscheduledPods").Interface().(sets.Set[types.UID]),
+		assumedPods:     writableField(data, "assumedPods").Interface().(map[types.UID]*v1.Pod),
+		assignedPods:    writableField(data, "assignedPods").Interface().(sets.Set[types.UID]),
+	}
+}
+
+func (d podGroupStateData) addPod(pod *v1.Pod) {
+	d.allPods[pod.UID] = pod
+	if pod.Spec.NodeName != "" {
+		d.assignedPods.Insert(pod.UID)
+		d.unscheduledPods.Delete(pod.UID)
+		delete(d.assumedPods, pod.UID)
+	} else {
+		d.unscheduledPods.Insert(pod.UID)
+	}
+}
+
+func (d podGroupStateData) deletePod(podUID types.UID) {
+	delete(d.allPods, podUID)
+	d.unscheduledPods.Delete(podUID)
+	delete(d.assumedPods, podUID)
+	d.assignedPods.Delete(podUID)
+}
+
+func (d podGroupStateData) empty() bool {
+	return podGroupEmpty(d.state)
 }
 
 func (s *ClusterSnapshot) addPodGroup(pg *schedulingv1beta1.PodGroup) error {
