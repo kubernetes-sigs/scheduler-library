@@ -59,6 +59,7 @@ func (s *ClusterState) GetAssociatedSnapshot() *snapshot.ClusterSnapshot {
 
 // SyncSnapshot uses the current cluster state to update the associated snapshot in-place.
 // Any mutations done on the snapshot since last sync will be reverted.
+// Once a rollback of the snapshot has failed, it keeps failing; recreate the ClusterState then.
 func (s *ClusterState) SyncSnapshot(logger klog.Logger) error {
 	if err := s.snapshot.ResetMutations(); err != nil {
 		return fmt.Errorf("failed to reset mutations: %w", err)
