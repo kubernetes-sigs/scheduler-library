@@ -25,6 +25,8 @@ import (
 	"fmt"
 	"testing"
 
+	"go.uber.org/goleak"
+
 	v1 "k8s.io/api/core/v1"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -392,6 +394,7 @@ const testPluginName = "OutOfTreeTestPlugin"
 // recordedPlugin is a minimal out-of-tree plugin that remembers what the framework handed
 // to its factory, so tests can assert on it.
 type recordedPlugin struct {
+	ctx    context.Context
 	name   string
 	args   runtime.Object
 	handle fwk.Handle
@@ -412,8 +415,8 @@ type factoryRecorder struct {
 }
 
 func (r *factoryRecorder) factory(name string) frameworkruntime.PluginFactory {
-	return func(_ context.Context, args runtime.Object, h fwk.Handle) (fwk.Plugin, error) {
-		p := &recordedPlugin{name: name, args: args, handle: h}
+	return func(ctx context.Context, args runtime.Object, h fwk.Handle) (fwk.Plugin, error) {
+		p := &recordedPlugin{ctx: ctx, name: name, args: args, handle: h}
 		r.calls++
 		r.plugins = append(r.plugins, p)
 		return p, nil
@@ -527,6 +530,11 @@ func TestWithFrameworkOutOfTreeRegistry(t *testing.T) {
 
 			if rec.calls != tc.wantCalls {
 				t.Errorf("Expected the out-of-tree factory to be called %d times, got %d", tc.wantCalls, rec.calls)
+			}
+			for _, p := range rec.plugins {
+				if err := p.ctx.Err(); err != nil {
+					t.Errorf("Expected plugin factory context to remain active after NewFrameworkMap returns, got %v", err)
+				}
 			}
 
 			if tc.wantFilterPlugin != "" {
@@ -654,4 +662,34 @@ func TestWithKubeConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNewFrameworkMapNoGoroutineLeak(t *testing.T) {
+	ctx := t.Context()
+	client := fake.NewClientset()
+	informerFactory := informers.NewSharedInformerFactory(client, 0)
+
+	comps, err := NewFrameworkComponents(ctx, client, informerFactory)
+	if err != nil {
+		t.Fatalf("NewFrameworkComponents failed: %v", err)
+	}
+	informerFactory.StartWithContext(ctx)
+	if res := informerFactory.WaitForCacheSyncWithContext(ctx); res.Err != nil {
+		t.Fatalf("WaitForCacheSyncWithContext failed: %v", res.Err)
+	}
+	if err := comps.WaitForHandlersSync(ctx); err != nil {
+		t.Fatalf("comps.WaitForHandlersSync failed: %v", err)
+	}
+
+	ignore := goleak.IgnoreCurrent()
+	snap := internalcache.NewEmptySnapshot()
+	for i := range 5 {
+		if _, err := NewFrameworkMap(ctx, comps, fakeRecorderFactory, snap); err != nil {
+			t.Fatalf("NewFrameworkMap call %d failed: %v", i, err)
+		}
+	}
+
+	// Verify before ctx is canceled that repeated NewFrameworkMap calls do not
+	// leak goroutines (such as unused default MetricAsyncRecorder goroutines).
+	goleak.VerifyNone(t, ignore)
 }
