@@ -56,17 +56,23 @@ type Simulator interface {
 	// slice holds one result per attempted pod, each carrying a copy of the pod the attempt was made
 	// for, with the selected node set when it was scheduled. On a pod that was not scheduled
 	// Spec.NodeName is left as it came in, so it is empty unless the caller already set one.
+	// Each pod goes to the first feasible node found: Score plugins and PercentageOfNodesToScore
+	// are not used.
 	SchedulePods(ctx context.Context, pods []*v1.Pod, placement *fwk.Placement, opts snapshot.SchedulePodsOptions) ([]snapshot.SchedulingResult, error)
 
 	// SchedulePodsByTemplate schedules as many pods created from the template as fit, up to maxPods.
 	// It stops at the first pod that does not fit, as the next identical one would not fit either;
 	// each SchedulingResult carries the generated pod, which is the only way to learn what was
-	// scheduled.
+	// scheduled. Like SchedulePods, it places each pod on the first feasible node found.
 	SchedulePodsByTemplate(ctx context.Context, template *v1.PodTemplateSpec, placement *fwk.Placement, maxPods int, opts snapshot.SchedulePodsByTemplateOptions) ([]snapshot.SchedulingResult, error)
 
 	// ScheduleWorkload schedules the given pods belonging to the same hierarchy using the workload-aware scheduling algorithm.
 	// If the pods do not belong to the same hierarchy, it returns an error status.
 	// The order of WorkloadSchedulingResult.PodResults is not guaranteed to match the order of input pods.
+	//
+	// Unlike SchedulePods, it scores nodes like kube-scheduler: each pod's search stops once enough
+	// feasible nodes are found for the profile's PercentageOfNodesToScore (or else the global one),
+	// and the pod goes to the best-scoring of them.
 	//
 	// See [snapshot.ClusterSnapshot.ScheduleWorkload] for more details.
 	ScheduleWorkload(ctx context.Context, pods []*v1.Pod, opts snapshot.ScheduleWorkloadOptions) snapshot.WorkloadSchedulingResult
@@ -121,8 +127,9 @@ func WithOutOfTreeRegistry(registry frameworkruntime.Registry) SimulatorOption {
 // Note that initializing states and snapshots (NewClusterState and NewClusterSnapshot) is not
 // safe for concurrent use on the same SchedulingSimulator instance.
 type SchedulingSimulator struct {
-	comps           *upstreamsync.FrameworkComponents
-	informerFactory informers.SharedInformerFactory
+	comps                    *upstreamsync.FrameworkComponents
+	informerFactory          informers.SharedInformerFactory
+	percentageOfNodesToScore int32
 
 	// informerCtx is what the informers run under. The factory is shared by every state and
 	// snapshot the simulator creates, so their lifetime is the simulator's, not any one call's.
@@ -162,6 +169,12 @@ func NewSchedulingSimulator(
 		opt(&simOpts)
 	}
 
+	if cfg != nil {
+		if err := ValidateKubeSchedulerConfiguration(cfg); err != nil {
+			return nil, fmt.Errorf("schedlib: %w", err)
+		}
+	}
+
 	cfg, err := framework.UpdateSimulatorConfig(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("schedlib: updating simulator config: %w", err)
@@ -171,6 +184,10 @@ func NewSchedulingSimulator(
 	frameworkOpts = append(frameworkOpts, upstreamsync.WithProfiles(cfg.Profiles...))
 	if cfg.Parallelism > 0 {
 		frameworkOpts = append(frameworkOpts, upstreamsync.WithParallelism(cfg.Parallelism))
+	}
+	percentageOfNodesToScore := int32(0)
+	if cfg.PercentageOfNodesToScore != nil {
+		percentageOfNodesToScore = *cfg.PercentageOfNodesToScore
 	}
 
 	r, err := framework.SimulatorRegistry()
@@ -202,9 +219,10 @@ func NewSchedulingSimulator(
 	}
 
 	return &SchedulingSimulator{
-		comps:           comps,
-		informerFactory: informerFactory,
-		informerCtx:     ctx,
+		comps:                    comps,
+		informerFactory:          informerFactory,
+		percentageOfNodesToScore: percentageOfNodesToScore,
+		informerCtx:              ctx,
 	}, nil
 }
 
@@ -228,7 +246,7 @@ func (s *SchedulingSimulator) NewClusterState(ctx context.Context, opts ...Optio
 		return nil, err
 	}
 
-	return state.New(internalCache, profiles, snap), nil
+	return state.New(internalCache, profiles, snap, s.percentageOfNodesToScore), nil
 }
 
 // NewClusterSnapshot initializes a new snapshot with the provided pods, nodes, pod groups, and composite pod groups.
@@ -252,7 +270,7 @@ func (s *SchedulingSimulator) NewClusterSnapshot(
 		return nil, err
 	}
 
-	return snapshot.New(snap, profiles), nil
+	return snapshot.New(snap, profiles, s.percentageOfNodesToScore), nil
 }
 
 func (s *SchedulingSimulator) buildProfileMap(ctx context.Context, snap *cache.Snapshot, opts ...Option) (*upstreamsync.ProfileMap, error) {

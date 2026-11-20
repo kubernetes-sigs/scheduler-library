@@ -33,6 +33,14 @@ func withTopologyPlacementGenerator(plugins *schedulerapi.Plugins) {
 	}
 }
 
+// withNodeAffinity enables the NodeAffinity plugin across filter and score extension points.
+func withNodeAffinity(plugins *schedulerapi.Plugins) {
+	plugins.PreFilter.Enabled = append(plugins.PreFilter.Enabled, schedulerapi.Plugin{Name: "NodeAffinity"})
+	plugins.Filter.Enabled = append(plugins.Filter.Enabled, schedulerapi.Plugin{Name: "NodeAffinity"})
+	plugins.PreScore.Enabled = append(plugins.PreScore.Enabled, schedulerapi.Plugin{Name: "NodeAffinity"})
+	plugins.Score.Enabled = append(plugins.Score.Enabled, schedulerapi.Plugin{Name: "NodeAffinity", Weight: 2})
+}
+
 // newKubeSchedulerConfig returns the scheduler configuration shared by the simulator integration
 // tests: the smallest set of plugins that still exercises a real filter and bind cycle.
 // Additional plugins can be enabled via optional configOpt mutators.
@@ -64,6 +72,10 @@ func newKubeSchedulerConfig(opts ...configOpt) *schedulerapi.KubeSchedulerConfig
 							MinCandidateNodesPercentage: 10,
 							MinCandidateNodesAbsolute:   100,
 						},
+					},
+					{
+						Name: "NodeAffinity",
+						Args: &schedulerapi.NodeAffinityArgs{},
 					},
 				},
 			},
