@@ -378,6 +378,44 @@ func TestSimulatorIntegration_AddAndRemovePodGroups(t *testing.T) {
 	}
 	assertScheduleWorkloadError(addedPods)
 	assertScheduleWorkloadSuccess(initialPods, false)
+
+	// 8. Verify PodGroupState tracks assumed pods across incremental ScheduleWorkload calls and reverts remaining unscheduled pods.
+	if err := snap.ResetMutations(); err != nil {
+		t.Fatalf("ResetMutations failed: %v", err)
+	}
+	tasBasicPG := makePodGroup(ns, "tas-basic-pg", "", 0, zoneLabel)
+	if err := snap.AddPodGroup(ctx, tasBasicPG); err != nil {
+		t.Fatalf("AddPodGroup(tasBasicPG) failed: %v", err)
+	}
+	tasBasicPod1 := makePod(ns, "tas-basic-pod-1", tasBasicPG.Name, "3")
+	tasBasicPodUnsched := makePod(ns, "tas-basic-pod-too-big", tasBasicPG.Name, "5")
+	tasBasicPod2 := makePod(ns, "tas-basic-pod-2", tasBasicPG.Name, "2")
+	tasBasicPod3 := makePod(ns, "tas-basic-pod-3", tasBasicPG.Name, "1")
+
+	// First call schedules tasBasicPod1 (3 CPU) on one zone (leaving 1 CPU free in that zone) and leaves tasBasicPodUnsched unscheduled.
+	res := snap.ScheduleWorkload(ctx, []*v1.Pod{tasBasicPod1, tasBasicPodUnsched}, snapshot.NewScheduleWorkloadOptions(false))
+	if !res.Status.IsSuccess() || len(res.PodResults) != 1 || res.PodResults[0].Pod.Name != tasBasicPod1.Name {
+		t.Fatalf("First call: got status=%v results=%v, want only %s scheduled", res.Status, res.PodResults, tasBasicPod1.Name)
+	}
+	selectedNode := res.PodResults[0].SelectedNodeName
+
+	// Second call with a 2-CPU pod must fail as Unschedulable because TopologyPlacementGenerator sees tasBasicPod1
+	// in PodGroupState.ScheduledPods() and restricts placement to selectedNode's zone (which only has 1 CPU left),
+	// even though the other zone has 4 CPU free.
+	if res := snap.ScheduleWorkload(ctx, []*v1.Pod{tasBasicPod2}, snapshot.NewScheduleWorkloadOptions(false)); res.Status.Code() != fwk.Unschedulable {
+		t.Fatalf("Second call: got status %v, want Unschedulable because the pod group is pinned to the zone of %s", res.Status, selectedNode)
+	}
+
+	// Third call with a 1-CPU pod succeeds on the same node in the locked zone.
+	res = snap.ScheduleWorkload(ctx, []*v1.Pod{tasBasicPod3}, snapshot.NewScheduleWorkloadOptions(false))
+	if !res.Status.IsSuccess() || len(res.PodResults) != 1 || res.PodResults[0].SelectedNodeName != selectedNode {
+		t.Fatalf("Third call: got status=%v results=%v, want %s scheduled on %s", res.Status, res.PodResults, tasBasicPod3.Name, selectedNode)
+	}
+	// SyncSnapshot drops the virtual pod group and its pods.
+	if err := cs.SyncSnapshot(logger); err != nil {
+		t.Fatalf("SyncSnapshot failed: %v", err)
+	}
+	assertScheduleWorkloadError([]*v1.Pod{tasBasicPod2})
 }
 
 func makePod(ns, name, podGroupName, cpu string) *v1.Pod {
