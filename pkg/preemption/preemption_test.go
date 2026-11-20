@@ -15,15 +15,20 @@
 package preemption_test
 
 import (
+	"context"
 	"slices"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	v1 "k8s.io/api/core/v1"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	fwk "k8s.io/kube-scheduler/framework"
+	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
+	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	ft "sigs.k8s.io/scheduler-library/pkg/framework/testing"
 	"sigs.k8s.io/scheduler-library/pkg/preemption"
@@ -412,7 +417,7 @@ func TestEvaluateWorkloadPreemption(t *testing.T) {
 				opts.PotentialVictims = slices.Values(tt.potentialVictims)
 			}
 
-			gotAssignments, gotVictims, gotStatus := preemption.EvaluateWorkloadPreemption(
+			gotResult, gotVictims, gotStatus := preemption.EvaluateWorkloadPreemption(
 				ctx, schedFramework, framework.NewCycleState(), podGroupInfo, baseSchedFn, opts,
 			)
 			if gotStatus.Code() != tt.wantStatusCode {
@@ -444,18 +449,100 @@ func TestEvaluateWorkloadPreemption(t *testing.T) {
 				}
 			}
 			if !gotStatus.IsSuccess() {
-				if gotAssignments != nil {
-					t.Errorf("EvaluateWorkloadPreemption() assignments = %v, want nil", gotAssignments)
+				if gotResult != nil {
+					t.Errorf("EvaluateWorkloadPreemption() result = %v, want nil", gotResult)
 				}
 				return
 			}
 			if tt.filter != nil && !tt.filter.activeVictimSet.Equal(sets.New(tt.wantVictims...)) {
 				t.Errorf("filter.activeVictimSet = %v, want %v", tt.filter.activeVictimSet.UnsortedList(), tt.wantVictims)
 			}
-			if gotAssignments == nil || len(gotAssignments.ProposedAssignments) != 1 {
-				t.Errorf("EvaluateWorkloadPreemption() assignments = %v, want 1 proposed assignment", gotAssignments)
+			podKey := types.NamespacedName{Namespace: workloadPod.Namespace, Name: workloadPod.Name}
+			if gotResult == nil || gotResult.NominatingInfos[podKey] == nil || gotResult.NominatingInfos[podKey].NominatedNodeName != "node1" {
+				t.Errorf("EvaluateWorkloadPreemption() result = %v, want %v nominated on \"node1\"", gotResult, podKey)
 			}
 		})
+	}
+}
+
+type fakePodGroupPostFilterPlugin struct {
+	result *fwk.PodGroupPostFilterResult
+}
+
+var _ fwk.PodGroupPostFilterPlugin = (*fakePodGroupPostFilterPlugin)(nil)
+
+func (p *fakePodGroupPostFilterPlugin) Name() string { return "FakePodGroupPostFilter" }
+
+func (p *fakePodGroupPostFilterPlugin) PodGroupPostFilter(
+	_ context.Context,
+	_ fwk.PodGroupCycleState,
+	_ fwk.PodGroupInfo,
+	_ fwk.PodGroupSchedulingFunc,
+) (*fwk.PodGroupPostFilterResult, *fwk.Status) {
+	return p.result, fwk.NewStatus(fwk.Success)
+}
+
+func TestEvaluateWorkloadPreemptionReturnsPostFilterResult(t *testing.T) {
+	ctx := t.Context()
+
+	wantResult := &fwk.PodGroupPostFilterResult{
+		NominatingInfos: map[types.NamespacedName]*fwk.NominatingInfo{
+			{Namespace: "default", Name: "w-pod"}: {
+				NominatingMode:    fwk.ModeOverride,
+				NominatedNodeName: "node1",
+			},
+		},
+	}
+	plugin := &fakePodGroupPostFilterPlugin{result: wantResult}
+	profileMap, snap, err := ft.SetupSnapshotTestWithPodGroups(
+		ctx,
+		t,
+		nil,
+		[]*v1.Node{makeNode("node1", "4")},
+		[]*schedulingv1beta1.PodGroup{testutils.MakeGangPodGroup("gang-pg", "", 1)},
+		nil,
+		ft.WithProfileModifier(func(prof *schedulerapi.KubeSchedulerProfile) {
+			prof.Plugins.PodGroupPostFilter.Enabled = []schedulerapi.Plugin{{Name: plugin.Name()}}
+		}),
+		ft.WithOutOfTreeRegistry(frameworkruntime.Registry{
+			plugin.Name(): func(_ context.Context, _ runtime.Object, _ fwk.Handle) (fwk.Plugin, error) {
+				return plugin, nil
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("SetupSnapshotTestWithPodGroups failed: %v", err)
+	}
+
+	workloadPod := testutils.MakePod("w-pod", "gang-pg", "4")
+	podGroupInfo, err := snapshot.BuildGroupHierarchyForTest(snap, []*v1.Pod{workloadPod})
+	if err != nil {
+		t.Fatalf("BuildGroupHierarchyForTest failed: %v", err)
+	}
+	schedFramework, err := profileMap.FrameworkForPodGroup(podGroupInfo)
+	if err != nil {
+		t.Fatalf("FrameworkForPodGroup failed: %v", err)
+	}
+
+	victim := makeVictimOnNode("v1", "node1", "4")
+	gotResult, gotVictims, gotStatus := preemption.EvaluateWorkloadPreemption(
+		ctx,
+		schedFramework,
+		framework.NewCycleState(),
+		podGroupInfo,
+		nil,
+		preemption.WorkloadPreemptionOptions{
+			PotentialVictims: slices.Values([]preemption.PreemptionVictim{victim}),
+		},
+	)
+	if !gotStatus.IsSuccess() {
+		t.Fatalf("EvaluateWorkloadPreemption() status = %v, want success", gotStatus)
+	}
+	if !slices.Equal(gotVictims, []preemption.PreemptionVictim{victim}) {
+		t.Errorf("EvaluateWorkloadPreemption() victims = %v, want [%v]", gotVictims, victim)
+	}
+	if gotResult != wantResult {
+		t.Errorf("EvaluateWorkloadPreemption() result = %v, want %v", gotResult, wantResult)
 	}
 }
 
