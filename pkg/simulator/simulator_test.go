@@ -46,6 +46,7 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/framework/parallelize"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/scheduler-library/pkg/preemption"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
 	testutils "sigs.k8s.io/scheduler-library/pkg/upstreamsync/testutils"
@@ -1191,5 +1192,72 @@ func TestNewSchedulingSimulator_DuplicateBuiltinPluginRegistrationReturnsError(t
 	_, err := NewSchedulingSimulator(ctx, cfg, ReadonlyClient{client: fake.NewClientset()}, nil, WithOutOfTreeRegistry(registry))
 	if err == nil {
 		t.Fatal("Expected NewSchedulingSimulator to return error on conflicting plugin registration, got nil")
+	}
+}
+
+func TestNewSchedulingSimulator_PercentageOfNodesToScore(t *testing.T) {
+	cfgWithPercentage := func(globalPct, profilePct *int32) *schedulerapi.KubeSchedulerConfiguration {
+		cfg := minimalConfig()
+		cfg.PercentageOfNodesToScore = globalPct
+		cfg.Profiles[0].PercentageOfNodesToScore = profilePct
+		return cfg
+	}
+
+	tests := []struct {
+		name                  string
+		cfg                   *schedulerapi.KubeSchedulerConfiguration
+		wantErr               string
+		wantGlobalPercentage  int32
+		wantProfilePercentage *int32
+	}{
+		{
+			name:    "invalid config returns validation error",
+			cfg:     cfgWithPercentage(ptr.To[int32](-1), nil),
+			wantErr: "percentageOfNodesToScore: Invalid value: -1",
+		},
+		{
+			name:                 "nil configuration defaults to 0",
+			cfg:                  nil,
+			wantGlobalPercentage: 0,
+		},
+		{
+			name:                 "unset global value selects the adaptive policy",
+			cfg:                  cfgWithPercentage(nil, nil),
+			wantGlobalPercentage: 0,
+		},
+		{
+			name:                  "global and profile values are wired and forwarded",
+			cfg:                   cfgWithPercentage(ptr.To[int32](10), ptr.To[int32](25)),
+			wantGlobalPercentage:  10,
+			wantProfilePercentage: ptr.To[int32](25),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			client := fake.NewClientset()
+			sim, err := NewSchedulingSimulator(ctx, tc.cfg, ReadonlyClient{client: client}, informers.NewSharedInformerFactory(client, 0))
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("NewSchedulingSimulator error = %v, want it to contain %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NewSchedulingSimulator failed: %v", err)
+			}
+			if sim.percentageOfNodesToScore != tc.wantGlobalPercentage {
+				t.Errorf("percentageOfNodesToScore = %d, want %d", sim.percentageOfNodesToScore, tc.wantGlobalPercentage)
+			}
+
+			profiles, err := sim.buildProfileMap(ctx, cache.NewEmptySnapshot())
+			if err != nil {
+				t.Fatalf("buildProfileMap failed: %v", err)
+			}
+			if got := profiles.Map[v1.DefaultSchedulerName].PercentageOfNodesToScore(); !ptr.Equal(got, tc.wantProfilePercentage) {
+				t.Errorf("profile PercentageOfNodesToScore() = %v, want %v", got, tc.wantProfilePercentage)
+			}
+		})
 	}
 }
