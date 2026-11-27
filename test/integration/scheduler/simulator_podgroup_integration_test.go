@@ -30,6 +30,7 @@ import (
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	testutils "k8s.io/kubernetes/test/integration/util"
 	"sigs.k8s.io/scheduler-library/pkg/simulator"
+	"sigs.k8s.io/scheduler-library/pkg/state"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync/snapshot"
 )
 
@@ -378,6 +379,128 @@ func TestSimulatorIntegration_AddAndRemovePodGroups(t *testing.T) {
 	}
 	assertScheduleWorkloadError(addedPods)
 	assertScheduleWorkloadSuccess(initialPods, false)
+}
+
+func TestSimulatorIntegration_PodGroupSchedulingAcrossMultipleCalls(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.GenericWorkload:                 true,
+		features.TopologyAwareWorkloadScheduling: true,
+		features.CompositePodGroup:               true,
+	})
+
+	testCtx := testutils.InitTestAPIServer(t, "sim-pg-across-calls", nil)
+	if testCtx == nil {
+		t.Fatal("Expected testCtx to be non-nil")
+	}
+	ctx := testCtx.Ctx
+	logger := klog.FromContext(ctx)
+	client := testCtx.ClientSet
+	ns := testCtx.NS.Name
+
+	cfg := newKubeSchedulerConfig(withTopologyPlacementGenerator)
+
+	readonlyClient, err := simulator.NewReadonlyClient(testCtx.KubeConfig)
+	if err != nil {
+		t.Fatalf("NewReadonlyClient failed: %v", err)
+	}
+
+	informerFactory := informers.NewSharedInformerFactory(client, 0)
+	sim, err := simulator.NewSchedulingSimulator(ctx, cfg, readonlyClient, informerFactory)
+	if err != nil {
+		t.Fatalf("NewSchedulingSimulator failed: %v", err)
+	}
+
+	tasNode1 := st.MakeNode().Name("node1").Label(zoneLabel, "zone-a").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "4",
+		v1.ResourceMemory: "4Gi",
+		v1.ResourcePods:   "10",
+	}).Obj()
+	tasNode2 := st.MakeNode().Name("node2").Label(zoneLabel, "zone-b").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "4",
+		v1.ResourceMemory: "4Gi",
+		v1.ResourcePods:   "10",
+	}).Obj()
+
+	newClusterState := func(t *testing.T) *state.ClusterState {
+		t.Helper()
+		cs, err := sim.NewClusterState(ctx)
+		if err != nil {
+			t.Fatalf("NewClusterState failed: %v", err)
+		}
+		cs.Cache.AddNode(logger, tasNode1)
+		cs.Cache.AddNode(logger, tasNode2)
+		if err := cs.SyncSnapshot(logger); err != nil {
+			t.Fatalf("SyncSnapshot failed: %v", err)
+		}
+		return cs
+	}
+
+	t.Run("topology placement pins later calls to the zone of earlier pods", func(t *testing.T) {
+		cs := newClusterState(t)
+		snap := cs.GetAssociatedSnapshot()
+
+		tasBasicPG := makePodGroup(ns, "tas-basic-pg", "", 0, zoneLabel)
+		if err := snap.AddPodGroup(ctx, tasBasicPG); err != nil {
+			t.Fatalf("AddPodGroup(tasBasicPG) failed: %v", err)
+		}
+		tasBasicPod1 := makePod(ns, "tas-basic-pod-1", tasBasicPG.Name, "3")
+		tasBasicPodUnsched := makePod(ns, "tas-basic-pod-too-big", tasBasicPG.Name, "5")
+		tasBasicPod2 := makePod(ns, "tas-basic-pod-2", tasBasicPG.Name, "2")
+		tasBasicPod3 := makePod(ns, "tas-basic-pod-3", tasBasicPG.Name, "1")
+
+		// First call schedules tasBasicPod1 (3 CPU) on one zone (leaving 1 CPU free in that zone) and leaves tasBasicPodUnsched unscheduled.
+		res := snap.ScheduleWorkload(ctx, []*v1.Pod{tasBasicPod1, tasBasicPodUnsched}, snapshot.NewScheduleWorkloadOptions(false))
+		if !res.Status.IsSuccess() || len(res.PodResults) != 1 || res.PodResults[0].Pod.Name != tasBasicPod1.Name {
+			t.Fatalf("First call: got status=%v results=%v, want only %s scheduled", res.Status, res.PodResults, tasBasicPod1.Name)
+		}
+		selectedNode := res.PodResults[0].SelectedNodeName
+
+		// Second call with a 2-CPU pod must fail as Unschedulable because TopologyPlacementGenerator sees tasBasicPod1
+		// in PodGroupState.ScheduledPods() and restricts placement to selectedNode's zone (which only has 1 CPU left),
+		// even though the other zone has 4 CPU free.
+		if res := snap.ScheduleWorkload(ctx, []*v1.Pod{tasBasicPod2}, snapshot.NewScheduleWorkloadOptions(false)); res.Status.Code() != fwk.Unschedulable {
+			t.Fatalf("Second call: got status %v, want Unschedulable because the pod group is pinned to the zone of %s", res.Status, selectedNode)
+		}
+
+		// Third call with a 1-CPU pod succeeds on the same node in the locked zone.
+		res = snap.ScheduleWorkload(ctx, []*v1.Pod{tasBasicPod3}, snapshot.NewScheduleWorkloadOptions(false))
+		if !res.Status.IsSuccess() || len(res.PodResults) != 1 || res.PodResults[0].SelectedNodeName != selectedNode {
+			t.Fatalf("Third call: got status=%v results=%v, want %s scheduled on %s", res.Status, res.PodResults, tasBasicPod3.Name, selectedNode)
+		}
+
+		// SyncSnapshot drops the virtual pod group and its pods.
+		if err := cs.SyncSnapshot(logger); err != nil {
+			t.Fatalf("SyncSnapshot failed: %v", err)
+		}
+		if res := snap.ScheduleWorkload(ctx, []*v1.Pod{tasBasicPod2}, snapshot.NewScheduleWorkloadOptions(false)); !res.Status.IsError() {
+			t.Fatalf("After SyncSnapshot: got status %v, want an error because the pod group is missing from the snapshot", res.Status)
+		}
+	})
+
+	t.Run("gang quorum counts pods scheduled by earlier calls", func(t *testing.T) {
+		snap := newClusterState(t).GetAssociatedSnapshot()
+
+		gangPG := makePodGroup(ns, "gang-pg", "", 2, "")
+		if err := snap.AddPodGroup(ctx, gangPG); err != nil {
+			t.Fatalf("AddPodGroup(gangPG) failed: %v", err)
+		}
+		gangPod1 := makePod(ns, "gang-pod-1", gangPG.Name, "1")
+		gangPod2 := makePod(ns, "gang-pod-2", gangPG.Name, "1")
+		gangPod3 := makePod(ns, "gang-pod-3", gangPG.Name, "1")
+
+		// First call schedules two pods, which meets minCount (2).
+		res := snap.ScheduleWorkload(ctx, []*v1.Pod{gangPod1, gangPod2}, snapshot.NewScheduleWorkloadOptions(false))
+		if !res.Status.IsSuccess() || len(res.PodResults) != 2 {
+			t.Fatalf("First call: got status=%v results=%v, want %s and %s scheduled", res.Status, res.PodResults, gangPod1.Name, gangPod2.Name)
+		}
+
+		// Second call has a single pod, below minCount on its own. It succeeds only because GangScheduling
+		// counts the two pods from the first call through PodGroupState.ScheduledPodsCount().
+		res = snap.ScheduleWorkload(ctx, []*v1.Pod{gangPod3}, snapshot.NewScheduleWorkloadOptions(false))
+		if !res.Status.IsSuccess() || len(res.PodResults) != 1 {
+			t.Fatalf("Second call: got status=%v results=%v, want %s scheduled", res.Status, res.PodResults, gangPod3.Name)
+		}
+	})
 }
 
 func makePod(ns, name, podGroupName, cpu string) *v1.Pod {

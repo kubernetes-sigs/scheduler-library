@@ -1270,6 +1270,30 @@ func TestResetMutations_NodeGenerationRestored(t *testing.T) {
 	}
 }
 
+func verifyPodGroupState(t *testing.T, snap *cache.Snapshot, namespace, name string, wantUnscheduled []string, wantScheduled map[string]string) {
+	t.Helper()
+	pgs, err := snap.PodGroupStates().Get(namespace, name)
+	if err != nil {
+		t.Fatalf("PodGroupStates().Get(%q, %q) failed: %v", namespace, name, err)
+	}
+	if diff := cmp.Diff(sets.New(wantUnscheduled...), sets.KeySet(pgs.UnscheduledPods()), cmpopts.EquateEmpty()); diff != "" {
+		t.Errorf("pod group %s/%s UnscheduledPods() mismatch (-want +got):\n%s", namespace, name, diff)
+	}
+	scheduled := make(map[string]string)
+	for _, pod := range pgs.ScheduledPods() {
+		scheduled[pod.Name] = pod.Spec.NodeName
+	}
+	if diff := cmp.Diff(wantScheduled, scheduled, cmpopts.EquateEmpty()); diff != "" {
+		t.Errorf("pod group %s/%s ScheduledPods() nodes mismatch (-want +got):\n%s", namespace, name, diff)
+	}
+	if got, want := pgs.ScheduledPodsCount(), len(wantScheduled); got != want {
+		t.Errorf("pod group %s/%s ScheduledPodsCount() = %d, want %d", namespace, name, got, want)
+	}
+	if got, want := pgs.AllPodsCount(), len(wantUnscheduled)+len(wantScheduled); got != want {
+		t.Errorf("pod group %s/%s AllPodsCount() = %d, want %d", namespace, name, got, want)
+	}
+}
+
 func TestScheduleWorkload(t *testing.T) {
 	ctx := context.Background()
 
@@ -1311,9 +1335,12 @@ func TestScheduleWorkload(t *testing.T) {
 	noPGPod := testutils.MakePod("no-pg", "", "")
 	missingPGPod := testutils.MakePod("missing-pg", "missing-pg-name", "")
 
+	assignedGangPod := makeScheduledTestPod("assigned-pod", "node1", "gang-pg", "2")
+
 	tests := []struct {
 		name                string
 		nodes               []*v1.Node
+		existingPods        []*v1.Pod
 		podGroups           []*schedulingv1beta1.PodGroup
 		compositePodGroups  []*schedulingv1alpha3.CompositePodGroup
 		pods                []*v1.Pod
@@ -1445,6 +1472,30 @@ func TestScheduleWorkload(t *testing.T) {
 			expectSnapshotState: map[string]sets.Set[string]{"node1": nil},
 			expectErr:           true,
 		},
+		{
+			name:         "Success - assigned pod group member stays scheduled next to the scheduled input pods",
+			nodes:        []*v1.Node{node4CPU},
+			existingPods: []*v1.Pod{assignedGangPod},
+			podGroups:    []*schedulingv1beta1.PodGroup{gangPG},
+			pods:         []*v1.Pod{pod1},
+			opts:         NewScheduleWorkloadOptions(false),
+			expectResults: []SchedulingResult{
+				{Pod: pod1, SelectedNodeName: "node1", Status: fwk.NewStatus(fwk.Success)},
+			},
+			expectSnapshotState: map[string]sets.Set[string]{"node1": sets.New("assigned-pod", "pod1")},
+		},
+		{
+			name:         "DryRun - assigned pod group member stays scheduled while input pods are rolled back",
+			nodes:        []*v1.Node{node4CPU},
+			existingPods: []*v1.Pod{assignedGangPod},
+			podGroups:    []*schedulingv1beta1.PodGroup{gangPG},
+			pods:         []*v1.Pod{pod1},
+			opts:         NewScheduleWorkloadOptions(true),
+			expectResults: []SchedulingResult{
+				{Pod: pod1, SelectedNodeName: "node1", Status: fwk.NewStatus(fwk.Success)},
+			},
+			expectSnapshotState: map[string]sets.Set[string]{"node1": sets.New("assigned-pod")},
+		},
 	}
 
 	for _, tt := range tests {
@@ -1452,7 +1503,7 @@ func TestScheduleWorkload(t *testing.T) {
 			profileMap, snap, err := ft.SetupSnapshotTestWithPodGroups(
 				ctx,
 				t,
-				nil,
+				tt.existingPods,
 				tt.nodes,
 				tt.podGroups,
 				tt.compositePodGroups,
@@ -1516,6 +1567,30 @@ func TestScheduleWorkload(t *testing.T) {
 			}
 
 			ft.VerifySnapshot(t, snap, tt.expectSnapshotState)
+
+			wantScheduled := make(map[string]map[string]string)
+			addScheduled := func(pod *v1.Pod, nodeName string) {
+				pgName := *pod.Spec.SchedulingGroup.PodGroupName
+				if wantScheduled[pgName] == nil {
+					wantScheduled[pgName] = make(map[string]string)
+				}
+				wantScheduled[pgName][pod.Name] = nodeName
+			}
+			for _, pod := range tt.existingPods {
+				if pod.Spec.SchedulingGroup != nil {
+					addScheduled(pod, pod.Spec.NodeName)
+				}
+			}
+			if !tt.opts.DryRun {
+				for _, want := range tt.expectResults {
+					if want.SelectedNodeName != "" {
+						addScheduled(want.Pod, want.SelectedNodeName)
+					}
+				}
+			}
+			for _, pg := range tt.podGroups {
+				verifyPodGroupState(t, snap, pg.Namespace, pg.Name, nil, wantScheduled[pg.Name])
+			}
 		})
 	}
 }
@@ -1564,8 +1639,14 @@ func TestSnapshot_ActionSequences_ScheduleWorkload(t *testing.T) {
 				inTransaction(Revert,
 					scheduleWorkload([]string{"pod1", "pod2"}, NewScheduleWorkloadOptions(false) /* expect success */, true),
 					verifySnapshot(map[string]sets.Set[string]{"node1": sets.New("pod1", "pod2")}),
+					func(t *testing.T, sc *stepContext) {
+						verifyPodGroupState(t, sc.snap, pg1.Namespace, pg1.Name, nil, map[string]string{"pod1": "node1", "pod2": "node1"})
+					},
 				),
 				verifySnapshot(map[string]sets.Set[string]{"node1": sets.New[string]()}),
+				func(t *testing.T, sc *stepContext) {
+					verifyPodGroupState(t, sc.snap, pg1.Namespace, pg1.Name, nil, nil)
+				},
 			},
 		},
 		{
@@ -3027,6 +3108,14 @@ func TestScheduleWorkload_Preemption(t *testing.T) {
 			}
 
 			ft.VerifySnapshot(t, snap, tt.expectSnapshotState)
+
+			wantScheduled := make(map[string]string)
+			if tt.wantStatusCode == fwk.Success && !opts.DryRun {
+				for _, pod := range tt.workloadPods {
+					wantScheduled[pod.Name] = "node1"
+				}
+			}
+			verifyPodGroupState(t, snap, gangPG.Namespace, gangPG.Name, nil, wantScheduled)
 		})
 	}
 }
