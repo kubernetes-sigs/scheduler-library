@@ -79,7 +79,7 @@ type Simulator interface {
 
 	// Transaction groups any of the above and commits or reverts them as a whole: the mutations are
 	// kept if transactionFn returns snapshot.Commit, and undone if it returns snapshot.Revert or an
-	// error. Transactions cannot be nested.
+	// error. Transactions cannot be nested. If undoing fails, the snapshot must be rebuilt.
 	Transaction(ctx context.Context, transactionFn func() (snapshot.TransactionResult, error)) error
 
 	// Unpreempt undoes the preemption the handle was returned for and reports the pods that were put

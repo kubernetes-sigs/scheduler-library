@@ -171,7 +171,8 @@ type WorkloadSchedulingResult struct {
 	//     was skipped by [PreemptionFilter.MayFit]).
 	//   - [fwk.UnschedulableAndUnresolvable]: a PlacementGenerate plugin rejected the root group
 	//     as unresolvable during Pass 1 or Pass 2 (remaining passes are skipped).
-	//   - [fwk.Error]: hierarchy validation, framework resolution, plugin execution, or preemption failed with an error.
+	//   - [fwk.Error]: hierarchy validation, framework resolution, plugin execution, preemption, or the snapshot
+	//     rollback failed with an error.
 	Status *fwk.Status
 
 	// PodResults stores per-pod scheduling outcomes.
