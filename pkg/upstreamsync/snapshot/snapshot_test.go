@@ -581,6 +581,23 @@ func TestMakePlacement(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error when node not found in snapshot, got nil")
 	}
+
+	placement, err = cs.MakePlacement([]string{"node2", "node1"})
+	if err != nil {
+		t.Fatalf("unexpected error from MakePlacement: %v", err)
+	}
+	var got []string
+	for _, ni := range placement.Nodes {
+		got = append(got, ni.Node().Name)
+	}
+	if want := []string{"node2", "node1"}; !slices.Equal(got, want) {
+		t.Errorf("placement order = %v, want %v", got, want)
+	}
+
+	// On this two-node snapshot, a placement of length two would be read as no restriction at all.
+	if _, err = cs.MakePlacement([]string{"node1", "node1"}); err == nil {
+		t.Errorf("expected error when a node is named twice, got nil")
+	}
 }
 
 func TestCanSchedulePod(t *testing.T) {

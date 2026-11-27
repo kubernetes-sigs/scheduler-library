@@ -42,7 +42,8 @@ import (
 // returns and what state.ClusterState.GetAssociatedSnapshot hands out — and exists to make the entry points of a
 // simulation visible from this package; consumers are not expected to implement it.
 type Simulator interface {
-	// MakePlacement turns node names into the *fwk.Placement that the other methods restrict the simulation to.
+	// MakePlacement turns distinct node names into the *fwk.Placement that the other methods restrict the
+	// simulation to.
 	MakePlacement(candidateNodeNames []string) (*fwk.Placement, error)
 
 	// CanSchedulePod reports which of the nodes in the placement fit a single pod, leaving the
