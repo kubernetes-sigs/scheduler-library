@@ -26,6 +26,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/klog/v2"
@@ -607,15 +608,16 @@ func (s *ClusterSnapshot) workloadPreemption(
 	initialResult WorkloadSchedulingResult,
 	opts ScheduleWorkloadOptions,
 ) WorkloadSchedulingResult {
-	baseSchedulingFunc := sched.BuildPodGroupSchedulingFunc(schedFramework, podGroupInfo)
+	pgSchedulingFunc := sched.BuildPodGroupSchedulingFunc(schedFramework, podGroupInfo)
 
 	// Pull PotentialVictims and run PodGroup preemption with reprieval.
-	assignments, preemptedVictims, status := preemption.EvaluateWorkloadPreemption(
+	// The results will not have CycleState but the caller shouldn't attempt to use CycleState when preemption is needed.
+	postFilterResult, preemptedVictims, status := preemption.EvaluateWorkloadPreemption(
 		ctx,
 		schedFramework,
 		podGroupCycleState,
 		podGroupInfo,
-		baseSchedulingFunc,
+		pgSchedulingFunc,
 		opts.WorkloadPreemptionOptions,
 	)
 	if status.IsError() {
@@ -627,7 +629,7 @@ func (s *ClusterSnapshot) workloadPreemption(
 
 	return WorkloadSchedulingResult{
 		Status:               initialResult.Status,
-		PodResults:           buildWorkloadPodResults(assignments),
+		PodResults:           buildWorkloadPodResults(podGroupInfo, postFilterResult),
 		WaitingForPreemption: true,
 		PreemptionVictims:    preemptedVictims,
 	}
@@ -671,20 +673,33 @@ func buildFailedWorkloadPodResults(
 	return results
 }
 
+// buildWorkloadPodResults converts PodGroupPostFilterResult to SchedulingResult.
+// Since CycleState is not present in PodGroupPostFilterResult, it's not included in the SchedulingResult.
+// This should be fine, as the only potential use case for CycleState would be to run Reserve,
+// which can't happen on the current snapshot state when preemption is required, and updating the snapshot would invalidate the CycleState anyway.
 func buildWorkloadPodResults(
-	assignments *fwk.PodGroupAssignments,
+	root fwk.PodGroupInfo,
+	postFilterResult *fwk.PodGroupPostFilterResult,
 ) []SchedulingResult {
 	var results []SchedulingResult
-	if assignments != nil {
-		results = make([]SchedulingResult, 0, len(assignments.ProposedAssignments))
-		for _, pa := range assignments.ProposedAssignments {
-			results = append(results, SchedulingResult{
-				Pod:              pa.GetPod(),
-				Status:           nil,
-				SelectedNodeName: pa.GetNodeName(),
-				CycleState:       pa.GetCycleState(),
-			})
+	for _, pod := range root.GetUnscheduledPods() {
+		podKey := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
+		ni := postFilterResult.NominatingInfos[podKey]
+		if ni == nil {
+			continue
 		}
+		nodeName := ni.NominatedNodeName
+		if ni.Mode() == fwk.ModeNoop {
+			nodeName = pod.Status.NominatedNodeName
+		}
+		if nodeName == "" {
+			continue
+		}
+		results = append(results, SchedulingResult{
+			Pod:              pod,
+			Status:           nil,
+			SelectedNodeName: nodeName,
+		})
 	}
 	return results
 }
