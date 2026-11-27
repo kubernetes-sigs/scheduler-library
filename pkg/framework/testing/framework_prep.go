@@ -57,7 +57,15 @@ func WithProfileModifier(fn func(*schedulerapi.KubeSchedulerProfile)) SnapshotTe
 	}
 }
 
-// SetupSnapshotTest initializes a fake clientset, snapshot, and default profile map for unit tests.
+// NoFilterPluginsSchedulerName names the profile that SetupSnapshotTest adds with no PreFilter or Filter plugins.
+const NoFilterPluginsSchedulerName = "no-filter-plugins"
+
+// FilterErrorSchedulerName names the profile that SetupSnapshotTest adds in which filtering returns
+// an error: NodeResourcesFit filters without its PreFilter, so it finds no state to read.
+const FilterErrorSchedulerName = "filter-error"
+
+// SetupSnapshotTest initializes a fake clientset, snapshot, and profile map for unit tests. The map
+// holds the default profile and the NoFilterPluginsSchedulerName and FilterErrorSchedulerName profiles.
 func SetupSnapshotTest(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (*upstreamsync.ProfileMap, *cache.Snapshot, error) {
 	framework.InitMetricsOnce()
 	client := fake.NewClientset()
@@ -72,6 +80,16 @@ func SetupSnapshotTest(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (*
 		}
 	}
 
+	nodeResourcesFitConfig := []schedulerapi.PluginConfig{
+		{
+			Name: "NodeResourcesFit",
+			Args: &schedulerapi.NodeResourcesFitArgs{
+				ScoringStrategy: &schedulerapi.ScoringStrategy{
+					Type: schedulerapi.LeastAllocated,
+				},
+			},
+		},
+	}
 	prof := schedulerapi.KubeSchedulerConfiguration{
 		Profiles: []schedulerapi.KubeSchedulerProfile{
 			{SchedulerName: v1.DefaultSchedulerName,
@@ -97,16 +115,41 @@ func SetupSnapshotTest(ctx context.Context, pods []*v1.Pod, nodes []*v1.Node) (*
 						},
 					},
 				},
-				PluginConfig: []schedulerapi.PluginConfig{
-					{
-						Name: "NodeResourcesFit",
-						Args: &schedulerapi.NodeResourcesFitArgs{
-							ScoringStrategy: &schedulerapi.ScoringStrategy{
-								Type: schedulerapi.LeastAllocated,
-							},
+				PluginConfig: nodeResourcesFitConfig,
+			},
+			{SchedulerName: NoFilterPluginsSchedulerName,
+				Plugins: &schedulerapi.Plugins{
+					QueueSort: schedulerapi.PluginSet{
+						Enabled: []schedulerapi.Plugin{
+							{Name: "PrioritySort"},
+						},
+					},
+					Bind: schedulerapi.PluginSet{
+						Enabled: []schedulerapi.Plugin{
+							{Name: "DefaultBinder"},
 						},
 					},
 				},
+			},
+			{SchedulerName: FilterErrorSchedulerName,
+				Plugins: &schedulerapi.Plugins{
+					QueueSort: schedulerapi.PluginSet{
+						Enabled: []schedulerapi.Plugin{
+							{Name: "PrioritySort"},
+						},
+					},
+					Filter: schedulerapi.PluginSet{
+						Enabled: []schedulerapi.Plugin{
+							{Name: "NodeResourcesFit"},
+						},
+					},
+					Bind: schedulerapi.PluginSet{
+						Enabled: []schedulerapi.Plugin{
+							{Name: "DefaultBinder"},
+						},
+					},
+				},
+				PluginConfig: nodeResourcesFitConfig,
 			},
 		},
 	}
